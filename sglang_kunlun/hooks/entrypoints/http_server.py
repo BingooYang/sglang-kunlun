@@ -57,6 +57,8 @@ from fastapi.responses import Response
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
+from sglang_kunlun.hooks.arg_groups import _resolution_compat as _resolution
+
 logger = logging.getLogger(__name__)
 
 # All health paths are served by the single shutdown-aware handler below,
@@ -267,7 +269,7 @@ def pin_nccl_port(server_args) -> None:
                 sock.bind(("", port))
             except OSError:
                 continue
-        server_args.nccl_port = port
+        _resolution.declare(server_args, nccl_port=port)
         logger.info("sglang-kunlun: pinned nccl_port to %d", port)
         return
     logger.warning("sglang-kunlun: found no free port below the ephemeral range")

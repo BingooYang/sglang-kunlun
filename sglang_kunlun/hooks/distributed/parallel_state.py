@@ -76,7 +76,15 @@ def kunlun_init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
+    **extra,
 ):
+    """Kunlun: init GroupCoordinator with XPU/NPU/HPU communicators.
+
+    ``**extra`` absorbs keywords newer sglang added to this call
+    (``rank_offset`` / ``max_world_size`` / ``device_pg_options``); they are
+    forwarded only when ``GroupCoordinator`` declares them, so one hook body
+    works across sglang releases.
+    """
     """Kunlun: init GroupCoordinator with XPU/NPU/HPU communicators."""
     from sglang.srt.distributed.parallel_state import (
         _ENABLE_CUSTOM_ALL_REDUCE,
@@ -92,6 +100,11 @@ def kunlun_init_model_parallel_group(
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
 
+    import inspect
+
+    ctor_params = set(inspect.signature(GroupCoordinator.__init__).parameters)
+    forwarded = {k: v for k, v in extra.items() if k in ctor_params}
+
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -106,4 +119,5 @@ def kunlun_init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         recovered_rank=recovered_rank,
+        **forwarded,
     )

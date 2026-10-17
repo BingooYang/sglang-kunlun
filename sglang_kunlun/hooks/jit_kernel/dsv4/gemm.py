@@ -17,7 +17,7 @@
 # limitations under the License.
 """HookRegistry registration for the DSV4 bf16 x bf16 -> fp32 linear.
 
-Upstream ``sglang.jit_kernel.dsv4.gemm.linear_bf16_fp32`` relies on the
+Upstream ``sglang.kernels.ops.attention.dsv4.gemm.linear_bf16_fp32`` relies on the
 ``torch.mm(out_dtype=...)`` overload (``aten::mm.dtype``), which the Kunlun XPU does
 not provide. The REPLACE hook below does a plain fp32 matmul instead.
 
@@ -35,7 +35,7 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    "sglang.jit_kernel.dsv4.gemm.linear_bf16_fp32",
+    "sglang.kernels.ops.attention.dsv4.gemm.linear_bf16_fp32",
     type=HookType.REPLACE,
 )
 def _linear_bf16_fp32_torch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

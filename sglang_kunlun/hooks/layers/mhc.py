@@ -17,7 +17,7 @@
 # limitations under the License.
 """HookRegistry registration for the MHC split-Sinkhorn gate kernel.
 
-Upstream ``sglang.srt.layers.mhc.hc_split_sinkhorn`` dispatches to a tilelang
+Upstream ``sglang.kernels.ops.layernorm.mhc.hc_split_sinkhorn`` dispatches to a tilelang
 JIT kernel that cannot build on the Kunlun XPU. The REPLACE hook below keeps the
 same (pre, post, comb) contract: ``pre``/``post`` are per-token sigmoid gates and
 ``comb`` is Sinkhorn-normalized.
@@ -34,7 +34,7 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    "sglang.srt.layers.mhc.hc_split_sinkhorn",
+    "sglang.kernels.ops.layernorm.mhc.hc_split_sinkhorn",
     type=HookType.REPLACE,
 )
 def _hc_split_sinkhorn_torch(
@@ -108,3 +108,31 @@ def _hc_split_sinkhorn_torch(
     post = post.reshape(b, s, hc)
     comb = comb.reshape(b, s, hc, hc)
     return pre, post, comb
+
+
+@plugin_hook(
+    "sglang.kernels.ops.layernorm.mhc.hc_combine",
+    type=HookType.REPLACE,
+)
+def hc_combine_kunlun(
+    x_flat: "torch.Tensor", pre: "torch.Tensor", hc: int, out_dtype: "torch.dtype"
+):
+    """Pure-torch ``hc_combine`` — the Triton kernel is CUDA-only.
+
+    Newer sglang extracted this weighted sum out of ``hc_pre`` into a fused
+    Triton kernel, but the maths is unchanged from v0.5.x, where it was simply::
+
+        y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
+
+    so the reference implementation is a few tensor ops — no new Kunlun kernel
+    is needed.
+    """
+    m = x_flat.shape[0]
+    h = x_flat.shape[1] // hc
+    y = torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
+    if m == 0:
+        return y
+    xv = x_flat.reshape(m, hc, h).to(torch.float32)
+    acc = (pre.to(torch.float32).unsqueeze(-1) * xv).sum(dim=1)
+    y.copy_(acc.to(out_dtype))
+    return y

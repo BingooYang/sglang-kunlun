@@ -55,9 +55,67 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
 )
+
+# Internal-fork only: bf16 KV-cache sparse-prefill gather.  Absent on v0.5.x,
+# where the sparse-prefill workspace is always fp8-dequantized.
+try:
+    from sglang.srt.internal.layers.attention.dsv4.gather_bf16_k_cache import (
+        gather_bf16_k_cache_paged,
+    )
+except Exception:  # noqa: BLE001
+    gather_bf16_k_cache_paged = None
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Indexer-logits bridge.
+#
+# The internal ``forward_c4_indexer`` selects its logits implementation from an
+# env-driven ladder and calls it as a *module-level* function.  On XPU every
+# rung of that ladder is either unavailable or Triton-only, so ``kernel_ops``
+# registers a replacement for ``fp8_paged_mqa_logits_torch`` (the rung selected
+# when ``SGLANG_FP8_PAGED_MQA_LOGITS_TORCH`` is set) which forwards to the
+# Kunlun-native implementation on the backend instance that is running.
+# ``forward_c4_indexer`` below publishes that instance + batch here.
+# ---------------------------------------------------------------------------
+_ACTIVE_C4_BACKEND = None
+_ACTIVE_C4_FORWARD_BATCH = None
+
+
+def kunlun_fp8_paged_mqa_logits_torch(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata=None,
+    max_seq_len=None,
+    clean_logits: bool = True,
+    **kwargs,
+) -> torch.Tensor:
+    """Kunlun replacement for the internal indexer-logits torch fallback.
+
+    Signature matches ``sglang.srt.layers.attention.dsv4.indexer.
+    fp8_paged_mqa_logits_torch`` (positional call site), so it drops the
+    deep-gemm metadata / ``clean_logits`` arguments and routes to
+    :meth:`_kunlun_c4a_paged_mqa_logits`.
+    """
+    backend = _ACTIVE_C4_BACKEND
+    forward_batch = _ACTIVE_C4_FORWARD_BATCH
+    assert backend is not None and forward_batch is not None, (
+        "kunlun_fp8_paged_mqa_logits_torch called outside "
+        "KunlunDeepseekV4AttnBackend.forward_c4_indexer"
+    )
+    return backend._kunlun_c4a_paged_mqa_logits(
+        q_fp8=q_fp8,
+        kvcache_fp8=kvcache_fp8,
+        weight=weight,
+        seq_lens=seq_lens,
+        page_table=page_table,
+        max_seq_len=int(max_seq_len),
+        forward_batch=forward_batch,
+    )
 
 _HEAD_DIM = DIM_NOPE + DIM_ROPE  # 512
 _E4M3_LUT = None
@@ -91,181 +149,43 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         enable_multi_stream: bool = False,
         q_lora_ready=None,
         skip_compressor: bool = False,
-    ) -> None:
-        """Upstream ``C4IndexerBackendMixin.forward_c4_indexer`` with the Kunlun
-        indexer-logits kernel called inline.
+        prev_topk_indices=None,
+        skip_topk: bool = False,
+        return_topk_indices: bool = False,
+        moa_hybrid_mask=None,
+    ):
+        """Delegate to the internal implementation, bridging the logits kernel.
 
-        The env-selected ``fn`` ladder (deep_gemm / tilelang / aiter / torch) is
-        replaced by ``self._kunlun_c4a_paged_mqa_logits``. The topk / hisparse /
-        indexer-capturer tail is unchanged, resolved lazily off the upstream module
-        so ``register_jit_op`` replacements still apply.
+        The internal ``C4IndexerBackendMixin.forward_c4_indexer`` owns the whole
+        topk / IndexCache / HiSparse / capturer tail -- and, on XPU, its
+        ``topk_transform_paged`` already dispatches to ``sgl_kernel``.  The only
+        piece that needs a Kunlun kernel is the indexer-logits function the
+        method resolves from its env-selected ladder at call time.  Stash the
+        batch and backend so the module-level replacement registered for
+        ``fp8_paged_mqa_logits_torch`` can reach them, then run the internal
+        method unchanged.
         """
-        if forward_batch.forward_mode.is_idle():
-            return
-        token_to_kv_pool = self.token_to_kv_pool
-
-        metadata = self.forward_metadata
-        indexer_metadata = metadata.indexer_metadata
-        core_metadata = metadata.core_metadata
-
-        assert isinstance(indexer_metadata, PagedIndexerMetadata)
-
-        positions = core_metadata.positions
-        num_queries = min(x.shape[0], q_lora.shape[0], positions.shape[0])
-        if x.shape[0] != num_queries:
-            x = x[:num_queries]
-        if q_lora.shape[0] != num_queries:
-            q_lora = q_lora[:num_queries]
-        if positions.shape[0] != num_queries:
-            positions = positions[:num_queries]
-
-        if enable_multi_stream:
-            q_indexer, weights, c4_indexer_kv_cache = (
-                self._forward_prepare_multi_stream(
-                    x=x,
-                    q_lora=q_lora,
-                    c4_indexer=c4_indexer,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    token_to_kv_pool=token_to_kv_pool,
-                    alt_streams=alt_streams,
-                    q_lora_ready=q_lora_ready,
-                )
-            )
-        else:
-            assert q_lora_ready is None
-            q_indexer, weights, c4_indexer_kv_cache = self._forward_prepare_normal(
+        global _ACTIVE_C4_BACKEND, _ACTIVE_C4_FORWARD_BATCH
+        _ACTIVE_C4_BACKEND = self
+        _ACTIVE_C4_FORWARD_BATCH = forward_batch
+        try:
+            return super().forward_c4_indexer(
                 x=x,
                 q_lora=q_lora,
                 c4_indexer=c4_indexer,
-                positions=positions,
                 forward_batch=forward_batch,
-                token_to_kv_pool=token_to_kv_pool,
+                alt_streams=alt_streams,
+                enable_multi_stream=enable_multi_stream,
+                q_lora_ready=q_lora_ready,
                 skip_compressor=skip_compressor,
+                prev_topk_indices=prev_topk_indices,
+                skip_topk=skip_topk,
+                return_topk_indices=return_topk_indices,
+                moa_hybrid_mask=moa_hybrid_mask,
             )
-
-        assert len(c4_indexer_kv_cache.shape) == 2
-        block_kv = 64
-        num_heads_kv = 1
-        if c4_indexer.use_fp4_indexer:
-            # The fp4 path needs deep_gemm's fp8_fp4_paged_mqa_logits; there is no
-            # Kunlun equivalent.
-            raise NotImplementedError(
-                "DeepSeek V4 FP4 indexer is not supported on Kunlun XPU."
-            )
-        head_dim_with_sf = 132
-
-        assert len(q_indexer.shape) == 3
-        q = q_indexer.unsqueeze(1)
-
-        c4_indexer_kv_cache = c4_indexer_kv_cache.view(
-            c4_indexer_kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-        )
-        assert len(weights.shape) == 3
-        weights = weights.squeeze(2)
-
-        query_rows = q_indexer.shape[0]
-
-        def match_num_queries(tensor: torch.Tensor, value: int) -> torch.Tensor:
-            if tensor.shape[0] == query_rows:
-                return tensor
-            if tensor.shape[0] > query_rows:
-                return tensor[:query_rows]
-            pad = (0, 0) * (tensor.dim() - 1) + (0, query_rows - tensor.shape[0])
-            return F.pad(tensor, pad, value=value)
-
-        c4_seq_lens = match_num_queries(indexer_metadata.c4_seq_lens, value=1)
-        page_table = match_num_queries(indexer_metadata.page_table, value=0)
-        c4_sparse_page_indices = match_num_queries(
-            core_metadata.c4_sparse_page_indices, value=-1
-        )
-
-        logits = self._kunlun_c4a_paged_mqa_logits(
-            q_fp8=q,
-            kvcache_fp8=c4_indexer_kv_cache,
-            weight=weights,
-            seq_lens=c4_seq_lens,
-            page_table=page_table,
-            max_seq_len=indexer_metadata.max_c4_seq_len,
-            forward_batch=forward_batch,
-        )
-
-        assert indexer_metadata.page_table is core_metadata.page_table
-        if self.debug_use_external_c4_sparse_indices:
-            return
-
-        indexer_capturer = _upstream_indexer.get_global_indexer_capturer()
-        capture_enabled = indexer_capturer is not None
-
-        hisparse_coordinator = self.hisparse_coordinator
-        hisparse_decode = (
-            hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
-        )
-
-        raw_indices = None
-        if capture_enabled:
-            raw_indices = torch.empty_like(c4_sparse_page_indices)
-        elif hisparse_decode:
-            raw_indices = hisparse_coordinator.raw_indices_buffer[
-                : c4_sparse_page_indices.size(0)
-            ]
-        elif core_metadata.c4_sparse_raw_indices is not None:
-            raw_indices = core_metadata.c4_sparse_raw_indices
-
-        if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
-            _upstream_indexer.topk_transform_512_pytorch_vectorized(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
-            _upstream_indexer.topk_transform_512_v2(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                indexer_metadata.topk_metadata,
-            )
-        else:
-            _upstream_indexer.topk_transform_512(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
-
-        if hisparse_coordinator is not None:
-            if hisparse_decode:
-                compress_layer_id = token_to_kv_pool.layer_mapping[
-                    c4_indexer.layer_id
-                ].compress_layer_id
-                core_metadata.c4_sparse_page_indices = (
-                    hisparse_coordinator.swap_in_selected_pages(
-                        req_pool_indices=forward_batch.req_pool_indices,
-                        compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                        top_k_result=raw_indices,
-                        layer_id=compress_layer_id,
-                    )
-                )
-            else:
-                # flash_mla C4 attention requires int32 page indices.
-                core_metadata.c4_sparse_page_indices = (
-                    token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
-                        core_metadata.c4_sparse_page_indices
-                    ).to(torch.int32)
-                )
-
-        if capture_enabled:
-            compress_layer_id = token_to_kv_pool.layer_mapping[
-                c4_indexer.layer_id
-            ].compress_layer_id
-            indexer_capturer.capture(compress_layer_id, raw_indices)
+        finally:
+            _ACTIVE_C4_BACKEND = None
+            _ACTIVE_C4_FORWARD_BATCH = None
 
     def _c4a_cp_extend_logits_torch(
         self,
@@ -609,9 +529,19 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             extra_indices = core_attn_metadata.c128_page_indices
             extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
 
-        swa_window_size = token_to_kv_pool.swa_window_size
+        swa_window_size = token_to_kv_pool.swa_page_size
         assert swa_k_cache.ndim == 2
         k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
+        # The internal pool stores even the bf16 layout in a uint8 byte buffer
+        # (1024 B/token = 512 bf16); present it as bf16 so the native op sees a
+        # cache whose dtype matches q.  The fp8 layout has no uniform view and
+        # is handled by the torch paths instead.
+        if (
+            swa_k_cache.dtype == torch.uint8
+            and k_cache_total_dim == 512 * 2
+        ):
+            swa_k_cache = swa_k_cache.view(torch.bfloat16)
+            k_cache_total_dim = k_cache_total_dim // 2
         swa_k_cache = swa_k_cache[:, : swa_window_size * k_cache_total_dim].view(
             swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
         )
@@ -620,6 +550,12 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 4: token_to_kv_pool.page_size // 4,
                 128: token_to_kv_pool.page_size // 128,
             }
+            # Same uint8 byte-buffer / bf16-layout situation as the SWA cache.
+            if (
+                extra_k_cache.dtype == torch.uint8
+                and token_to_kv_pool.swa_kv_pool.kv_cache_total_dim == 512 * 2
+            ):
+                extra_k_cache = extra_k_cache.view(torch.bfloat16)
             extra_k_cache = extra_k_cache[
                 :, : page_sizes[compress_ratio] * k_cache_total_dim
             ].view(
@@ -695,6 +631,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 compress_ratio=compress_ratio,
                 core_attn_metadata=core_attn_metadata,
                 attn_sink=attn_sink,
+                forward_batch=forward_batch,
             )
         else:
             # Pure-torch reference for the modes the native op cannot serve.
@@ -725,6 +662,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         compress_ratio: Literal[0, 4, 128],
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
+        forward_batch=None,
     ) -> torch.Tensor:
         """Inlined ``flash_mla_with_kvcache``: build the qlod / kvseqlen context
         the retired ContextVar wrapper used to publish, then call the Kunlun op.
@@ -749,12 +687,71 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         qlod_cpu = torch.arange(seq_lens.shape[0] + 1, dtype=torch.int32)
         qlod_xpu = qlod_cpu.to(q.device, non_blocking=False)
         kvseqlen_xpu = seq_lens.to(dtype=torch.int32, device=q.device)
-        kvseqlen_cpu = kvseqlen_xpu.to("cpu", non_blocking=False)
+        # Host copy of the sequence lengths.  ``.to("cpu")`` returns uninitialised
+        # memory during CUDA-graph capture, so prefer the batch's CPU mirror: the
+        # decode graph runner maintains ``seq_lens_cpu`` in its own buffers and
+        # refreshes it before every replay, and handing the op that very buffer
+        # keeps the values live across replays.
+        _n = kvseqlen_xpu.numel()
+        if torch.cuda.is_current_stream_capturing():
+            # Inside CUDA-graph capture the batch's CPU mirror aliases other
+            # pooled buffers (share_buffers() coalesces seq_lens / seq_lens_cpu)
+            # and reads back uninitialised float data, while a device->host copy
+            # is illegal.  Every request of a capture batch carries the backend's
+            # capture fill length, so use that; the tensor must outlive the graph
+            # because the captured launch bakes its address.
+            _fill = int(self.get_cuda_graph_seq_len_fill_value())
+            _cache = getattr(self, "_kunlun_capture_kvseqlen_cpu", None)
+            if _cache is None or _cache.numel() != _n or int(_cache[0]) != _fill:
+                _cache = torch.full((_n,), _fill, dtype=torch.int32)
+                self._kunlun_capture_kvseqlen_cpu = _cache
+            kvseqlen_cpu = _cache
+            _seq_cpu = None
+        else:
+            _seq_cpu = (
+                getattr(forward_batch, "seq_lens_cpu", None)
+                if forward_batch is not None
+                else None
+            )
+            if _seq_cpu is not None and len(_seq_cpu) >= _n:
+                _seq_cpu = _seq_cpu[:_n]
+                kvseqlen_cpu = (
+                    _seq_cpu
+                    if _seq_cpu.dtype == torch.int32
+                    else _seq_cpu.to(torch.int32)
+                )
+            else:
+                kvseqlen_cpu = kvseqlen_xpu.to("cpu", non_blocking=False)
+
+        if os.environ.get("KUNLUN_DEBUG_KVSEQLEN"):
+            import sys as _sys
+
+            _flat = kvseqlen_cpu.reshape(-1)
+            print(
+                "[kdebug] compressed_attention "
+                f"fb={'yes' if forward_batch is not None else 'None'} "
+                f"mirror={'yes' if _seq_cpu is not None else 'None'} "
+                f"n={_flat.numel()} min={int(_flat.min())} max={int(_flat.max())} "
+                f"capturing={torch.cuda.is_current_stream_capturing()} "
+                f"mirror_dev={getattr(_seq_cpu, 'device', None)} "
+                f"mirror_dtype={getattr(_seq_cpu, 'dtype', None)} "
+                f"cpu_dev={kvseqlen_cpu.device} "
+                f"mode={getattr(getattr(forward_batch, 'forward_mode', None), 'name', None)} "
+                f"head={_flat[:4].tolist()}",
+                file=_sys.stderr,
+                flush=True,
+            )
 
         q_dtype = q.dtype
         win_cache = _flatten_cache(swa_k_cache)
         q_3d = q.squeeze(1)
-        if q_3d.dtype != win_cache.dtype:
+        # The internal fork's SWA pool is a *byte* buffer (uint8) in both the
+        # bf16 and fp8 layouts, so matching q to the storage dtype would produce
+        # a uint8 q the op rejects.  Keep q in its compute dtype and let the op
+        # read the cache; only mirror the dtype for real element-typed caches.
+        if win_cache.dtype not in (torch.uint8, torch.int8) and (
+            q_3d.dtype != win_cache.dtype
+        ):
             q_3d = q_3d.to(win_cache.dtype)
         q_3d = q_3d.contiguous()
         win_indices = swa_page_indices.squeeze(1).contiguous()
@@ -863,8 +860,18 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
 
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
-            # ``swa_window_size`` on the pool is its storage page size, not the
-            # model's SWA window — pass both explicitly.
+            # Internal fork's ``SparsePrefillChunkCache.build`` additionally
+            # requires ``max_seq_len`` and ``total_swa`` (the upstream v0.5.x
+            # signature computed ``total_swa`` internally).  Mirror the internal
+            # ``_build_sparse_prefill_chunk_cache`` computation.
+            seq_lens_cpu_list = forward_batch.seq_lens_cpu.tolist()
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            total_swa = sum(
+                min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
+                for seq_len, extend_len in zip(
+                    seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
+                )
+            )
             cache = SparsePrefillChunkCache.build(
                 seq_lens=forward_batch.seq_lens.to(torch.int32),
                 extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
@@ -872,8 +879,10 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 req_to_token=self.req_to_token,
                 full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
                 swa_window_size=SWA_WINDOW,
-                swa_page_size=token_to_kv_pool.swa_window_size,
+                swa_page_size=token_to_kv_pool.swa_page_size,
                 num_qo_tokens=q_flat.shape[0],
+                max_seq_len=max(seq_lens_cpu_list),
+                total_swa=total_swa,
             )
             self.forward_metadata.sparse_prefill_cache = cache
         # Resolve the workspace + indices for this ratio, then dequant
@@ -882,8 +891,13 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         extra_k_cache = None
         extra_page_size = None
         flat_token_ids = None
+        # The internal fork allocates the flat KV workspace from
+        # ``self.sparse_prefill_workspace`` (a per-backend pool), not from
+        # per-ratio ``cache.*_workspace`` attributes.
         if compress_ratio == 0:
-            workspace = cache.c0_workspace
+            workspace = self.sparse_prefill_workspace.get(
+                cache.swa_token_ids.shape[0]
+            )
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
             swa_slice = workspace
@@ -894,7 +908,6 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 assert core_attn_metadata.c128_page_indices is not None
                 cache.ensure_c128(core_attn_metadata.c128_page_indices)
                 flat_token_ids = cache.c128_flat_token_ids
-                workspace = cache.c128_workspace
                 combined_indices = cache.c128_combined_indices
                 combined_lens = cache.c128_combined_lens
             else:
@@ -904,22 +917,33 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 )
                 cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
                 flat_token_ids = cache.c4_flat_token_ids
-                workspace = cache.c4_workspace
                 combined_indices, combined_lens = cache.combine_c4_layer(
-                    c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices,
+                    c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices[
+                        : cache.num_qo_tokens
+                    ],
                 )
             n_compressed = flat_token_ids.shape[0]
+            workspace = self.sparse_prefill_workspace.get(
+                n_compressed + cache.swa_token_ids.shape[0]
+            )
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
+        from sglang_kunlun.kernels.kernel_ops import dequantize_k_cache_paged_torch
+
+        populate_kv_workspace = (
+            gather_bf16_k_cache_paged
+            if (self.is_bf16_kv_cache and gather_bf16_k_cache_paged is not None)
+            else dequantize_k_cache_paged_torch
+        )
         if compressed_slice is not None:
-            dequantize_k_cache_paged(
+            populate_kv_workspace(
                 extra_k_cache,
                 flat_token_ids,
                 page_size=extra_page_size,
                 out=compressed_slice,
             )
-        dequantize_k_cache_paged(
+        populate_kv_workspace(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,

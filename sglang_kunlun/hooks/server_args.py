@@ -65,6 +65,21 @@ def add_cli_args_kunlun(original_fn, parser):
 
 
 @plugin_hook(
+    # internal fork (v1.3.x): the DSV4 kv-cache dtype default/validation moved
+    # from ServerArgs._set_default_dsa_kv_cache_dtype to this declarative pass,
+    # which reads a read-only view and returns {field: resolved_value}.
+    "sglang.srt.arg_groups.overrides._deepseek_v4_kv_cache_dtype",
+    type=HookType.AROUND,
+)
+def _deepseek_v4_kv_cache_dtype_kunlun(original_fn, view):
+    """Accept float16 instead of asserting on the bf16/fp8_e4m3 whitelist."""
+    if getattr(view, "kv_cache_dtype", None) in _FLOAT16_ALIASES:
+        return {"kv_cache_dtype": "float16"}
+    return original_fn(view)
+
+
+@plugin_hook(
+    # v0.5.x equivalent (kept so the plugin still works on upstream sglang).
     "sglang.srt.server_args.ServerArgs._set_default_dsa_kv_cache_dtype",
     type=HookType.AROUND,
 )

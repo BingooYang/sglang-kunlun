@@ -289,6 +289,12 @@ def _fused_k_norm_rope_flashmla_kunlun(
         torch.ops.xspeedgate_ops.set_k_and_s_v4(kvcache, _loc, kv_out, page_size)
         return
 
+    # Byte-addressed bf16 layout (internal fork: uint8 pool, 2 bytes/element).
+    if kvcache.dtype == torch.uint8 and kvcache.shape[1] == page_size * head_dim * 2:
+        kv_out = torch.cat([kv_nope, kv_rope_rot], dim=-1).to(torch.bfloat16)
+        _store_bf16_rows(kvcache, out_loc, kv_out, page_size)
+        return
+
     raise NotImplementedError(
         f"_fused_k_norm_rope_flashmla_kunlun only supports bf16/fp16 kvcache, "
         f"got {kvcache.dtype}"
@@ -706,18 +712,30 @@ def _compress_forward_c128_torch(
                 (write_locs >= 0).unsqueeze(1), kv_score_input[:P], cur
             )
         else:
-            # Prefill runs eagerly (prefill cuda graph disabled) -> boolean mask is fine.
-            plan_w = plan[2]  # [num_w, 8] uint8 = WritePlan
+            # [CG-CAPTURE-SAFE extend compress write] Static-shape scatter (no
+            # boolean mask / .any() / nonzero()) so the verify path's in-graph
+            # metadata materialisation stays capture-legal.  Invalid rows
+            # (write_loc < 0) are routed to an appended scratch slot that is
+            # discarded, so they never corrupt real state slots.
+            plan_w = plan[2]  # [N, 8] uint8 = WritePlan
             if plan_w.shape[0] > 0:
-                plan_w_raw = plan_w.view(torch.int32)  # [num_w, 2]
+                plan_w_raw = plan_w.view(torch.int32)  # [N, 2]
                 ragged_ids = plan_w_raw[:, 0].long() & 0xFFFF
                 write_locs = plan_w_raw[:, 1].long()
                 valid_write = (write_locs >= 0) & (write_locs < num_total_slots)
-                ragged_ids_safe = ragged_ids.clamp(min=0, max=kv_score_input.shape[0] - 1)
-                if valid_write.any():
-                    buf_flat[write_locs[valid_write]] = kv_score_input[
-                        ragged_ids_safe[valid_write]
-                    ]
+                ragged_ids_safe = ragged_ids.clamp(
+                    min=0, max=kv_score_input.shape[0] - 1
+                )
+                tgt = torch.where(
+                    valid_write,
+                    write_locs.clamp(0, num_total_slots - 1),
+                    torch.full_like(write_locs, num_total_slots),
+                )
+                padded = torch.cat(
+                    [buf_flat, buf_flat.new_zeros(1, last_dim)], dim=0
+                )
+                padded[tgt] = kv_score_input[ragged_ids_safe]
+                buf_flat.copy_(padded[:num_total_slots])
 
     # Step 2: COMPRESS (read from buffer page and softmax-pool) -- unchanged, graph-safe.
     plan_c = plan[1]
@@ -816,7 +834,106 @@ def _compress_forward_torch(
 # ---------------------------------------------------------------------------
 
 
-def _store_compress_kv_int8(kvcache, out_locs, kv_out, page_size=None):
+def _store_bf16_rows(kvcache, loc, rows_bf16, page_size, valid=None):
+    """Scatter ``[N, D]`` bf16 rows into a byte-addressed paged buffer.
+
+    The internal fork stores the bf16 KV layout in a *uint8* pool
+    (``bytes_per_token = D * 2``), so the rows go in as raw bf16 bytes at
+    ``page*page_bytes + in_page*(D*2)``.
+    """
+    n, d = rows_bf16.shape
+    page_bytes = kvcache.shape[1]
+    u8 = kvcache.contiguous().view(torch.uint8).reshape(-1)
+    src = rows_bf16.contiguous().view(torch.uint8).reshape(n, d * 2)
+    loc = loc.to(torch.int64).clamp(min=0, max=kvcache.shape[0] * page_size - 1)
+    page = torch.div(loc, page_size, rounding_mode="floor")
+    in_page = loc % page_size
+    base = page * page_bytes + in_page * (d * 2)
+    ar = torch.arange(d * 2, device=u8.device)
+    if valid is None:
+        idx = base[:, None] + ar[None, :]
+        u8[idx.reshape(-1)] = src.reshape(-1)
+        return
+    # Rows the plan marked invalid are routed to an appended scratch token that
+    # is discarded, so they never corrupt real slots.  The selection is pure
+    # int64 arithmetic: XPU's graph capturer rejects `where` on uint8 data.
+    total = u8.numel()
+    m = valid.unsqueeze(1).to(torch.int64)
+    tgt = base[:, None] * m + total * (1 - m)
+    padded = torch.cat([u8, u8.new_zeros(d * 2)], dim=0)
+    idx = tgt + ar[None, :]
+    padded[idx.reshape(-1)] = src.reshape(-1)
+    u8.copy_(padded[:total])
+
+
+def _store_compress_kv_flashmla_fp8(kvcache, loc, kv_out, page_size, valid=None):
+    """Write the FlashMLA fp8 compress-cache layout.
+
+    Per token: 448 fp8-e4m3 nope bytes + 64 bf16 rope (128 bytes) = 576 bytes,
+    followed by 7 UE8M0 scale bytes padded to 8, at
+    ``page*page_bytes + 576*page_size + in_page*8``.  Page stride is
+    ``ceil(584*page_size/576)*576`` (mirrors ``FusedNormRopeKernel``'s
+    ``kPageBytes`` in ``fused_norm_rope_v2.cuh``).  Same layout the SWA K cache
+    uses, hence the reuse of the nope/rope split below.
+    """
+    nope_dim, rope_dim = 448, 64
+    tile, num_tiles = 64, 7
+    page_bytes = kvcache.shape[1]
+    device = kvcache.device
+    u8 = kvcache.contiguous().view(torch.uint8).reshape(-1)
+
+    loc = loc.to(torch.int64)
+    x = kv_out.detach().float()
+    nope = x[:, :nope_dim].reshape(-1, num_tiles, tile)
+    rope = kv_out.detach()[:, nope_dim:].to(torch.bfloat16).contiguous()
+
+    # per-64 UE8M0 scales (exponent+127), same encoding as the SWA writer.
+    amax = nope.abs().amax(dim=-1).clamp(min=1e-4)
+    scale_raw = amax / 448.0
+    scale_u8 = (
+        (torch.floor(torch.log2(scale_raw)) + 127.0).clamp(0, 254).to(torch.uint8)
+    )
+    inv = 2.0 ** (127.0 - scale_u8.float())
+    q_u8 = _e4m3_to_uint8((nope * inv.unsqueeze(-1)).clamp(-448.0, 448.0)).reshape(-1)
+
+    page = torch.div(loc, page_size, rounding_mode="floor")
+    in_page = loc % page_size
+    token_base = page * page_bytes + in_page * 576
+
+    ar_nope = torch.arange(nope_dim, device=device)
+    nope_idx = token_base[:, None] + ar_nope[None, :]
+    rope_bytes = rope.view(torch.uint8).reshape(rope.shape[0], -1)
+    ar_rope = torch.arange(rope_dim * 2, device=device)
+    rope_idx = token_base[:, None] + nope_dim + ar_rope[None, :]
+    scale_base = page * page_bytes + 576 * page_size + in_page * 8
+    ar_scale = torch.arange(num_tiles, device=device)
+    scale_idx = scale_base[:, None] + ar_scale[None, :]
+
+    if valid is None:
+        u8[nope_idx.reshape(-1)] = q_u8
+        u8[rope_idx.reshape(-1)] = rope_bytes.reshape(-1)
+        u8[scale_idx.reshape(-1)] = scale_u8.reshape(-1)
+        return
+
+    # Rows the plan marked invalid go to an appended scratch token that is
+    # discarded.  Pure int64 arithmetic: XPU's graph capturer rejects `where`
+    # on uint8 data.
+    total = u8.numel()
+    scratch = total
+    padded = torch.cat(
+        [u8, u8.new_zeros(nope_dim + rope_dim * 2 + num_tiles)], dim=0
+    )
+    m = valid.unsqueeze(1).to(torch.int64)
+    nope_tgt = nope_idx * m + scratch * (1 - m)
+    rope_tgt = rope_idx * m + (scratch + nope_dim) * (1 - m)
+    scale_tgt = scale_idx * m + (scratch + nope_dim + rope_dim * 2) * (1 - m)
+    padded[nope_tgt.reshape(-1)] = q_u8
+    padded[rope_tgt.reshape(-1)] = rope_bytes.reshape(-1)
+    padded[scale_tgt.reshape(-1)] = scale_u8.reshape(-1)
+    u8.copy_(padded[:total])
+
+
+def _store_compress_kv_int8(kvcache, out_locs, kv_out, page_size=None, valid=None):
     """Write compressed K into the paged compress cache.
 
     ``xspeedgate_ops.set_mla_kv_buffer`` does not exist in every image and the
@@ -838,6 +955,9 @@ def _store_compress_kv_int8(kvcache, out_locs, kv_out, page_size=None):
     page_elems = kvcache.numel() // num_pages
     loc = out_locs.to(torch.int64)
 
+    if valid is not None:
+        valid = valid.to(torch.bool)
+
     if kvcache.dtype in (torch.bfloat16, torch.float16, torch.float32):
         block = page_elems // head_dim
         if block <= 0 or page_elems != block * head_dim:
@@ -849,11 +969,38 @@ def _store_compress_kv_int8(kvcache, out_locs, kv_out, page_size=None):
         idx = (loc * head_dim).unsqueeze(1) + torch.arange(
             head_dim, device=flat.device, dtype=torch.int64
         ).unsqueeze(0)
-        flat[idx.reshape(-1)] = kv_out.reshape(-1).to(flat.dtype)
+        src = kv_out.reshape(-1).to(flat.dtype)
+        if valid is None:
+            flat[idx.reshape(-1)] = src
+            return
+        total = flat.numel()
+        m = valid.unsqueeze(1).to(torch.int64)
+        tgt = idx * m + total * (1 - m)
+        padded = torch.cat([flat, flat.new_zeros(head_dim)], dim=0)
+        padded[tgt.reshape(-1)] = src
+        flat.copy_(padded[:total])
         return
 
     # byte-addressed page buffer
     page_bytes = page_elems * kvcache.element_size()
+
+    # bf16 latent layout in a byte buffer: head_dim * 2 bytes/token.
+    if page_size and page_bytes == page_size * head_dim * 2:
+        _store_bf16_rows(
+            kvcache, loc, kv_out.to(torch.bfloat16), page_size, valid=valid
+        )
+        return
+
+    # FlashMLA fp8 latent layout: 576 B/token + 8 B scales, page stride
+    # ceil(584*page_size/576)*576 (e.g. page_size=64 -> 37440).
+    if page_size:
+        flashmla_page_bytes = ((584 * page_size + 575) // 576) * 576
+        if page_bytes == flashmla_page_bytes:
+            _store_compress_kv_flashmla_fp8(
+                kvcache, loc, kv_out, page_size, valid=valid
+            )
+            return
+
     block = page_bytes // (head_dim + 4)
     if block <= 0 or page_bytes != block * (head_dim + 4):
         block_alt = page_bytes // head_dim
@@ -1029,11 +1176,15 @@ def _compress_norm_rope_store_kunlun(
     kv_out = torch.cat([kv_nope, kv_rope_rot], dim=-1)  # [N, head_dim]
 
     # --- Step 3: Store to paged cache (same as torch version) ---
+    valid_rows = None
     if plan.is_decode:
         out_locs = out_loc
     else:
         plan_c_raw = plan[1].contiguous().view(torch.int32)
         ragged_ids = plan_c_raw[:, 1].long() & 0xFFFF
+        # Fixed-capacity prefill plans carry invalid rows; they must not be
+        # written (their slot would otherwise clamp to row 0).
+        valid_rows = plan_c_raw[:, 0].to(torch.int64) > 0
         out_locs = out_loc[ragged_ids.clamp(min=0, max=out_loc.shape[0] - 1)]
 
     if kv_out.shape[0] == 0:
@@ -1047,7 +1198,9 @@ def _compress_norm_rope_store_kunlun(
     except Exception:
         pack = kv_out.bfloat16()
 
-    _store_compress_kv_int8(kvcache, out_locs, kv_out, page_size=page_size)
+    _store_compress_kv_int8(
+        kvcache, out_locs, kv_out, page_size=page_size, valid=valid_rows
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1247,6 +1400,53 @@ def _compress_forward_c4_torch(
 # analogues live in compress.py; these prefill counterparts are host-side plan
 # builders (run at prefill prepare, outside CUDA-graph capture).
 # ===========================================================================
+def _dedup_last_wins(locs: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Clear every writer but the highest-row-index one for each ``loc``.
+
+    Reproduces the host-side "later token wins" dedup that a sequential scatter
+    gives, using only fixed-shape ops (argsort / compare / scatter) so it stays
+    legal inside CUDA-graph capture.  Invalid rows (``loc == -1``) are never
+    revived because the caller ANDs with ``valid``.
+    """
+    if locs.numel() == 0:
+        return valid
+    order = torch.argsort(locs, stable=True)
+    sorted_loc = locs[order]
+    keep_sorted = torch.ones_like(sorted_loc, dtype=torch.bool)
+    if sorted_loc.numel() > 1:
+        keep_sorted[:-1] = sorted_loc[:-1] != sorted_loc[1:]
+    keep = torch.empty_like(keep_sorted)
+    keep[order] = keep_sorted
+    return valid & keep
+
+
+def _prefill_grid(seq_lens, extend_lens, num_q_tokens):
+    """Per-global-token ``(b_idx, j, tok_pos, in_req)`` for the prefill plans.
+
+    Row ``k`` of a prefill plan corresponds to global query token ``k``; this
+    expands that mapping without any host sync.
+    """
+    device = seq_lens.device
+    bs = int(seq_lens.shape[0])
+    nq = int(num_q_tokens)
+    k = torch.arange(nq, device=device)
+    # NOTE: callers pass seq_lens/extend_lens already moved onto the device of
+    # req_to_token/full_to_swa; those two are CPU-side planners in the internal
+    # fork (torch.tensor(seq_lens_cpu, ...)), so they must be coerced first.
+    if bs == 0:
+        z = torch.zeros(nq, dtype=torch.int64, device=device)
+        return z, z, z, torch.zeros(nq, dtype=torch.bool, device=device)
+    seq = seq_lens.to(torch.int64)
+    ext = extend_lens.to(torch.int64)
+    ends = torch.cumsum(ext, 0)
+    b_idx = torch.searchsorted(ends, k, right=True).clamp(max=bs - 1)
+    ragged_off = ends - ext
+    j = k - ragged_off[b_idx]
+    in_req = (j >= 0) & (j < ext[b_idx])
+    tok_pos = seq[b_idx] - ext[b_idx] + j
+    return b_idx, j, tok_pos, in_req
+
+
 def _make_prefill_plan_torch(
     compress_ratio: int,
     req_pool_indices: torch.Tensor,   # [bs] int64
@@ -1258,81 +1458,81 @@ def _make_prefill_plan_torch(
     ring_size: int,
     num_q_tokens: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pure-Python reimplementation of plan_compress_prefill.
+    """Device-side (CUDA-graph replayable) c128 CompressPlan / WritePlan builder.
 
-    Returns (plan_c, plan_w) where:
-      plan_c: [num_c, 16] uint8  (CompressPlan layout)
-      plan_w: [num_w, 8] uint8   (WritePlan layout)
+    Row ``k`` of the plan is global query token ``k``, so the plan keeps the
+    fixed capacity ``[num_q_tokens, 16]`` / ``[num_q_tokens, 8]`` that the
+    internal fork's contract expects; rows with no entry are marked invalid
+    (``seq_len == 0`` / ``read_page_0 == -1`` / ``write_loc == -1``) rather than
+    compacted away.  Nothing here reads device values on the host, so the
+    builder is legal inside CUDA-graph capture (the verify path materialises its
+    metadata in-graph and replays it).
 
     CompressPlan (16 bytes):
       uint32  seq_len
       uint16  ragged_id
-      uint16  buffer_len  (not used here, set 0)
-      int32   read_page_0
-      int32   read_page_1  (not used, set 0 or -1)
-
+      uint16  buffer_len  (unused here, 0)
+      int32   read_page_0 (state slot; -1 = invalid row)
+      int32   read_page_1 (unused here, 0)
     WritePlan (8 bytes):
-      uint32  ragged_id  (packed: batch_id<<16 | ragged_id, but we set just ragged_id)
-      int32   write_loc
+      uint32  ragged_id
+      int32   write_loc   (-1 = invalid row)
     """
-    device = seq_lens.device
-    cr = compress_ratio
-    bs = int(seq_lens.shape[0])
+    # The internal fork passes seq_lens/extend_lens as CPU planner tensors while
+    # req_to_token / full_to_swa live on the device, so the device has to come
+    # from the latter (using seq_lens.device would mix CPU and XPU).
+    device = req_to_token.device
+    cr = int(compress_ratio)
+    sps = int(swa_page_size)
+    rs = int(ring_size)
+    nq = int(num_q_tokens)
 
-    compress_entries = []  # list of (seq_len, ragged_id, state_loc)
-    write_entries = []     # list of (ragged_id, state_loc)
+    plan_c = torch.zeros(max(nq, 1), 16, dtype=torch.uint8, device=device)
+    plan_w = torch.zeros(max(nq, 1), 8, dtype=torch.uint8, device=device)
+    if nq == 0:
+        return plan_c[:0], plan_w[:0]
 
-    ragged_offset = 0  # running offset across all tokens in all requests
-    for b in range(bs):
-        seq_len = int(seq_lens[b].item())
-        extend_len = int(extend_lens[b].item())
-        prefix_len = seq_len - extend_len
-        rid = int(req_pool_indices[b].item())
-        # See _make_prefill_plan_c4_torch: the state pool is a paged ring, so only
-        # the tail tokens that later steps still read are written (no overlap for
-        # this layout, hence first_w_pos == last compress position).
-        first_w_pos = (seq_len // cr) * cr
+    seq = seq_lens.to(device=device, dtype=torch.int64)
+    ext = extend_lens.to(device=device, dtype=torch.int64)
+    rid_pool = req_pool_indices.to(device=device, dtype=torch.int64)
+    b_idx, _j, tok_pos, in_req = _prefill_grid(seq, ext, nq)
+    pos_in_seq = tok_pos + 1
 
-        for j in range(extend_len):
-            tok_pos = prefix_len + j  # position within the full sequence
-            ragged_id = ragged_offset + j
+    safe_col = tok_pos.clamp(0, req_to_token.shape[1] - 1)
+    safe_row = rid_pool[b_idx].clamp(0, req_to_token.shape[0] - 1)
+    full_id = req_to_token[safe_row, safe_col].to(torch.int64)
+    full_id = full_id.clamp(0, full_to_swa.shape[0] - 1)
+    swa_loc = full_to_swa[full_id]
+    swa_page = torch.div(swa_loc, sps, rounding_mode="floor")
+    state_loc = torch.div(
+        swa_page * rs + (swa_loc % rs), cr, rounding_mode="floor"
+    )
 
-            # Compress entry: only at boundary positions
-            pos_in_seq = tok_pos + 1  # 1-indexed position after this token
-            if pos_in_seq % cr == 0 and pos_in_seq > 0:
-                # This token is at the last position of a compress group
-                token_loc_abs = int(req_to_token[rid, tok_pos].item())
-                swa_loc = int(full_to_swa[token_loc_abs].item())
-                swa_page = swa_loc // swa_page_size
-                state_loc = (swa_page * ring_size + (swa_loc % ring_size)) // cr
-                compress_entries.append((pos_in_seq, ragged_id, state_loc))
-                if tok_pos >= first_w_pos:
-                    write_entries.append((ragged_id, state_loc))
+    neg1 = torch.full_like(state_loc, -1)
+    k = torch.arange(nq, device=device)
 
-        ragged_offset += extend_len
+    is_boundary = in_req & (pos_in_seq % cr == 0) & (pos_in_seq > 0)
+    first_w_pos = torch.div(seq[b_idx], cr, rounding_mode="floor") * cr
+    do_write = is_boundary & (tok_pos >= first_w_pos)
 
-    num_c = len(compress_entries)
-    num_w = len(write_entries)
-    plan_c = torch.zeros(max(num_c, 1), 16, dtype=torch.uint8, device=device)
-    plan_w = torch.zeros(max(num_w, 1), 8, dtype=torch.uint8, device=device)
+    # Select with int64 arithmetic rather than ``torch.where``: XPU's graph
+    # capturer rejects several ``where`` dtype combinations.
+    mb = is_boundary.to(torch.int64)
+    pc = plan_c.view(torch.int32)
+    pc[:, 0] = (pos_in_seq * mb).to(torch.int32)
+    pc[:, 1] = (k * mb).to(torch.int32)
+    pc[:, 2] = (state_loc * mb + neg1 * (1 - mb)).to(torch.int32)
+    pc[:, 3] = 0
 
-    if num_c > 0:
-        pc_i32 = plan_c.view(torch.int32)  # [num_c, 4]
-        for i, (sl, rid, sloc) in enumerate(compress_entries):
-            pc_i32[i, 0] = sl     # seq_len
-            pc_i32[i, 1] = rid    # ragged_id (low 16) + buffer_len (high 16) = 0
-            pc_i32[i, 2] = sloc   # read_page_0
-            pc_i32[i, 3] = 0
+    # Duplicate state slots: keep the later token (a sequential scatter's
+    # last-write-wins), resolved on device instead of with a host dict.
+    mw = do_write.to(torch.int64)
+    do_write = _dedup_last_wins(state_loc * mw + neg1 * (1 - mw), do_write)
+    mw = do_write.to(torch.int64)
+    pw = plan_w.view(torch.int32)
+    pw[:, 0] = (k * mw).to(torch.int32)
+    pw[:, 1] = (state_loc * mw + neg1 * (1 - mw)).to(torch.int32)
 
-    if num_w > 0:
-        pw_i32 = plan_w.view(torch.int32)  # [num_w, 2]
-        for i, (rid, sloc) in enumerate(write_entries):
-            pw_i32[i, 0] = rid    # ragged_id
-            pw_i32[i, 1] = sloc   # write_loc
-
-    # Trim to actual sizes
-    plan_c = plan_c[:num_c]
-    plan_w = plan_w[:num_w]
     return plan_c, plan_w
 
 
@@ -1347,73 +1547,71 @@ def _make_prefill_plan_c4_torch(
     ring_size,
     num_q_tokens,
 ):
-    """c4 CompressPlan/[num_c,16] + WritePlan/[num_w,8].
-    Writes EVERY extend token to the state pool so overlap pages are populated.
+    """Device-side c4 CompressPlan/[num_q_tokens,16] + WritePlan/[num_q_tokens,8].
+
+    Same fixed-capacity, row==token, invalid-marked contract as the c128 builder
+    (see :func:`_make_prefill_plan_torch`), plus the c4 overlap semantics: every
+    extend token that later steps still read is written to the state pool (the
+    tail of the sequence and the last ``cr`` tokens of each SWA page), and each
+    compress entry reads the overlapping pair of SWA pages.
     """
-    device = seq_lens.device
+    # Same CPU-planner / device-cache split as the c128 builder above.
+    device = req_to_token.device
     cr = int(compress_ratio)
     sps = int(swa_page_size)
     rs = int(ring_size)
-    bs = int(seq_lens.shape[0])
+    nq = int(num_q_tokens)
 
-    def cl(x):
-        return (x // sps) * rs + (x % rs)
+    plan_c = torch.zeros(max(nq, 1), 16, dtype=torch.uint8, device=device)
+    plan_w = torch.zeros(max(nq, 1), 8, dtype=torch.uint8, device=device)
+    if nq == 0:
+        return plan_c[:0], plan_w[:0]
 
-    comp = []  # (seq_len, ragged_id, read_page_0, read_page_1)
-    wr = []    # (ragged_id, write_loc)
-    ragged_off = 0
-    for b in range(bs):
-        seq_len = int(seq_lens[b].item())
-        ext = int(extend_lens[b].item())
-        pl = seq_len - ext
-        rid = int(req_pool_indices[b].item())
-        # The state pool is a paged ring: only ``ring_size`` slots exist per SWA
-        # page, so writing every extend token (as this used to do) makes the
-        # tokens of one page overwrite each other and leaves the pool holding
-        # whichever token happened to land last. The native plan only writes the
-        # tokens that later steps still need: the tail of the sequence and, for
-        # the overlap (c4) layout, the last ``cr`` tokens of every SWA page.
-        last_c_pos = (seq_len // cr) * cr
-        first_w_pos = last_c_pos - cr
-        for j in range(ext):
-            pos = pl + j
-            ragged_id = ragged_off + j
-            do_write = pos >= first_w_pos or (pos % sps) >= (sps - cr)
-            if do_write:
-                raw = int(req_to_token[rid, pos].item())
-                swa = int(full_to_swa[raw].item())
-                wr.append((ragged_id, cl(swa)))
-            if (pos + 1) % cr == 0:
-                pos1 = pos
-                pos0 = max(pos1 - cr, 0)
-                r1 = int(req_to_token[rid, pos1].item())
-                r0 = int(req_to_token[rid, pos0].item())
-                s1 = int(full_to_swa[r1].item())
-                s0 = int(full_to_swa[r0].item())
-                comp.append((pos + 1, ragged_id, cl(s0) // cr, cl(s1) // cr))
-        ragged_off += ext
+    seq = seq_lens.to(device=device, dtype=torch.int64)
+    ext = extend_lens.to(device=device, dtype=torch.int64)
+    rid_pool = req_pool_indices.to(device=device, dtype=torch.int64)
+    b_idx, _j, pos, in_req = _prefill_grid(seq, ext, nq)
+    safe_row = rid_pool[b_idx].clamp(0, req_to_token.shape[0] - 1)
+    max_col = req_to_token.shape[1] - 1
 
-    # Long prompts make several extend tokens map onto the same state-pool slot
-    # (the pool is a paged ring) and a scatter with duplicate indices has
-    # undefined behaviour. Keep the sequential last-token-wins semantics of the
-    # native kernel by dropping the earlier writers here on the host: the device
-    # path then needs no index-validating dedup, which is illegal during CUDA
-    # graph capture (the recorded indices are not materialised yet).
-    if wr:
-        wr = list({wl: (rid, wl) for rid, wl in wr}.values())
+    def _swa_at(col):
+        c = col.clamp(0, max_col)
+        fid = req_to_token[safe_row, c].to(torch.int64)
+        fid = fid.clamp(0, full_to_swa.shape[0] - 1)
+        return full_to_swa[fid]
 
-    num_c = len(comp)
-    num_w = len(wr)
-    plan_c = torch.zeros(max(num_c, 1), 16, dtype=torch.uint8, device=device)
-    plan_w = torch.zeros(max(num_w, 1), 8, dtype=torch.uint8, device=device)
+    def _cl(x):
+        return torch.div(x, sps, rounding_mode="floor") * rs + (x % rs)
+
+    c1 = _cl(_swa_at(pos))
+    c0 = _cl(_swa_at((pos - cr).clamp(min=0)))
+
+    last_c_pos = torch.div(seq[b_idx], cr, rounding_mode="floor") * cr
+    first_w_pos = last_c_pos - cr
+    do_write = in_req & ((pos >= first_w_pos) | ((pos % sps) >= (sps - cr)))
+    write_loc = c1
+
+    is_bnd = in_req & ((pos + 1) % cr == 0)
+    k = torch.arange(nq, device=device)
+    neg1 = torch.full_like(c1, -1)
+
+    # Select with int64 arithmetic rather than ``torch.where``: XPU's graph
+    # capturer rejects several ``where`` dtype combinations.
+    mb = is_bnd.to(torch.int64)
+    rp0 = torch.div(c0, cr, rounding_mode="floor")
+    rp1 = torch.div(c1, cr, rounding_mode="floor")
     pc = plan_c.view(torch.int32)
+    pc[:, 0] = ((pos + 1) * mb).to(torch.int32)
+    pc[:, 1] = (k * mb).to(torch.int32)
+    pc[:, 2] = (rp0 * mb + neg1 * (1 - mb)).to(torch.int32)
+    pc[:, 3] = (rp1 * mb + neg1 * (1 - mb)).to(torch.int32)
+
+    # Ring slots collide for long prompts; keep the later token, on device.
+    mw = do_write.to(torch.int64)
+    do_write = _dedup_last_wins(write_loc * mw + neg1 * (1 - mw), do_write)
+    mw = do_write.to(torch.int64)
     pw = plan_w.view(torch.int32)
-    for i, (sl, rid, rp0, rp1) in enumerate(comp):
-        pc[i, 0] = sl
-        pc[i, 1] = rid
-        pc[i, 2] = rp0
-        pc[i, 3] = rp1
-    for i, (rid, wl) in enumerate(wr):
-        pw[i, 0] = rid
-        pw[i, 1] = wl
-    return plan_c[:num_c], plan_w[:num_w]
+    pw[:, 0] = (k * mw).to(torch.int32)
+    pw[:, 1] = (write_loc * mw + neg1 * (1 - mw)).to(torch.int32)
+
+    return plan_c, plan_w

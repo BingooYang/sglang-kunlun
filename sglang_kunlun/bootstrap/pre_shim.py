@@ -180,6 +180,50 @@ def _disable_xgrammar_import() -> None:
     module.get_model_structural_tag = None
     sys.modules["xgrammar"] = module
 
+    # Some optional function-call detectors (e.g. ernie_lite) import
+    # ``xgrammar.structural_tag`` at module import time.  Expose a placeholder
+    # submodule so those imports succeed; the formats are only ever
+    # *instantiated* inside detector methods, which we never call.
+    st = types.ModuleType("xgrammar.structural_tag")
+    st.__file__ = "<kunlun-xgrammar-disabled>"
+    st.__spec__ = importlib.machinery.ModuleSpec(
+        "xgrammar.structural_tag", loader=None
+    )
+
+    class _UnavailableFormat:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                "xgrammar is disabled on the Kunlun backend; "
+                "structural-tag based parsers are unavailable"
+            )
+
+    # Full name set imported anywhere in sglang (CUDA + internal forks).
+    _FORMAT_NAMES = (
+        "AnyTextFormat", "AnyTokensFormat", "ConstStringFormat",
+        "ExcludeTokenFormat", "Format", "JSONSchemaFormat", "OptionalFormat",
+        "OrFormat", "RegexFormat", "SequenceFormat", "StarFormat", "TagFormat",
+        "TagsWithSeparatorFormat", "TokenFormat", "TriggeredTagsFormat",
+        "StructuralTag",
+    )
+    for _name in _FORMAT_NAMES:
+        setattr(st, _name, _UnavailableFormat)
+    sys.modules["xgrammar.structural_tag"] = st
+    module.structural_tag = st
+
+    # Names imported straight from ``xgrammar``.
+    def _unavailable_fn(*_a, **_kw):
+        raise RuntimeError(
+            "xgrammar is disabled on the Kunlun backend"
+        )
+
+    for _name in (
+        "CompiledGrammar", "GrammarCompiler", "GrammarMatcher",
+        "StructuralTagItem", "TokenizerInfo",
+    ):
+        setattr(module, _name, _UnavailableFormat)
+    for _name in ("bitmask_dtype", "get_bitmask_shape"):
+        setattr(module, _name, _unavailable_fn)
+
 
 def _kunlun_pre_shim() -> None:
     """Force triton's active driver to advertise ``backend == "cuda"``."""

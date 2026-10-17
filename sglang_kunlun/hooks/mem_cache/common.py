@@ -67,9 +67,16 @@ def alloc_extend_kunlun(
     out_indices = torch.empty(
         (extend_num_tokens,), dtype=torch.int64, device=self.device
     )
-    from sglang.srt.mem_cache.triton_ops.allocator import alloc_extend_kernel
+    # Call the Kunlun implementation directly instead of importing the upstream
+    # symbol through the ``sglang.srt.mem_cache.triton_ops.allocator`` compat
+    # alias: that alias is re-bound at runtime and the module object the caller
+    # sees may not be the one ``kernel_ops.install()`` patched (verified: the
+    # alias path yields a *duplicate* module object holding the raw Triton
+    # JITFunction), so the replacement is lost and the raw kernel is launched
+    # (fails on XPU with ``'_CudaTarget' object has no attribute 'arch'``).
+    from sglang_kunlun.kernels.kernel_ops import alloc_extend_kernel
 
-    alloc_extend_kernel[(bs,)](
+    alloc_extend_kernel(
         prefix_lens,
         seq_lens,
         last_loc,

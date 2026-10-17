@@ -61,3 +61,9 @@ from . import attention_registry  # noqa: E402,F401
 from . import nsa  # noqa: E402,F401
 from . import fla  # noqa: E402,F401
 from . import deepseek_v4_backend  # noqa: E402,F401
+# NOTE: this subpackage was never imported (dead code) — its hooks
+# (compressor / index_buf_accessor / quant_k_cache / metadata_kernel)
+# therefore never registered.  Needed on sglang >= the kernels.ops
+# relocation, where the stale module-level aliases make kernel_ops'
+# setattr-only patching insufficient.
+from . import dsv4  # noqa: E402,F401

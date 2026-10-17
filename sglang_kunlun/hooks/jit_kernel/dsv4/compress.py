@@ -134,19 +134,26 @@ def _make_decode_plan_c4_torch(
 
 
 @plugin_hook(
-    "sglang.jit_kernel.dsv4.compress.CompressorDecodePlan.generate",
+    "sglang.kernels.ops.attention.dsv4.compress.CompressorDecodePlan.generate",
     type=HookType.REPLACE,
 )
 def _decode_plan_generate_torch(
     compress_ratio,
     req_pool_indices,
     req_to_token,
-    full_to_swa,
-    seq_lens,
-    swa_page_size,
-    ring_size,
+    full_to_swa=None,
+    seq_lens=None,
+    swa_page_size=None,
+    ring_size=None,
+    **kwargs,
 ):
-    """Pure-torch ``CompressorDecodePlan.generate`` (no tvm_ffi)."""
+    """Pure-torch ``CompressorDecodePlan.generate`` (no tvm_ffi).
+
+    ``**kwargs`` absorbs signature drift across sglang releases; the internal
+    fork renamed ``full_to_swa`` to ``full_to_state`` at the call site.
+    """
+    if full_to_swa is None:
+        full_to_swa = kwargs.get("full_to_state")
     from sglang.jit_kernel.dsv4.compress import CompressorDecodePlan
 
     _mk_dec = (
@@ -167,7 +174,7 @@ def _decode_plan_generate_torch(
 
 
 @plugin_hook(
-    "sglang.jit_kernel.dsv4.compress.CompressorPrefillPlan.generate",
+    "sglang.kernels.ops.attention.dsv4.compress.CompressorPrefillPlan.generate",
     type=HookType.REPLACE,
 )
 def _prefill_plan_generate_torch(
@@ -176,13 +183,20 @@ def _prefill_plan_generate_torch(
     seq_lens,
     extend_lens,
     req_to_token,
-    full_to_swa,
-    swa_page_size,
-    ring_size,
-    num_q_tokens,
+    full_to_swa=None,
+    swa_page_size=None,
+    ring_size=None,
+    num_q_tokens=None,
     use_cuda_graph=False,
+    **kwargs,
 ):
-    """Pure-torch ``CompressorPrefillPlan.generate`` (no tvm_ffi)."""
+    """Pure-torch ``CompressorPrefillPlan.generate`` (no tvm_ffi).
+
+    ``**kwargs`` absorbs signature drift across sglang releases; in particular
+    newer sglang renamed ``full_to_swa`` to ``full_to_state``.
+    """
+    if full_to_swa is None:
+        full_to_swa = kwargs.get("full_to_state")
     from sglang.jit_kernel.dsv4.compress import CompressorPrefillPlan
     from sglang_kunlun.kernels.dsv4_torch_shim import (
         _make_prefill_plan_c4_torch,

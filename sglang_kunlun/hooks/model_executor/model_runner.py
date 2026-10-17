@@ -41,5 +41,53 @@ def configure_kv_cache_dtype_kunlun(original_fn, self):
     """Resolve ``float16`` / ``half`` to ``torch.float16``."""
     if self.server_args.kv_cache_dtype in ("float16", "half"):
         self.kv_cache_dtype = torch.float16
+        # Newer sglang also keeps a resolved *string* on the runner (attention
+        # backends read it instead of the process-global bag).  The stock body
+        # sets it, so we must mirror it when short-circuiting.
+        if hasattr(type(self), "kv_cache_dtype_str") or hasattr(self, "kv_cache_dtype_str"):
+            self.kv_cache_dtype_str = "float16"
+        else:
+            try:
+                self.kv_cache_dtype_str = "float16"
+            except Exception:
+                pass
         return
     return original_fn(self)
+
+
+@plugin_hook(
+    "sglang.srt.model_executor.model_runner.ModelRunner.load_model",
+    type=HookType.AFTER,
+)
+def _repair_kernel_bindings(result, self):
+    """Re-point stale kernel aliases once every module has been imported.
+
+    sglang imports many kernel symbols with ``from m import f as g`` at module
+    import time; a later patch of the defining module does not reach those
+    bindings.  By the time the model is loaded all of them exist, so one sweep
+    fixes them all.
+    """
+    try:
+        from sglang_kunlun.kernels.kernel_ops import repair_imported_bindings
+
+        repair_imported_bindings()
+    except Exception:  # noqa: BLE001 - never block model loading
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "kernel_ops: binding repair failed"
+        )
+
+
+@plugin_hook(
+    "sglang.srt.model_executor.model_runner.ModelRunner.__init__",
+    type=HookType.AFTER,
+)
+def _repair_kernel_bindings_early(result, self, *args, **kwargs):
+    """Second sweep: attention backends import their kernels during init."""
+    try:
+        from sglang_kunlun.kernels.kernel_ops import repair_imported_bindings
+
+        repair_imported_bindings()
+    except Exception:  # noqa: BLE001
+        pass

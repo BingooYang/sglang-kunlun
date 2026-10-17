@@ -38,6 +38,8 @@ from __future__ import annotations
 
 from sglang.srt.platforms.interface import SRTPlatform
 
+from sglang_kunlun.hooks.arg_groups import _resolution_compat as _resolution
+
 from .device import KunlunDeviceMixin
 
 
@@ -99,7 +101,7 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
         Replaces the old ``hooks/server_args.py`` page-size REPLACE hook.
         """
         if getattr(server_args, "page_size", None) is None:
-            server_args.page_size = 128
+            _resolution.declare(server_args, page_size=128)
 
     # ------------------------------------------------------------------
     # Subsystem factory methods

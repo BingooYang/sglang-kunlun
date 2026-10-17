@@ -49,11 +49,18 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    "sglang.srt.layers.attention.dsv4.metadata_kernel.init_compression_metadata",
+    "sglang.kernels.ops.attention.dsv4.metadata_kernel.init_compression_metadata",
     type=HookType.AROUND,
 )
 def init_compression_metadata_kunlun(original_fn, *args, **kwargs):
-    """Mask every ``c128_page_indices`` entry past a row's valid length to -1."""
+    """Mask every ``c128_page_indices`` entry past a row's valid length to -1.
+
+    The base call goes straight to the plugin's pure-torch implementation rather
+    than through ``original_fn``: the internal fork imports this symbol under an
+    alias (``_init_compression_metadata_triton``) at module import time, so a
+    later ``setattr`` on the defining module does not reach that binding and the
+    Triton kernel would still be attempted.
+    """
     out = original_fn(*args, **kwargs)
     page_indices = out[8]
     seq_lens_raw = out[6]
@@ -64,3 +71,20 @@ def init_compression_metadata_kunlun(original_fn, *args, **kwargs):
             torch.where(valid, page_indices, torch.full_like(page_indices, -1))
         )
     return out
+
+
+@plugin_hook(
+    "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels._inputs_on_cuda",
+    type=HookType.REPLACE,
+)
+def _inputs_on_cuda_kunlun(*args, **kwargs) -> bool:
+    """Force the torch reference path for the DSV4 metadata kernels on Kunlun.
+
+    Upstream routes on input placement — CUDA tensors take the fused Triton
+    kernel, CPU tensors the reference implementation.  ``torch_xmlir`` reports
+    its tensors as CUDA, so the Triton branch is taken even though Triton's
+    NVIDIA backend cannot compile for XPU (``_CudaTarget has no attribute
+    arch``).  Reporting "not CUDA" selects the reference implementation, which
+    is what the Kunlun kernels replace anyway.
+    """
+    return False

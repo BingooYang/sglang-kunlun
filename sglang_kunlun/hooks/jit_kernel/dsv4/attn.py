@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 
 @plugin_hook(
-    "sglang.jit_kernel.dsv4.attn.fused_store_cache",
+    "sglang.kernels.ops.attention.dsv4.attn.fused_store_cache",
     type=HookType.AROUND,
 )
 def fused_store_cache_kunlun(

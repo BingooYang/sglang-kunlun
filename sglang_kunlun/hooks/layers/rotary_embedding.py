@@ -27,7 +27,7 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    "sglang.srt.layers.rotary_embedding.RotaryEmbedding.forward_cuda",
+    "sglang.srt.layers.rotary_embedding.base.RotaryEmbedding.forward_cuda",
     type=HookType.REPLACE,
 )
 def rotary_embedding_forward_kunlun(

@@ -45,7 +45,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
-from sglang.srt.server_args import get_global_server_args
 from sglang_kunlun.environ import envs as patch_envs
 from sglang.srt.utils import get_bool_env_var, dispose_tensor
 from sglang.srt.layers.activation import SiluAndMul
@@ -83,6 +82,79 @@ from kunlun_ops import (
     silu_and_per_token_group_quant_I8,
 )
 logger = logging.getLogger(__name__)
+
+
+def _situ_and_mul_masked(
+    gateup_output: torch.Tensor, down_input: torch.Tensor, moe_runner_config
+) -> torch.Tensor:
+    """SiTU(SoftCap-GLU) 的 masked 激活，供 DeepEP-LL 的 bf16 路径使用。
+
+    ``situ_and_mul_masked_fwd`` 是 fork 的 triton kernel，昆仑上跑不了；这里优先用
+    KLX 原生 ``xspeedgate_ops.situ_and_mul``，取不到时退回 torch 拆解。
+    ``masked_m`` 之外的行是 masked GroupGemm 留下的垃圾值，且紧随其后的 masked
+    GroupGemm 只读 ``masked_m`` 以内的行，所以对整块做激活是安全的。
+    """
+    n = gateup_output.shape[-1]
+    beta = getattr(moe_runner_config, "gemm1_alpha", None)
+    linear_beta = getattr(moe_runner_config, "gemm1_clamp_limit", None)
+    assert beta is not None, "SiTU requires gemm1_alpha (beta)"
+    flat_in = gateup_output.view(-1, n)
+    flat_out = down_input.view(-1, n // 2)
+    if flat_in.is_cuda and flat_in.dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ):
+        try:
+            res = torch.ops.xspeedgate_ops.situ_and_mul(
+                flat_in.contiguous(),
+                float(beta),
+                float(linear_beta) if linear_beta is not None else -1.0,
+            )
+            flat_out.copy_(res.reshape(flat_out.shape).to(flat_out.dtype))
+            return down_input
+        except Exception:  # noqa: BLE001 - 原生算子不可用时退回 torch
+            pass
+    gate = flat_in[..., : n // 2].float()
+    up = flat_in[..., n // 2 :].float()
+    gate = float(beta) * torch.tanh(gate / float(beta)) * torch.sigmoid(gate)
+    if linear_beta is not None:
+        up = float(linear_beta) * torch.tanh(up / float(linear_beta))
+    flat_out.copy_((gate * up).to(flat_out.dtype))
+    return down_input
+
+
+_UNSET = object()
+
+
+def _apply_masked_activation(
+    moe: torch.nn.Module,
+    gateup_output: torch.Tensor,
+    down_input: torch.Tensor,
+    masked_m: torch.Tensor,
+    limit=_UNSET,
+) -> torch.Tensor:
+    """Dispatch the DeepEP-LL masked gate/up activation on the runner config.
+
+    KLX only ships the fused SiLU variant; EB5/Kimi-K3 checkpoints run SiTU.
+    """
+    activation = str(getattr(moe.moe_runner_config, "activation", "silu") or "silu")
+    if activation.lower() == "situ":
+        return _situ_and_mul_masked(gateup_output, down_input, moe.moe_runner_config)
+    n_in = gateup_output.shape[-1]
+    n_out = down_input.shape[-1]
+    if limit is _UNSET:
+        silu_and_mul_mask_fwd(
+            gateup_output.view(-1, n_in), down_input.view(-1, n_out), masked_m
+        )
+    else:
+        silu_and_mul_mask_fwd(
+            gateup_output.view(-1, n_in),
+            down_input.view(-1, n_out),
+            masked_m,
+            limit=limit,
+        )
+    return down_input
 
 
 class _DSV4ClampedSiluAndMul(torch.nn.Module):
@@ -499,7 +571,9 @@ class DeepEPMoE(FusedMoE):
         hidden_states = self.dispatcher.combine(
             combine_input=combine_input,
         )
-        if get_global_server_args().dtype in ["float16", "fp16", "half"]:
+        # The internal fork retired ``get_global_server_args()`` (and its
+        # ``dtype`` field); the model dtype is exactly the activation dtype here.
+        if hidden_states.dtype == torch.float16:
             limit = int(patch_envs.SGLANG_FP16_LIMIT_IN_MOE.get())
             hidden_states = hidden_states.clamp(min=-limit, max=limit).to(torch.float16)
 
@@ -1148,7 +1222,10 @@ class DeepEPMoE(FusedMoE):
         forward_deepgemm_masked_bfp16
         """
         assert self.quant_method is not None
-        assert self.moe_runner_config.activation == "silu"
+        assert self.moe_runner_config.activation in ("silu", "situ"), (
+            "DeepEP-LL bf16 masked path supports silu and situ activations, got "
+            f"{self.moe_runner_config.activation!r}"
+        )
 
         def wrapper_m_grouped_gemm_nt_masked_v3(
             lhs: torch.Tensor,
@@ -1222,11 +1299,7 @@ class DeepEPMoE(FusedMoE):
             device=gateup_output.device,
             dtype=torch.bfloat16,
         )
-        silu_and_mul_mask_fwd(
-            gateup_output.view(-1, gateup_output.shape[2]),
-            down_input.view(-1, gateup_output.shape[2] // 2),
-            masked_m,
-        )
+        _apply_masked_activation(self, gateup_output, down_input, masked_m)
         del gateup_output
         # GroupGemm-1
         n = self.w2_weight.size(1)
@@ -1251,12 +1324,14 @@ class DeepEPMoE(FusedMoE):
         import kunlun_ops
         hidden_states, hidden_states_scale,  _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
-        assert self.moe_runner_config.activation == "silu"
         hidden_states_fp8 = (hidden_states, hidden_states_scale)
         if self.w13_weight.dtype != torch.int8:
+            # bf16/fp16 path: SiLU and SiTU are both wired (see
+            # _apply_masked_activation); the int8 path below is SiLU-only.
             return self.forward_deepgemm_masked_bfp16(
                 hidden_states_fp8, masked_m, expected_m
             )
+        assert self.moe_runner_config.activation == "silu"
         # GroupGemm-0
         num_groups, m, k = hidden_states_fp8[0].size()
         n = self.w13_weight.size(1)

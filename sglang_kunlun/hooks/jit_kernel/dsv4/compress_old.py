@@ -55,7 +55,7 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    "sglang.jit_kernel.dsv4.compress_old.CompressorPrefillPlan.generate",
+    "sglang.kernels.ops.attention.dsv4.compress_old.CompressorPrefillPlan.generate",
     type=HookType.REPLACE,
 )
 def _prefill_plan_generate_v1_kunlun(
@@ -108,7 +108,7 @@ def _prefill_plan_generate_v1_kunlun(
 # ---------------------------------------------------------------------------
 
 @plugin_hook(
-    "sglang.jit_kernel.dsv4.compress_old.compress_forward",
+    "sglang.kernels.ops.attention.dsv4.compress_old.compress_forward",
     type=HookType.REPLACE,
 )
 def _compress_forward_v1_kunlun(
@@ -172,7 +172,7 @@ def _compress_forward_v1_kunlun(
 
 
 @plugin_hook(
-    "sglang.jit_kernel.dsv4.compress_old.compress_fused_norm_rope_inplace",
+    "sglang.kernels.ops.attention.dsv4.compress_old.compress_fused_norm_rope_inplace",
     type=HookType.REPLACE,
 )
 def _compress_fused_norm_rope_inplace_v1_kunlun(

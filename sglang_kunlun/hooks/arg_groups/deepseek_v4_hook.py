@@ -39,6 +39,19 @@ from __future__ import annotations
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
+from sglang_kunlun.hooks.arg_groups import _resolution_compat as _resolution
+
+# EB5 MLA+HCA has its own attention stack (``eb5_mla_hca``: DSV4 HCA layers +
+# dense-MLA full layers with a 2048-wide lightning indexer).  ``kunlun_dsv4``
+# is the Kunlun port of the plain DSV4 backend, which only serves the
+# index_topk in (512, 1024) shapes and has no HCA/full-MLA split.  The fork's
+# ``runtime_patch`` picks ``eb5_mla_hca`` for this arch, so do not clobber it.
+_EB5_MLA_HCA_ARCHS = (
+    "ErnieMlaHcaForCausalLM",
+    "ErnieMlaHcaForCausalLMNextN",
+    "ErnieMlaHcaForCausalLMDSpark",
+)
+
 
 @plugin_hook(
     "sglang.srt.arg_groups.deepseek_v4_hook.apply_deepseek_v4_defaults",
@@ -49,14 +62,20 @@ def apply_deepseek_v4_defaults_kunlun(original_fn, server_args, model_arch):
     original_dtype = server_args.kv_cache_dtype
     forced_float16 = original_dtype in ("float16", "half")
     if forced_float16:
-        server_args.kv_cache_dtype = "bfloat16"
+        # Mask float16 as bfloat16 while the stock defaults run: it validates the
+        # dtype against the upstream whitelist.  Route the write through the
+        # resolution API so it works on both the imperative (v0.5.x) and the
+        # declarative (internal fork) ServerArgs implementations.
+        _resolution.declare(server_args, kv_cache_dtype="bfloat16")
     succeeded = False
     try:
         original_fn(server_args, model_arch)
         succeeded = True
-        server_args.attention_backend = "kunlun_dsv4"
+        if model_arch not in _EB5_MLA_HCA_ARCHS:
+            _resolution.declare(server_args, attention_backend="kunlun_dsv4")
     finally:
         if forced_float16:
-            server_args.kv_cache_dtype = (
-                "float16" if succeeded else original_dtype
+            _resolution.declare(
+                server_args,
+                kv_cache_dtype="float16" if succeeded else original_dtype,
             )

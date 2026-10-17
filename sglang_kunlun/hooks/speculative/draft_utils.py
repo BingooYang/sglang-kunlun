@@ -43,11 +43,36 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 logger = logging.getLogger(__name__)
 
 
+def _factory_server_args(factory):
+    """Resolve ``server_args`` from the draft-backend factory.
+
+    v0.5.x exposes it directly; the internal fork dropped the attribute and
+    keeps it on the draft model runner instead.
+    """
+    sa = getattr(factory, "server_args", None)
+    if sa is None:
+        sa = getattr(getattr(factory, "draft_model_runner", None), "server_args", None)
+    if sa is None:
+        return None
+    # The internal fork keeps the *operator input* on ``server_args`` and the
+    # resolved values in a separate view, so a plain attribute read returns the
+    # pre-resolution value (often None).  Read through the view when available
+    # so hooks agree with the in-tree code.
+    try:
+        from sglang.srt.arg_groups.model_override_base import resolved_view
+
+        return resolved_view(sa)
+    except Exception:
+        return sa
+
+
 @plugin_hook(
     "sglang.srt.speculative.draft_utils.DraftBackendFactory._create_backend",
     type=HookType.AROUND,
 )
-def _create_backend_kunlun(original_fn, self, backend_name, backend_map, error_template):
+def _create_backend_kunlun(
+    original_fn, self, backend_name, backend_map, error_template, **kwargs
+):
     """Route the ``kunlun`` draft attention backend through the platform.
 
     ``backend_name`` is the ServerArgs attribute consulted for the backend
@@ -59,10 +84,10 @@ def _create_backend_kunlun(original_fn, self, backend_name, backend_map, error_t
     backend_type = (
         self.draft_attn_backend
         if self.draft_attn_backend
-        else getattr(self.server_args, backend_name)
+        else getattr(_factory_server_args(self), backend_name)
     )
     if backend_type is None:
-        backend_type = self.server_args.attention_backend
+        backend_type = _factory_server_args(self).attention_backend
 
     if backend_type == "kunlun_dsv4":
         from sglang_kunlun.hooks.layers.attention.deepseek_v4_backend import (
@@ -79,14 +104,16 @@ def _create_backend_kunlun(original_fn, self, backend_name, backend_map, error_t
         )
 
     if backend_type != "kunlun":
-        return original_fn(self, backend_name, backend_map, error_template)
+        return original_fn(
+            self, backend_name, backend_map, error_template, **kwargs
+        )
 
     from sglang.srt.platforms import current_platform
 
     # decode multi-step backend uses the "decode_attention_backend" slot;
     # draft-extend (prefill) uses the prefill/decode slot per attention mode.
     is_decode_multistep = backend_name == "decode_attention_backend" and (
-        self.server_args.speculative_attention_mode != "decode"
+        _factory_server_args(self).speculative_attention_mode != "decode"
     )
 
     if is_decode_multistep:

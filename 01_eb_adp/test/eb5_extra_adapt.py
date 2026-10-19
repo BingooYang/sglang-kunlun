@@ -1245,11 +1245,21 @@ def _dsv4_shim():
         return mod
     stub = "sglang_kunlun.hooks.layers.attention.nsa.triton_kernel"
     if stub not in sys.modules:
+        # DSV4 的 indexer 量化路径会真的调它，要给能用的实现（同上，别 import 插件模块）。
+        def _act_quant_kunlun(x, block_size=128, scale_fmt=None):
+            import kunlun_ops
+
+            assert x.is_contiguous(), "Input tensor must be contiguous"
+            assert x.size(-1) % block_size == 0
+            assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            x_shape = x.shape
+            x_blocks = x.view(-1, block_size).contiguous()
+            y_int8 = torch.empty(x_blocks.shape, dtype=torch.int8, device=x.device)
+            y_max = torch.empty(x_blocks.shape[0], dtype=torch.float32, device=x.device)
+            kunlun_ops.quant2d(x_blocks, y_int8, y_max, force_sdnn=True)
+            return y_int8.view(x_shape), y_max.view(x_shape[0], -1)
+
         m = types.ModuleType(stub)
-
-        def _act_quant_kunlun(*_a, **_k):
-            raise NotImplementedError("act_quant_kunlun unavailable on the fork")
-
         m.act_quant_kunlun = _act_quant_kunlun
         sys.modules[stub] = m
     path = _dsv4_torch_shim_path()

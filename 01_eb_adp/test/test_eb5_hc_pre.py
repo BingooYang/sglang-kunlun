@@ -180,3 +180,165 @@ class TestHcPreMoeKernels(TestHcPreAttnKernels):
 
 if __name__ == "__main__":
     unittest.main()
+
+# ═════════════════════════════════════════════════════════════════════════
+# hc_pre 的 sqrsum / splitk 家族（适配层**自己新增**的 torch 拆解）
+#
+# 为什么单独立一组：`mhc_pre_gemm_sqrsum_splitk_kernel` / `_tilelang` / `_dispatch`
+# 这三个**不在** ku《EBlite 和 dpsk-v4 算子对比》的第三方 kernel 清单里（那张表只有
+# `sm100_tf32_hc_prenorm_gemm_impl` 和 `mhc_pre_big_fuse_with_norm_tilelang_kernel`），
+# 于是按"清单枚举"的覆盖模型**天然漏掉了它们** —— 2026-10-17 EB5 整网首次前向
+# 正是炸在 `kernel_0` 上（`KL_XID_KERNEL_EXCEPTION` / `wait for noc idle timeout`）。
+#
+# 调用约定对齐 `sglang/kernels/ops/layernorm/mhc.py::mhc_pre`，真实配置
+# hc_mult=4 / hidden=4096 → hc_hidden = hc_mult*hidden = 16384、hc_mult3 = 24：
+#   * splitk 路径（`SGLANG_OPT_DEEPGEMM_HC_PRENORM=0`，**服务脚本用的就是这条**）：
+#       partial_out=(split_k, N, 32)、partial_sqrsum=(split_k, N)、gemm_last_dim=32
+#   * tilelang 路径（该 env 默认 1，**原来的单测只走了这条**）：
+#       out=(N, hc_mult3)、sqrsum=(N,)、gemm_last_dim=hc_mult3
+# 两条路径的 out 维度就不同（3-D vs 2-D）—— 这正是"单测全绿、整网炸"的一处结构性原因。
+#
+# 这里刻意从 **`sglang.kernels.ops.layernorm.mhc`** 取符号（适配层补丁替换后的那个），
+# 而不是直接 import `eb5_kunlun_adapt` —— 这样测的就是模型真正会调到的对象。
+# ═════════════════════════════════════════════════════════════════════════
+class TestHcPreSqrsumFamily(CustomTestCase):
+    HC_MULT = 4
+    HIDDEN = 4096
+    HC_HIDDEN = HC_MULT * HIDDEN          # 16384
+    HC_MULT3 = HC_MULT * 2 + HC_MULT**2   # 24
+    SPLIT_K = 16
+    # 覆盖 mhc.py 里 num_tokens <= 2048 的分发阈值两侧
+    TOKEN_SWEEP = (8, 256, 2048, 2049)
+
+    @classmethod
+    def setUpClass(cls):
+        _require_cuda()
+
+    def _make_inputs(self, num_tokens):
+        x = _rand(num_tokens, self.HC_HIDDEN)
+        fn = (
+            torch.randn(
+                self.HC_MULT3, self.HC_HIDDEN, dtype=torch.float32, device=_DEVICE
+            )
+            * 0.02
+        )
+        return x, fn
+
+    def _ref_splitk(self, x, fn, split_k):
+        """fp32 参考：逐段 GEMM + 逐段平方和。"""
+        xf, f = x.float(), fn.float()
+        n = xf.shape[0]
+        j = min(self.HC_MULT3, f.shape[0])
+        split_size = self.HC_HIDDEN // split_k
+        out = torch.zeros(split_k, n, 32, dtype=torch.float32, device=x.device)
+        sq = torch.zeros(split_k, n, dtype=torch.float32, device=x.device)
+        for s in range(split_k):
+            lo, hi = s * split_size, (s + 1) * split_size
+            out[s, :, :j] = xf[:, lo:hi] @ f[:j, lo:hi].t()
+            sq[s] = (xf[:, lo:hi] ** 2).sum(-1)
+        return out, sq
+
+    def test_mhc_pre_gemm_sqrsum_splitk_kernel(self):
+        """`kernel_0`（split-K）：真实配置 + 真实 token 规模下数值正确。
+
+        这条路径服务端必走（`run_eb5_kunlun.sh` 设 `SGLANG_OPT_DEEPGEMM_HC_PRENORM=0`），
+        而原来的单测从不经过它。
+        """
+        from sglang.kernels.ops.layernorm.mhc import (
+            mhc_pre_gemm_sqrsum_splitk_kernel,
+        )
+
+        kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
+            self.HC_MULT3, self.HC_HIDDEN, split_k=self.SPLIT_K
+        )
+        for n in self.TOKEN_SWEEP:
+            with self.subTest(num_tokens=n):
+                x, fn = self._make_inputs(n)
+                out_partial = torch.empty(
+                    self.SPLIT_K, n, 32, dtype=torch.float32, device=_DEVICE
+                )
+                sqrsum_partial = torch.empty(
+                    self.SPLIT_K, n, dtype=torch.float32, device=_DEVICE
+                )
+                kernel_0(x, fn, out_partial, sqrsum_partial)
+                torch.cuda.synchronize()
+                ref_out, ref_sq = self._ref_splitk(x, fn, self.SPLIT_K)
+                self.assertTrue(
+                    torch.allclose(out_partial, ref_out, atol=1e-3, rtol=1e-3),
+                    f"num_tokens={n}: out_partial 与 fp32 参考不一致",
+                )
+                self.assertTrue(
+                    torch.allclose(sqrsum_partial, ref_sq, atol=1e-3, rtol=1e-3),
+                    f"num_tokens={n}: sqrsum_partial 与 fp32 参考不一致",
+                )
+
+    def test_kernel_0_matmul_contiguity_contrast(self):
+        """对照实验：matmul 操作数先 `.contiguous()` vs 直接喂非连续切片。
+
+        背景：`kernel_0` 里两个操作数**都是非连续的** ——
+        `xs = xf[:, lo:hi]`（stride `(16384, 1)`）与 `f[:j, lo:hi].t()`（stride `(1, 16384)`）。
+        CPU 上两种写法数值完全相同（已实测），所以这是**纯 XPU 后端行为**问题。
+
+        **顺序是刻意的**：先跑"干净"的连续形式。若非连续形式会触发设备级异常，
+        它会把 XPU 上下文带坏、后面全部连带失败；把连续形式放前面，结果就可判定：
+          * 都过             → 与连续性无关
+          * 连续过 / 非连续炸 → 坐实 strided matmul
+          * 连续就炸          → 连续性问题不是（唯一）原因
+        """
+        n = 2048
+        x, fn = self._make_inputs(n)
+        xf, f = x.float(), fn.float()
+        split_size = self.HC_HIDDEN // self.SPLIT_K
+        xs = xf[:, 0:split_size]
+        fs_t = f[: self.HC_MULT3, 0:split_size].t()
+
+        with self.subTest(form="contiguous"):
+            ref = xs.contiguous() @ fs_t.contiguous()
+            torch.cuda.synchronize()
+            ref = ref.clone()
+
+        with self.subTest(form="strided"):
+            got = xs @ fs_t
+            torch.cuda.synchronize()
+            self.assertTrue(
+                torch.allclose(got, ref, atol=1e-3, rtol=1e-3),
+                "连续与非连续两种 matmul 的数值必须一致",
+            )
+
+    def test_mhc_pre_gemm_sqrsum_tilelang(self):
+        """`mhc_pre_gemm_sqrsum_tilelang`（单链、无 split）：2-D 调用约定。"""
+        from sglang.kernels.ops.layernorm.mhc import (
+            mhc_pre_gemm_sqrsum_tilelang,
+        )
+
+        for n in (8, 2048):
+            with self.subTest(num_tokens=n):
+                x, fn = self._make_inputs(n)
+                out = torch.empty(n, self.HC_MULT3, dtype=torch.float32, device=_DEVICE)
+                sqrsum = torch.empty(n, dtype=torch.float32, device=_DEVICE)
+                mhc_pre_gemm_sqrsum_tilelang(
+                    x, fn, out, sqrsum, self.HC_MULT3, self.HC_HIDDEN
+                )
+                torch.cuda.synchronize()
+                xf, f = x.float(), fn.float()
+                ref_out = xf @ f[: self.HC_MULT3].t()
+                ref_sq = (xf * xf).sum(-1)
+                self.assertTrue(
+                    torch.allclose(out, ref_out, atol=1e-3, rtol=1e-3),
+                    f"num_tokens={n}: tilelang out 与参考不一致",
+                )
+                self.assertTrue(
+                    torch.allclose(sqrsum, ref_sq, atol=1e-3, rtol=1e-3),
+                    f"num_tokens={n}: tilelang sqrsum 与参考不一致",
+                )
+
+    def test_mhc_pre_gemm_sqrsum_dispatch(self):
+        """`_mhc_pre_gemm_sqrsum_dispatch()` 返回单链实现（mhc.py 会直接调用它）。"""
+        from sglang.kernels.ops.layernorm.mhc import (
+            _mhc_pre_gemm_sqrsum_dispatch,
+            mhc_pre_gemm_sqrsum_tilelang,
+        )
+
+        fn = _mhc_pre_gemm_sqrsum_dispatch()
+        self.assertTrue(callable(fn), "dispatch 必须返回可调用对象")
+        self.assertIs(fn, mhc_pre_gemm_sqrsum_tilelang)

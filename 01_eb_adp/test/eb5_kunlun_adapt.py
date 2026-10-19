@@ -23,6 +23,7 @@ KLX 原生算子）。本模块照此把 EB5 的融合 kernel 换成 torch 实�
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -113,14 +114,32 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
         n = xf.shape[0]
         f = fn.float()
         j = min(int(hc_mult3), f.shape[0])
+        if os.environ.get("EB5_DEBUG_MHC_PRE"):
+            print(
+                f"[mhc-dbg] kernel_0 x={tuple(x.shape)}/{x.dtype} fn={tuple(fn.shape)} "
+                f"out={tuple(out_partial.shape)} sqrsum={tuple(sqrsum_partial.shape)} "
+                f"hc_mult3={hc_mult3} split_k={split_k} split_size={split_size} "
+                f"n={n} j={j}",
+                flush=True,
+            )
         # kernel 里 out_frag 宽 32、只写前 hc_mult3 列；剩下的列在 big_fuse 里被
         # 求和但从不读取，这里显式清零避免 empty() 的垃圾值参与求和。
         out_partial[:, :n, :].zero_()
         for s in range(split_k):
             lo = s * split_size
             hi = lo + split_size
-            xs = xf[:, lo:hi]
-            out_partial[s, :n, :j].copy_(xs @ f[:j, lo:hi].t())
+            # ⚠️ 这里两个 matmul 操作数原本都是**非连续切片**：
+            #   xs            = xf[:, lo:hi]        → stride (H, 1)
+            #   f[:j, lo:hi].t()                    → stride (1, H)
+            # XPU 后端对非连续 matmul 会走另一条路径。2026-10-17 EB5 整网首次前向
+            # 就在这一行报设备级 kernel 异常（`wait for noc idle timeout` /
+            # `KL_XID_KERNEL_EXCEPTION`），把设备带坏。
+            # 显式 `.contiguous()` **不改变数值**（CPU 上两种写法已逐元素对照过），
+            # 只是把它拉回常规路径；仓库里 `dsv4_torch_shim.py` 也一贯这么写
+            # （那里有 20+ 处 `.contiguous()`，本文件原先只有 2 处）。
+            xs = xf[:, lo:hi].contiguous()
+            fk = f[:j, lo:hi].t().contiguous()
+            out_partial[s, :n, :j].copy_(xs @ fk)
             sqrsum_partial[s, :n].copy_((xs * xs).sum(-1))
         return None
 
@@ -275,11 +294,26 @@ def apply() -> list[str]:
 
         _stub_name = "sglang_kunlun.hooks.layers.attention.nsa.triton_kernel"
         if _stub_name not in sys.modules:
+            # DSV4 的 indexer 量化路径（fused_q_indexer_rope_hadamard_quant ->
+            # dsv4_torch_shim.act_quant_kunlun）会**真的**调它，所以要给能用的实现
+            # （与插件 nsa/triton_kernel.act_quant_kunlun 同实现，都是 kunlun_ops.quant2d）。
+            # 不要改成 import 插件那个模块：会拉起 sglang_kunlun.hooks.layers.attention
+            # 的 nsa redirect，提前 import fork 的 attention 模块，使本模块 _TARGETS 的补丁
+            # 被已绑定的旧符号绕过（EB5 单测 19 passed -> 4 failed）。
+            def _act_quant_kunlun(x, block_size=128, scale_fmt=None):
+                import kunlun_ops
+
+                assert x.is_contiguous(), "Input tensor must be contiguous"
+                assert x.size(-1) % block_size == 0
+                assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+                x_shape = x.shape
+                x_blocks = x.view(-1, block_size).contiguous()
+                y_int8 = torch.empty(x_blocks.shape, dtype=torch.int8, device=x.device)
+                y_max = torch.empty(x_blocks.shape[0], dtype=torch.float32, device=x.device)
+                kunlun_ops.quant2d(x_blocks, y_int8, y_max, force_sdnn=True)
+                return y_int8.view(x_shape), y_max.view(x_shape[0], -1)
+
             _m = types.ModuleType(_stub_name)
-
-            def _act_quant_kunlun(*_a, **_k):  # 只有 *_kunlun 变体会用到
-                raise NotImplementedError("act_quant_kunlun unavailable on the fork")
-
             _m.act_quant_kunlun = _act_quant_kunlun
             sys.modules[_stub_name] = _m
 

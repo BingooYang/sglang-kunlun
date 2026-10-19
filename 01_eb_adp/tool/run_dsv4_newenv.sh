@@ -58,19 +58,26 @@ python "$BINGOO/code/sglang-kunlun/sglang_kunlun/hooks/utils/sglang_xpu_patch.py
 # `_init_raw`。适配层的 `_install_expert_location_pad` 用 `torch.cat` 绕开它。
 export EB5_KUNLUN_ADAPT_DIR=$BINGOO/code/sglang-kunlun/01_eb_adp/test
 
-# ⚠️⚠️ 下面这段 `pkill -9` 是**有代价**的，先读 `doc/3. eb5模型运行.md` 的
-# 「最重要的一条」再动它：对"卡在 XPU 调用里"的进程强杀（CPU 100% 空转、GPU 0% util、
-# 显存不涨）会在设备上留下杀不掉的 kernel，拖坏整个 XPU runtime，并让驱动泄漏
-# "in use" 引用计数 —— 之后 `xpu-smi -r` 对全部卡报 "currently in use by another
-# process"，只能节点级重启。
-# 只在确认**没有 XPU 调用在飞**时用；杀完必须确认 8 张卡都回到 `0 MiB / 0%` 再起服务。
-#
-# 残留 launcher / worker 会占着 port_base 与 HTTP 端口，先清掉。
-if pgrep -f "sglang.launch_server|sglang::" >/dev/null 2>&1; then
-  echo "[run_dsv4_newenv] killing stale sglang launcher/workers"
-  pkill -9 -f "sglang.launch_server" || true
-  pkill -9 -f "sglang::" || true
-  sleep 5
+# ---- 起服务前先安全清掉上一次的残留 ----
+# 这里**不再**用 `pkill -9 -f "sglang.launch_server|sglang::"`：它有两个真实的坑
+#   1) 会打到调用者自己（`pkill -f` 匹配整条命令行，调用命令本身就含这些字符串）；
+#   2) 对 launcher 用 -9 会留下 stuck kernel（doc/3 的「最重要的一条」）。
+# 换成 stop_kunlun.sh：先 TERM/INT，必要时只对空闲的纯 CPU worker 用 -9 解开
+# waitpid 死锁，launcher 绝不用 -9，最后校验 8 卡回到 0 MiB / 0%。
+if ! bash "$BINGOO/code/sglang-kunlun/01_eb_adp/tool/stop_kunlun.sh"; then
+  echo "[run_dsv4_newenv] ❌ 残留没清干净，放弃启动（不要硬上）"
+  exit 1
+fi
+
+# ---- 起服务前的健康闸门 ----
+# 为什么不能只看 `xpu-smi`：设备级 kernel 异常之后，8 卡照样显示 `0MiB / 0%`、
+# 驱动登记 0 个进程 —— **看着完全正常**，但下一次起服务会挂死（2026-10-17 实测：
+# EB5 首次前向报 KL_XID_KERNEL_EXCEPTION 之后，下一次起服务在加载权重阶段挂死）。
+# 所以闸门必须包含 **8 进程 XCCL 探针**（单卡探针抓不到 rank 0/1/2 挂死）。
+# 急用时可用 `SKIP_PREFLIGHT=1` 跳过（不推荐）。
+if ! bash "$BINGOO/code/sglang-kunlun/01_eb_adp/tool/preflight.sh"; then
+  echo "[run_dsv4_newenv] ❌ preflight 没过，放弃启动（别硬上）"
+  exit 1
 fi
 
 echo "[run_dsv4_newenv] gpus=$DSV4_GPUS (n=$NGPU) port=$PORT log=$LOG"

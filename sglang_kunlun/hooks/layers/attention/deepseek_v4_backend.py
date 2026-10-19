@@ -619,7 +619,17 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         # Only DECODE / TARGET_VERIFY / EXTEND can drive the Kunlun native op
         # Everything else (e.g. draft-extend) uses the pure-torch
         # reference path below.
-        if logical_mode.is_decode() or logical_mode.is_target_verify() or is_extend:
+        # FP8 KV 布局（584 B/token：448 fp8 nope + 64 bf16 rope + 8 scale）落在 uint8
+        # 字节缓冲里，没有统一的 dtype view；而原生 compressed_attention 要求
+        # win_kv_cache 与 q 同 dtype，喂 uint8 会直接报
+        # "compressed_attention: win_kv_cache dtype must match q"。
+        # 按本文件上面的约定（"The fp8 layout has no uniform view and is handled by
+        # the torch paths instead"），这种情况改走纯 torch 参考路径。
+        _fp8_kv_layout = swa_k_cache.dtype == torch.uint8
+        if (
+            not _fp8_kv_layout
+            and (logical_mode.is_decode() or logical_mode.is_target_verify() or is_extend)
+        ):
             return self._kunlun_compressed_attention(
                 q=q,
                 logical_mode=logical_mode,

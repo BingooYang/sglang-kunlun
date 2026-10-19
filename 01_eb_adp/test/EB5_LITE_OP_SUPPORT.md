@@ -424,3 +424,165 @@ forward 走另一个：
 会让 sitecustomize 过早 bootstrap XPU，且 `_kunlun_pre_shim` 与 `compat_aliases` 打架，
 报 `cannot import name 'QUANTIZATION_METHODS' from ... <kunlun-alias-stub>`，8 个文件全 collect 失败。
 `tool/env.sh` 的注释已写明。
+
+---
+
+## 十、复跑前置：staging 与两个注意点（2026-10-17 晚）
+
+第九节说"用归档 patch，别手抄"：
+
+```bash
+git -C code/sglang apply patches/sglang-eb5-layer.patch
+```
+
+但**工作区里已经没有 `patches/` 目录**（`patches/sglang-eb5-layer.patch` 丢失）。
+而 staging 位置不能随便放 —— `_eb5_kernel_test_common.py` 靠这两行定位：
+
+```python
+_REPO_ROOT = _HERE.parents[5]                 # <repo>/test_internal/internal/models/eb5/layer/xxx.py
+_PYTHON_DIR = _REPO_ROOT / "python"
+for _p in (str(_PYTHON_DIR), str(_HERE.parent.parent)):
+    sys.path.insert(0, _p)
+```
+
+即 **repo 根**和 **`eb5/` 目录**（`_hf_strict_compat.py` 在那儿）。
+所以文件**必须**落在 `code/sglang/test_internal/internal/models/eb5/layer/`；
+放在 `01_eb_adp/test/` 下会报 `No module named '_hf_strict_compat'`
+（**是位置问题，不是环境问题** —— 排查时别往环境上找）。
+
+手工 staging（等价于那个 patch）：
+
+```bash
+SRC=code/sglang-kunlun/01_eb_adp/test
+DST=code/sglang/test_internal/internal/models/eb5/layer
+mkdir -p "$DST"
+cp "$SRC"/_eb5_kernel_test_common.py "$SRC"/eb5_kunlun_adapt.py \
+   "$SRC"/eb5_extra_adapt.py "$SRC"/eb5_mla_adapt.py "$SRC"/conftest.py \
+   "$SRC"/test_eb5_*.py "$DST"/
+```
+
+跑法（**单卡**，逐模块，避免整机 8 卡同时上）：
+
+```bash
+source code/sglang-kunlun/01_eb_adp/tool/env.sh
+cd code/sglang
+CUDA_VISIBLE_DEVICES=0 python -m pytest test_internal/internal/models/eb5/layer -q
+```
+
+实测与第九节一致：
+
+| 文件 | 用例 |
+|---|---|
+| `test_eb5_preprocess.py` | 8 |
+| `test_eb5_hc_pre.py` | 4 |
+| `test_eb5_hc_post.py` | 2 |
+| `test_eb5_postprocess.py` | 4 |
+| `test_eb5_moe.py` | 8 + 2 skip |
+| `test_eb5_attn_mla.py` | 23 |
+| `test_eb5_attn_hca.py` | 14 |
+| `test_eb5_layer_modules.py` | 19 |
+| **合计** | **82 passed / 2 skipped / 0 failed** |
+
+跑之前建议先确认设备干净（`xpu-smi | grep -c '0MiB / 98304MiB'` = 8）；
+卡死时**不要 `kill -9`**（见本文开头与 `doc/3`）。
+
+### 两个注意点
+
+1. **改了 `01_eb_adp/test/eb5_*_adapt.py` 一定要同步 staging 副本** —— 单测 import 的是
+   staging 那份（`conftest.py` 里 `import eb5_kunlun_adapt`）。不同步会出现"改了源码但单测
+   行为没变"的错觉，白排查一轮。
+2. **`act_quant_kunlun` 那个桩是 DSV4 的雷**。`eb5_kunlun_adapt.py` 原来把它打成一个抛异常的
+   桩，理由是"只有 `*_kunlun` 变体会用到"；但 **DSV4 的 indexer 量化路径会真的调到它**
+   （`fused_q_indexer_rope_hadamard_quant → dsv4_torch_shim.py:642`），表现为第一次前向
+   `NotImplementedError`。详见 `doc/3` 第七节 7.2①。
+
+   改这里时**不要**用 `importlib.import_module` 去复用插件的真实现：会提前 import fork 的
+   attention 模块，让本模块 `_TARGETS` 的补丁被已绑定的旧符号绕过，**单测 19 passed → 4 failed**
+   （`dequant_k_cache.py:68 TypeError: 'function' object is not subscriptable`）。
+   要用自包含实现（`kunlun_ops.quant2d`）。
+
+---
+
+## 十一、单测补强：为什么"82 全绿"挡不住整网炸（2026-10-17 深夜）
+
+第十节记了复跑方法。这一节记**为什么那 82 个用例全绿、整网却炸**，以及为此补了什么。
+
+### 11.1 根因：单测和整网**走了同一个分发器的不同分支**
+
+`sglang/kernels/ops/layernorm/mhc.py:1119` 按环境变量分支：
+
+```python
+if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+    tf32_hc_prenorm_gemm(...)                              # ← 单测走这条
+else:
+    kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(...)   # ← 服务走这条（崩在这）
+```
+
+而 `SGLANG_OPT_DEEPGEMM_HC_PRENORM` 的**默认值是 `True`**（`srt/environ.py:1485`）：
+
+| 上下文 | 取值 | 走哪条 |
+|---|---|---|
+| 单测（只 source `tool/env.sh`） | 未设 → **默认 True** | `tf32_hc_prenorm_gemm` |
+| 服务（`run_eb5_kunlun.sh:62`） | 显式 **0** | `kernel_0`（splitk） |
+
+而且 `run_eb5_kunlun.sh` 比 `env.sh` 多设 **28 个**变量，而 kernel/model 热路径里有
+**65 处** `envs.SGLANG_*.get()` 分支 —— 单测等于在**另一套配置**下验证。
+"单测全绿"证明的是另一条路能跑。
+
+### 11.2 补了什么
+
+**(1) 配置 profile** —— `conftest.py`
+
+```bash
+EB5_TEST_PROFILE=service CUDA_VISIBLE_DEVICES=0 python -m pytest <layer_dir> -q
+```
+
+把服务那套**运行期**开关复现一遍（26 个；故意**不含** `SGLANG_PLUGINS` /
+`SGLANG_EXTERNAL_MODEL_PACKAGE` —— 那两个是启动期决定插件与模型包的，测试进程里早就
+import 完了，改了反而误导）。**建议两套都跑**：默认 + `service`。
+
+**(2) sqrsum / splitk 家族用例** —— `test_eb5_hc_pre.py::TestHcPreSqrsumFamily`
+
+这一族原来**零覆盖**：`kernel_0`、`mhc_pre_gemm_sqrsum_tilelang`、
+`_mhc_pre_gemm_sqrsum_dispatch` 都**不在** ku 表的第三方 kernel 清单里，
+而覆盖是按那张表枚举的。新增：
+
+- `test_mhc_pre_gemm_sqrsum_splitk_kernel` —— 真实配置（hc_mult=4 / hidden=4096 →
+  hc_hidden=16384、hc_mult3=24、split_k=16）+ token 数扫 `8 / 256 / 2048 / 2049`
+  （覆盖 `mhc.py` 的 2048 分发阈值两侧），与 fp32 参考逐项对齐
+- `test_mhc_pre_gemm_sqrsum_tilelang` —— 2-D 调用约定（`out=(N, hc_mult3)`）
+- `test_mhc_pre_gemm_sqrsum_dispatch` —— 返回单链实现
+- `test_kernel_0_matmul_contiguity_contrast` —— **对照实验**：`kernel_0` 里两个 matmul
+  操作数原本**都是非连续切片**（`xs` stride `(H,1)`、`f[:j,lo:hi].t()` stride `(1,H)`）。
+  先跑 `.contiguous()` 形式、再跑非连续形式 —— **顺序是刻意的**：非连续若触发设备级异常
+  会把 XPU 上下文带坏，把干净的那条放前面，结果才可判定
+  （都过 → 与连续性无关；连续过/非连续炸 → 坐实 strided matmul；连续就炸 → 不是（唯一）原因）
+
+> 用例从 **`sglang.kernels.ops.layernorm.mhc`** 取符号（适配层补丁**替换后**的那个），
+> 而不是直接 import `eb5_kunlun_adapt` —— 这样测的就是模型真正会调到的对象。
+
+配套还改了 `eb5_kunlun_adapt.py::kernel_0`：显式 `.contiguous()` 后再做 matmul。
+**数值不变**（CPU 上两种写法已逐元素对照过），只是把它拉回常规路径；
+仓库里 `dsv4_torch_shim.py` 一贯这么写（那里 20+ 处 `.contiguous()`，这个文件原先只有 2 处）。
+**注：这个改动在设备恢复前无法验证**（见 11.3）。
+
+**(3) 覆盖自检** —— `test_eb5_adapt_coverage.py`
+
+解析适配层三个文件里"被替换的符号"，要求**每个都有用例提到**，否则 fail ——
+把"悄悄漏一个"变成"跑不过"。现状：28 个符号、**23 个被提到（82%）**，
+剩下 5 个在 `_KNOWN_UNCOVERED` 里**带原因**登记（另有一条用例挡住清单腐烂）。
+
+**这个文件刻意不依赖 XPU**（不 import 那个在 import 阶段就 `init_process_group(backend="nccl")`
+的 `_eb5_kernel_test_common`），所以**设备不健康时也能单跑**，用来快速确认覆盖没退化。
+
+### 11.3 一个重要的边界
+
+单测保证的是"**拆解算得对** + **分支可达**"，**不保证**整网能跑：
+
+- **规模/形状**：单测用 `_TOKENS = 4 / 8`，整网是真实 token 数；
+- **多卡集合通信**：单测 `num_gpus=1`、`world_size=1`、不 init XCCL，
+  而 rank 0/1/2 的 D2H 挂死在原理上就覆盖不到 —— 那个只能靠 8 进程 XCCL 探针兜底
+  （`tool/xccl_probe.py` + `tool/preflight.sh`）；
+- **设备健康**：设备"半坏"时**单测自己会挂死**，那不是用例的问题
+  （`doc/3` 第九节：`0MiB/0%` + XCCL 8/8 都可能全绿，但真实计算 kernel 照样挂）。
+  起服务/跑单测前先过 `tool/preflight.sh`。

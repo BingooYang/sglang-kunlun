@@ -586,3 +586,87 @@ import 完了，改了反而误导）。**建议两套都跑**：默认 + `servi
 - **设备健康**：设备"半坏"时**单测自己会挂死**，那不是用例的问题
   （`doc/3` 第九节：`0MiB/0%` + XCCL 8/8 都可能全绿，但真实计算 kernel 照样挂）。
   起服务/跑单测前先过 `tool/preflight.sh`。
+
+---
+
+## 十二、又三个盲区：split_k / align_fleet / 小 token（2026-10-19）
+
+第十一节解决了"分支不同"（`SGLANG_OPT_DEEPGEMM_HC_PRENORM`），但 2026-10-19 在
+4 卡 8 层子模型上复现整网挂死时，发现**同一分支内还有三个参数差异**，单测一个都没覆盖。
+
+### 12.1 `split_k`：单测 16，服务是 32
+
+`ernie5.EB5DecoderLayer._mhc_pre` 调 `mhc.mhc_pre` 时**不传 `n_splits_pre`**，
+于是走签名默认值 **32**（`kernels/ops/layernorm/mhc.py`）：
+
+```python
+def mhc_pre(..., n_splits_pre: int = 32, ...):
+    ...
+    deterministic = _is_deterministic_inference_enabled()
+    if deterministic:
+        n_splits_pre = 16          # 只有确定性推理才改成 16
+```
+
+而 `test_eb5_hc_pre.py::TestHcPreSqrsumFamily.SPLIT_K` 原来写死 **16**。
+16 与 32 是**两条不同的 kernel 形状**（`split_size = 16384/16 = 1024` vs `512`，
+且 `partial_out` 形状不同），所以"16 全绿"证明不了 32 能跑。
+
+**已改**：`SPLIT_K = 32`（与默认值一致），并新增
+`test_mhc_pre_gemm_sqrsum_splitk_kernel_all_splits` 同时覆盖 **16 与 32**。
+
+### 12.2 `mhc_align_fleet`：单测 False，服务是 True
+
+服务端按 `model_type` 设置：
+`self.mhc_align_fleet = "ernie" in model_type.lower()`，本权重 `model_type="ernie"`
+→ **True**。它切换两处算法：
+
+* mapping norm 用 `1/(sqrt(sum_sq/D)+eps)`（eps 在 sqrt **外**）；
+* sinkhorn softmax 用 `exp2((x-max)*LOG2E)` 而非 `exp(x-max)`。
+
+而适配层的层测试一律写 `layer.mhc_align_fleet = False`（HF/DSV4 口径）。
+
+**已改**：新增 `test_mhc_pre_align_fleet_matches_hf_form`，直接按 `mhc_align_fleet=True`
+跑 `mhc_pre_big_fuse_with_norm_tilelang`，校验有限性与 comb 列和。
+
+### 12.3 token 数：单测从 8 起，warmup 是 3
+
+服务 warmup 的请求是（`entrypoints/http_server.py::_execute_server_warmup`）：
+
+```python
+json_data["input_ids"] = [[10, 11, 12] for _ in range(get_parallel().dp_size)]
+```
+
+即 **每个 DP rank 3 token**。而 `TOKEN_SWEEP = (8, 256, 2048, 2049)` 的最小值是 8。
+`n=1..7` 从未被测过。
+
+### 12.4 单卡单测原理上抓不到的一类问题：D2H 同步
+
+2026-10-19 定位到的两个真实 bug 都属于这一类：
+
+* `eb5_extra_adapt.py::memcpy_triton` 把 **device 标量** `offset`/`sz` 用 `int()` 拉回主机；
+* `fused_split_feature_topk` 同样把 `num_token_non_padded` 用 `int()` 拉回主机。
+
+原始 triton kernel 都是把这两个值当 **device 指针**在 kernel 内 `tl.load`，**没有 D2H**。
+在本机 XPU 上，这种标量 D2H 会让所有 rank 一起挂死（8~10 分钟后进程自行 `exit -3`）。
+
+> **单测为什么抓不到**：单进程 `world_size=1`、不 init XCCL、`num_gpus=1`，
+> 这些标量同步在单卡上并不必然挂；只有整网（多 rank + DP attention + 真实调度）
+> 才会稳定复现。所以这条只能靠**整网复现**兜底，属于第十一节 11.3 那条边界的延伸。
+
+**排查口径**：适配层里出现 `int(x)` / `.item()` / `.cpu()` / `.tolist()`，
+先确认 `x` 是不是 device tensor。当前三个适配文件已逐个核对调用点，
+其余都是 Python int（`extend_seq_lens_sum`、`num_tokens`、`num_seq` 等）。
+
+### 12.5 当前单测状态
+
+在 **4/5/6/7** 四张卡上、`EB5_TEST_PROFILE=service` 跑 `test_eb5_hc_pre.py`：
+
+```
+10 passed, 18 subtests passed     # 含新增的 all_splits 与 align_fleet
+```
+
+完整 `layer/` 目录四卡各一遍均为 `89 passed / 2 skipped / 0 failed`
+（与第十一节基线一致；新增用例后为 91 个用例口径）。
+
+> 复跑方式见第十节；`_hf_strict_compat` 只存在于 staging 目录
+> （`code/sglang/test_internal/internal/models/eb5/`），所以 pytest 要在 staging 下跑。

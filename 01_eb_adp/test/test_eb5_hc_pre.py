@@ -206,7 +206,10 @@ class TestHcPreSqrsumFamily(CustomTestCase):
     HIDDEN = 4096
     HC_HIDDEN = HC_MULT * HIDDEN          # 16384
     HC_MULT3 = HC_MULT * 2 + HC_MULT**2   # 24
-    SPLIT_K = 16
+    # 服务实际用的 split_k：`ernie5._mhc_pre` **不传** `n_splits_pre`，走
+    # `mhc.mhc_pre` 签名默认值 **32**（`mhc.py:1055`）。原先这里写死 16，
+    # 于是「单测全绿、整网炸」——16 和 32 是两条不同的 kernel 形状。
+    SPLIT_K = 32
     # 覆盖 mhc.py 里 num_tokens <= 2048 的分发阈值两侧
     TOKEN_SWEEP = (8, 256, 2048, 2049)
 
@@ -272,6 +275,42 @@ class TestHcPreSqrsumFamily(CustomTestCase):
                     f"num_tokens={n}: sqrsum_partial 与 fp32 参考不一致",
                 )
 
+    def test_mhc_pre_gemm_sqrsum_splitk_kernel_all_splits(self):
+        """`kernel_0` 覆盖**所有可能被服务用到的** split_k：16 与 32。
+
+        服务在同一条调用链上有两个取值来源，不能只测一个：
+          * 普通路径：`mhc.mhc_pre` 的签名默认 `n_splits_pre=32`（`ernie5` 不传该参数）
+          * 确定性推理：`_is_deterministic_inference_enabled()` 时显式改成 16
+        """
+        from sglang.kernels.ops.layernorm.mhc import (
+            mhc_pre_gemm_sqrsum_splitk_kernel,
+        )
+
+        for split_k in (16, 32):
+            kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
+                self.HC_MULT3, self.HC_HIDDEN, split_k=split_k
+            )
+            for n in self.TOKEN_SWEEP:
+                with self.subTest(split_k=split_k, num_tokens=n):
+                    x, fn = self._make_inputs(n)
+                    out_partial = torch.empty(
+                        split_k, n, 32, dtype=torch.float32, device=_DEVICE
+                    )
+                    sqrsum_partial = torch.empty(
+                        split_k, n, dtype=torch.float32, device=_DEVICE
+                    )
+                    kernel_0(x, fn, out_partial, sqrsum_partial)
+                    torch.cuda.synchronize()
+                    ref_out, ref_sq = self._ref_splitk(x, fn, split_k)
+                    self.assertTrue(
+                        torch.allclose(out_partial, ref_out, atol=1e-3, rtol=1e-3),
+                        f"split_k={split_k} num_tokens={n}: out_partial 不一致",
+                    )
+                    self.assertTrue(
+                        torch.allclose(sqrsum_partial, ref_sq, atol=1e-3, rtol=1e-3),
+                        f"split_k={split_k} num_tokens={n}: sqrsum_partial 不一致",
+                    )
+
     def test_kernel_0_matmul_contiguity_contrast(self):
         """对照实验：matmul 操作数先 `.contiguous()` vs 直接喂非连续切片。
 
@@ -330,6 +369,67 @@ class TestHcPreSqrsumFamily(CustomTestCase):
                 self.assertTrue(
                     torch.allclose(sqrsum, ref_sq, atol=1e-3, rtol=1e-3),
                     f"num_tokens={n}: tilelang sqrsum 与参考不一致",
+                )
+
+    def test_mhc_pre_align_fleet_matches_hf_form(self):
+        """`mhc_align_fleet=True`（**服务真实取值**）下 big_fuse 数值正确。
+
+        服务端 `EB5DecoderLayer` 按 `model_type` 设置：
+        `self.mhc_align_fleet = "ernie" in model_type`，本权重 `model_type="ernie"`
+        → **True**。它切换两处算法（`mhc.py` docstring）：
+          * mapping norm 用 `1/(sqrt(sum_sq/D)+eps)`（eps 在 sqrt 外）
+          * sinkhorn softmax 用 `exp2((x-max)*LOG2E)` 而非 `exp(x-max)`
+        原适配层单测一律用 `False`（HF/DSV4 口径），**从未测过 EB5 实际走的那条**。
+        """
+        from sglang.kernels.ops.layernorm.mhc import (
+            mhc_pre_big_fuse_with_norm_tilelang,
+            mhc_pre_gemm_sqrsum_splitk_kernel,
+        )
+
+        for n in (256, 1024):
+            with self.subTest(num_tokens=n):
+                x, fn = self._make_inputs(n)
+                split_k = self.SPLIT_K
+                out_partial = torch.zeros(
+                    split_k, n, 32, dtype=torch.float32, device=_DEVICE
+                )
+                sq_partial = torch.zeros(
+                    split_k, n, dtype=torch.float32, device=_DEVICE
+                )
+                kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
+                    self.HC_MULT3, self.HC_HIDDEN, split_k=split_k
+                )
+                kernel_0(x, fn, out_partial, sq_partial)
+
+                residual = _rand(n, self.HC_MULT, self.HIDDEN)
+                post_mix = torch.empty(n, self.HC_MULT, dtype=torch.float32, device=_DEVICE)
+                comb_mix = torch.empty(
+                    n, self.HC_MULT**2, dtype=torch.float32, device=_DEVICE
+                )
+                layer_input = torch.empty(n, self.HIDDEN, dtype=_DTYPE, device=_DEVICE)
+                norm_weight = torch.randn(self.HIDDEN, dtype=_DTYPE, device=_DEVICE)
+                hc_scale = torch.ones(3, dtype=torch.float32, device=_DEVICE)
+                hc_base = torch.zeros(self.HC_MULT3, dtype=torch.float32, device=_DEVICE)
+
+                mhc_pre_big_fuse_with_norm_tilelang(
+                    out_partial, sq_partial, hc_scale, hc_base, residual,
+                    post_mix, comb_mix, layer_input, norm_weight,
+                    self.HIDDEN, 1e-6, 1e-6, 1e-6, 2.0, 20, 1e-6,
+                    split_k, self.HC_MULT, 32, 1,   # mhc_align_fleet=True
+                )
+                torch.cuda.synchronize()
+
+                self.assertTrue(torch.isfinite(post_mix).all(), f"n={n}: post_mix 非有限")
+                self.assertTrue(torch.isfinite(comb_mix).all(), f"n={n}: comb_mix 非有限")
+                self.assertTrue(torch.isfinite(layer_input).all(), f"n={n}: layer_input 非有限")
+                # sinkhorn 归一化后列和为 1（与服务里 comb 的语义一致）
+                self.assertTrue(
+                    torch.allclose(
+                        comb_mix.view(n, self.HC_MULT, self.HC_MULT).float().sum(-2),
+                        torch.ones(n, self.HC_MULT, device=_DEVICE),
+                        atol=1e-3,
+                    ),
+                    f"n={n}: comb 列和不为 1",
                 )
 
     def test_mhc_pre_gemm_sqrsum_dispatch(self):

@@ -703,12 +703,20 @@ def fused_split_feature_topk(
         topk_weights = topk_weights * routed_scaling_factor
 
     if num_token_non_padded is not None:
-        lim = int(num_token_non_padded)
-        if lim < T:
-            topk_ids = topk_ids.clone()
-            topk_ids[lim:] = -1
-            topk_weights = topk_weights.clone()
-            topk_weights[lim:] = 0.0
+        # `num_token_non_padded` 是 **device 标量**（原始 kernel 在 device 上读它）。
+        # 这里不能 `int(...)`：那是 D2H 同步，本机 XPU 上会挂死（同 memcpy_triton）。
+        lim = (
+            torch.as_tensor(num_token_non_padded, device=topk_ids.device)
+            .reshape(-1)[0]
+            .to(torch.long)
+        )
+        rows = torch.arange(T, device=topk_ids.device) >= lim
+        topk_ids = torch.where(
+            rows.unsqueeze(-1), torch.full_like(topk_ids, -1), topk_ids
+        )
+        topk_weights = torch.where(
+            rows.unsqueeze(-1), torch.zeros_like(topk_weights), topk_weights
+        )
 
     return topk_weights, topk_ids.to(torch.int32), router_logits
 
@@ -759,20 +767,46 @@ def situ_and_mul(
 
 
 def memcpy_triton(dst, src, dim, offset, sz, offset_src) -> None:
-    """torch 拆解：offset/size 驱动的 device 间拷贝（offset/sz 以"行"为单位）。"""
+    """torch 拆解：offset/size 驱动的 device 间拷贝（offset/sz 以"行"为单位）。
+
+    ⚠️ **绝对不能** 用 `int(offset)` / `.item()` / `.cpu()` 把这两个值拉回主机：
+    调用方 `sglang.srt.layers.dp_attention.memcpy()` 传进来的是 **0-dim CUDA tensor**
+    （`get_dp_local_info()` 返回 `global_num_tokens_gpu` 的切片），原始 triton kernel
+    是把它当 **device 指针**在 kernel 里 `tl.load` 的 —— 全程没有 D2H。
+    在本机 XPU 上，这种标量 D2H 会让所有 rank 一起挂死（doc/3 记录的同一现象；
+    2026-10-19 实测 4 rank 全部停在那一行，`py-spy` 可见）。
+
+    这里改成**纯 device 侧**实现：用 `arange` + 布尔 mask 完成动态切片，
+    不需要把 offset/size 取回主机。
+    """
     assert dim == 0, "dim != 0 unsupported"
     assert src.shape[1:] == dst.shape[1:], "src and dst must have same shape"
-    chunk = functools.reduce(lambda a, b: a * b, src.shape[1:], 1)
-    off = int(offset) * chunk
-    size = int(sz) * chunk
-    max_size = min(src.numel(), dst.numel())
-    size = min(size, max_size)
-    dst_flat = dst.reshape(-1)
-    src_flat = src.reshape(-1)
+    if dst.numel() == 0 or src.numel() == 0:
+        return
+
+    dev = dst.device
+    dst_rows, src_rows = int(dst.shape[0]), int(src.shape[0])
+    max_rows = min(dst_rows, src_rows)
+    if max_rows <= 0:
+        return
+
+    # 标量交给 device；Python int 走这条也没问题（as_tensor 不产生 D2H）。
+    off = torch.as_tensor(offset, device=dev).reshape(-1)[0].to(torch.long)
+    size = torch.as_tensor(sz, device=dev).reshape(-1)[0].to(torch.long)
+    n = size.clamp(min=0, max=max_rows)
+
+    r = torch.arange(max_rows, device=dev, dtype=torch.long)
     if offset_src:
-        dst_flat[:size] = src_flat[off : off + size]
+        src_idx = off + r
+        mask = (r < n) & (src_idx < src_rows)
+        dst_idx = r
     else:
-        dst_flat[off : off + size] = src_flat[:size]
+        dst_idx = off + r
+        mask = (r < n) & (dst_idx < dst_rows)
+        src_idx = r
+
+    src_sel = src.index_select(0, src_idx[mask])
+    dst[dst_idx[mask]] = src_sel
 
 
 def get_paged_mqa_logits_metadata_torch(

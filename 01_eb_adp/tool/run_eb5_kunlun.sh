@@ -29,6 +29,20 @@ source "$BINGOO/code/sglang-kunlun/01_eb_adp/tool/env.sh"
 
 MODEL_PATH=${1:-$BINGOO/models/hf_checkpoint-48800}
 PORT=${2:-30082}
+
+# 用哪几张卡（默认全 8 张）。TP/DP/EP 都按卡数自动取，与 run_dsv4_newenv.sh 一致。
+EB5_GPUS=${EB5_GPUS:-0,1,2,3,4,5,6,7}
+NGPU=$(awk -F, '{print NF}' <<<"$EB5_GPUS")
+export XPU_VISIBLE_DEVICES=$EB5_GPUS
+export CUDA_VISIBLE_DEVICES=$EB5_GPUS
+
+# 可选：给模型 config 打补丁（JSON）。4 卡装不下完整 43 层（573GB / 4 = 143GB > 96GB），
+# 用减层子模型时必须同时改 num_hidden_layers 和 compress_ratios：
+#   MODEL_OVERRIDE_ARGS='{"num_hidden_layers":8,"compress_ratios":[128,128,128,128,128,128,128,-2,-2]}'
+MODEL_OVERRIDE_ARGS=${MODEL_OVERRIDE_ARGS:-}
+# 用数组传，避免 JSON 里带空格时被 word-split。
+OVERRIDE_ARG=()
+[ -n "$MODEL_OVERRIDE_ARGS" ] && OVERRIDE_ARG=(--json-model-override-args "$MODEL_OVERRIDE_ARGS")
 # BF16 权重（每卡 ~67 GB / 可用 96 GB）下 KV cache 只剩 ~25 GB，先跑通：
 # 小 context、低并发、关 CUDA graph。
 MEM_FRACTION=${MEM_FRACTION:-0.90}
@@ -77,7 +91,7 @@ export PYTHONUNBUFFERED=1
 export no_proxy="127.0.0.1,localhost${no_proxy:+,${no_proxy}}"
 export NO_PROXY="$no_proxy"
 
-echo "[run_eb5_kunlun] model=$MODEL_PATH port=$PORT log=$LOG"
+echo "[run_eb5_kunlun] model=$MODEL_PATH port=$PORT gpus=$EB5_GPUS (n=$NGPU) log=$LOG"
 
 # ---- 起服务前先安全清掉上一次的残留 ----
 # 这里**不再**用 `pkill -9 -f "sglang.launch_server|sglang::"`：它有两个真实的坑
@@ -96,7 +110,7 @@ fi
 # EB5 首次前向报 KL_XID_KERNEL_EXCEPTION 之后，下一次起服务在加载权重阶段挂死）。
 # 所以闸门必须包含 **8 进程 XCCL 探针**（单卡探针抓不到 rank 0/1/2 挂死）。
 # 急用时可用 `SKIP_PREFLIGHT=1` 跳过（不推荐）。
-if ! bash "$BINGOO/code/sglang-kunlun/01_eb_adp/tool/preflight.sh"; then
+if ! PREFLIGHT_GPUS=$EB5_GPUS bash "$BINGOO/code/sglang-kunlun/01_eb_adp/tool/preflight.sh"; then
   echo "[run_eb5_kunlun] ❌ preflight 没过，放弃启动（别硬上）"
   exit 1
 fi
@@ -119,7 +133,8 @@ nohup sglang-kunlun-launch \
   --max-running-requests "$MAX_RUNNING_REQUESTS" \
   --disable-cuda-graph \
   --swa-full-tokens-ratio 0.1 \
-  --tp-size 8 --dp-size 8 --ep-size 8 \
+  --tp-size "$NGPU" --dp-size "$NGPU" --ep-size "$NGPU" \
+  "${OVERRIDE_ARG[@]}" \
   --enable-dp-attention \
   --disable-custom-all-reduce \
   --page-size 256 \

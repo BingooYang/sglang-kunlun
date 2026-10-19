@@ -48,7 +48,8 @@ _SERVICE_PROFILE = {
 }
 if os.environ.get("EB5_TEST_PROFILE") == "service":
     for _k, _v in _SERVICE_PROFILE.items():
-        os.environ.setdefault(_k, _v)
+        # 显式选择 service 时固定配置，避免继承的相反开关悄悄切换分支。
+        os.environ[_k] = _v
     print(
         "[eb5-test-profile] service 配置已生效，关键开关 "
         f"SGLANG_OPT_DEEPGEMM_HC_PRENORM="

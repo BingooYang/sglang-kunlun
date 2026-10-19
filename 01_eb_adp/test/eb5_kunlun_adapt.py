@@ -107,6 +107,11 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
     ``out_partial[s,t,:hc_mult3] = x[t, 段] @ fn[:hc_mult3, 段].T``、
     ``sqrsum_partial[s,t] = Σ x[t, 段]²``；后面的 ``*_big_fuse_*`` 再把各段求和。
     """
+    # 与原 kernel 的 32 列输出和等长 split 契约一致，避免静默丢弃 K 尾部。
+    if not 0 < hc_mult3 <= 32:
+        raise ValueError("hc_mult3 must be in [1, 32]")
+    if hc_hidden_size <= 0 or split_k <= 0 or hc_hidden_size % split_k:
+        raise ValueError("hc_hidden_size must be positive and divisible by positive split_k")
     split_size = hc_hidden_size // split_k
 
     def kernel_0(x, fn, out_partial, sqrsum_partial):

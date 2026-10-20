@@ -45,7 +45,10 @@ OVERRIDE_ARG=()
 [ -n "$MODEL_OVERRIDE_ARGS" ] && OVERRIDE_ARG=(--json-model-override-args "$MODEL_OVERRIDE_ARGS")
 # BF16 权重（每卡 ~67 GB / 可用 96 GB）下 KV cache 只剩 ~25 GB，先跑通：
 # 小 context、低并发、关 CUDA graph。
-MEM_FRACTION=${MEM_FRACTION:-0.90}
+MEM_FRACTION=${MEM_FRACTION:-0.85}  # 0.90 -> 整网(43 层/8 卡)时 KV pool 把卡吃到只剩 28 MB，
+# 首个 forward 里 `_store_bf16_rows` 申请 38 MB 临时缓冲就直接 OOM
+# （2026-10-20 23:15 实测，`fused_k_norm_rope_flashmla_bf16`）。
+# 0.85 留出 ~14 GB 给临时张量；8L 在 0.90/0.85 下都够用。
 CONTEXT_LENGTH=${CONTEXT_LENGTH:-32768}
 MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-8}
 # KV cache 必须显式给 bf16。默认 `auto` 落到 FP8(uint8) 布局，而 SWA 的 K 写入

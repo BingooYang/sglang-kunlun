@@ -754,6 +754,39 @@ def fused_q_norm_rope(q_input, q_output, eps, freqs_cis, positions):
 # --------------------------------------------------------------------------- #
 # 注入
 # --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# wo_a 低秩投影：替代 torch.einsum 的通用收缩
+# --------------------------------------------------------------------------- #
+def _apply_wo_a_bf16_matmul_torch(o, wo_a, is_decode=False):
+    """``[T,G,D] x [G,R,D] -> [T,G,R]``：group 作 batch 的 bmm + 按 token 分块。
+
+    fork 的兜底是 ``torch.einsum("tgd,grd->tgr")``。通用收缩在昆仑上会把
+    4-D 中间量物化（T≈1200、G=8、R=1536、D=512 时约 15 GiB），整网 43 层
+    首 forward 因此 OOM（2026-10-20 23:23 实测）。这里改成显式 bmm + 分块，
+    峰值只有 ``chunk*G*(D+R)*2`` 字节（chunk=1024 时约 30 MB），数值等价。
+
+    ``is_decode`` 仅为保持签名兼容（昆仑上 aiter batched_gemm 不可用）。
+    """
+    assert o.dim() == 3 and wo_a.dim() == 3, (o.shape, wo_a.shape)
+    T, G, D = o.shape
+    assert wo_a.shape[0] == G and wo_a.shape[-1] == D, (o.shape, wo_a.shape)
+    R = wo_a.shape[1]
+    if T == 0:
+        return o.new_empty((0, G, R))
+    w = wo_a.transpose(1, 2)
+    if not w.is_contiguous():
+        w = w.contiguous()                                   # [G,D,R]
+    out = torch.empty((T, G, R), dtype=o.dtype, device=o.device)
+    chunk = 1024
+    for lo in range(0, T, chunk):
+        hi = min(lo + chunk, T)
+        x = o[lo:hi].permute(1, 0, 2).contiguous()           # [G,c,D]
+        y = torch.bmm(x, w)                                  # [G,c,R]
+        out[lo:hi] = y.permute(1, 0, 2)
+    return out
+
+
 def apply() -> list[str]:
     """把上面的 torch 拆解实现 patch 到 fork 的调用点上。返回已 patch 的符号列表。"""
     import importlib
@@ -797,6 +830,14 @@ def apply() -> list[str]:
     _patch(mhc_mod, "_mhc_pre_gemm_sqrsum_dispatch", _mhc_pre_gemm_sqrsum_dispatch)
     # deep_gemm 的 tf32 prenorm GEMM（`mhc_pre` 的 `SGLANG_OPT_DEEPGEMM_HC_PRENORM=1`
     # 分支、以及 kernel 级单测都直接 import 它）。
+    # ③ wo_a 低秩投影：fork 兜底的 torch.einsum 在昆仑上会物化 4-D 中间量
+    #    （整网 43 层首 forward 峰值 ~15 GiB -> OOM）。改成 bmm + 分块。
+    _patch(
+        "sglang.srt.models.deepseek_v4",
+        "_apply_wo_a_bf16_matmul",
+        _apply_wo_a_bf16_matmul_torch,
+    )
+
     dg_mod = "sglang.srt.layers.deep_gemm_wrapper.entrypoint"
     _patch(dg_mod, "tf32_hc_prenorm_gemm", tf32_hc_prenorm_gemm)
 

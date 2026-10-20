@@ -30,7 +30,33 @@ PAT_CPU_WORKER='sglang[:][:]tokenizer_worker|sglang[:][:]detoken'
 
 say() { echo "[stop_kunlun] $*"; }
 
-alive() { pgrep -f "$PAT_LAUNCH" >/dev/null 2>&1 || pgrep -f "$PAT_WORKER" >/dev/null 2>&1; }
+# 只认"真正的" sglang 进程：`pgrep -f` 匹配整条命令行，会把别的任务的 shell 包装
+# （cmdline 里引用了 `sglang::` 字面量）误判成残留，从而挡住每次启动、甚至给它发 TERM。
+# 用 /proc/<pid>/comm 过滤：scheduler/worker 的 comm 是 `sglang::xxx`，launcher 是 python*。
+sglang_pids() {
+  local p comm
+  for p in $(pgrep -f "$PAT_LAUNCH|$PAT_WORKER" 2>/dev/null); do
+    comm=$(cat /proc/"$p"/comm 2>/dev/null) || continue
+    case "$comm" in bash|sh|dash|zsh|ksh|timeout|grep|pgrep) continue ;; esac
+    echo "$p"
+  done
+}
+alive() { [ -n "$(sglang_pids)" ]; }
+
+# 只校验本次任务实际要用的卡（默认全 8 张）。`run_eb5_kunlun.sh` 支持 EB5_GPUS 子集，
+# 但这里原来硬编码 8 张；4–7 被别的任务占着时，4 卡运行会被误判成"有卡没回到 0 MiB"。
+GPUS=${STOP_GPUS:-${EB5_GPUS:-0,1,2,3,4,5,6,7}}
+NGPU=$(awk -F, '{print NF}' <<<"$GPUS")
+card_free() {
+  local out
+  out=$(xpu-smi -i "$1" 2>/dev/null) || return 1
+  grep -qE '0MiB / 98304MiB' <<<"$out"
+}
+count_free() {
+  local n=0 d
+  for d in $(tr ',' ' ' <<<"$GPUS"); do card_free "$d" && n=$((n+1)); done
+  echo "$n"
+}
 
 if ! alive; then
   say "没有在跑的 sglang 进程"
@@ -38,10 +64,11 @@ if ! alive; then
 fi
 
 say "发现残留："
-pgrep -af "$PAT_LAUNCH|$PAT_WORKER" | sed 's/^/  /' | cut -c1-120
+for _p in $(sglang_pids); do printf "  %s %s\n" "$_p" "$(tr '\0' ' ' < /proc/$_p/cmdline 2>/dev/null | cut -c1-110)"; done
 
 # a) 优雅信号
-for p in $(pgrep -f "$PAT_LAUNCH" 2>/dev/null); do
+for p in $(sglang_pids); do
+  grep -q "$PAT_LAUNCH" /proc/"$p"/cmdline 2>/dev/null || continue
   kill -TERM "$p" 2>/dev/null && say "TERM -> $p"
   kill -INT  "$p" 2>/dev/null
 done
@@ -49,11 +76,11 @@ done
 # b) 给优雅退出一点时间
 for _ in $(seq 1 6); do
   sleep 5
-  pgrep -f "$PAT_LAUNCH" >/dev/null 2>&1 || { say "launcher 已优雅退出"; break; }
+  alive || { say "launcher 已优雅退出"; break; }
 done
 
 # c) 还活着：只 -9 空闲的纯 CPU worker，解开 waitpid 死锁
-if pgrep -f "$PAT_LAUNCH" >/dev/null 2>&1; then
+if alive; then
   say "launcher 仍在（多半卡在 waitpid 等 worker），只对空闲的纯 CPU worker 用 -9"
   for p in $(pgrep -f "$PAT_CPU_WORKER" 2>/dev/null); do
     st=$(awk '{print $3}' /proc/"$p"/stat 2>/dev/null)
@@ -70,19 +97,19 @@ fi
 # d) 等 launcher 自己退出
 for _ in $(seq 1 24); do
   sleep 5
-  pgrep -f "$PAT_LAUNCH" >/dev/null 2>&1 || break
+  alive || break
 done
 
 if alive; then
   say "❌ 仍有进程未退出："
-  pgrep -af "$PAT_LAUNCH|$PAT_WORKER" | sed 's/^/  /' | cut -c1-120
+  for _p in $(sglang_pids); do printf "  %s %s\n" "$_p" "$(tr '\0' ' ' < /proc/$_p/cmdline 2>/dev/null | cut -c1-110)"; done
   say "不要对 launcher 用 -9（doc/3：会留 stuck kernel）。请人工确认后再处理。"
   exit 1
 fi
 
-free=$(xpu-smi 2>/dev/null | grep -cE '0MiB / 98304MiB')
-say "设备：$free/8 张卡空闲（0 MiB）"
-if [ "$free" -ne 8 ]; then
+free=$(count_free)
+say "设备：$free/$NGPU 张卡空闲（0 MiB，范围 $GPUS）"
+if [ "$free" -ne "$NGPU" ]; then
   say "❌ 有卡没回到 0 MiB —— 先别起下一个任务，按 doc/3 第五节处理"
   exit 1
 fi

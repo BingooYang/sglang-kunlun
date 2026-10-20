@@ -57,8 +57,10 @@ class TestAdaptCoverage(unittest.TestCase):
     def test_replaced_symbol_set_is_non_trivial(self):
         """自检：解析本身没坏（不然下面那条会假绿）。"""
         syms = _replaced_symbols()
+        # mHC 的融合替代实现（tilelang post / big_fuse pre / split-K / tf32）已删除，
+        # 适配层只保留散装 torch 的 mhc_pre/mhc_post，被替换符号从 30 降到 24。
         self.assertGreaterEqual(
-            len(syms), 25, f"只解析出 {len(syms)} 个被替换符号，解析逻辑可能坏了"
+            len(syms), 20, f"只解析出 {len(syms)} 个被替换符号，解析逻辑可能坏了"
         )
 
     def test_every_replaced_symbol_is_referenced_by_some_test(self):

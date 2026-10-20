@@ -33,12 +33,101 @@ import torch
 from einops import rearrange
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
 logger = logging.getLogger(__name__)
+
+
+def _get_k_bf16_compat(module, x, positions):
+    """K-only 路径，兼容 fork 的两代实现。
+
+    fork 的 ``Indexer._get_k_bf16`` 只支持非融合（``self.wk``），而 EB5 的
+    ``EB5FullMLAIndexer`` 走 ``use_dsa_indexer_fusion=True``（只有
+    ``wk_weights_proj``，没有 ``wk``），直接调基类会
+    ``AttributeError: 'EB5FullMLAIndexer' object has no attribute 'wk'``。
+    这里按基类 ``_get_q_k_bf16`` 的融合分支重写一份 K-only 版本。
+    """
+    if getattr(module, "use_dsa_indexer_fusion", False):
+        key, _ = module._fused_k_weights(x)
+    else:
+        key, _ = module.wk(x)
+    key = module.k_norm(key)
+    k_rope, _ = torch.split(
+        key,
+        [module.rope_head_dim, module.head_dim - module.rope_head_dim],
+        dim=-1,
+    )
+    # rotary 可能原地改两个输入，dummy_q 不能与 k_rope 共享内存。
+    dummy_q_rope = torch.empty_like(k_rope)
+    _, k_rope = module.rotary_emb(positions, dummy_q_rope, k_rope)
+    module._update_rope_guarded(key[..., : module.rope_head_dim], k_rope)
+    return module._maybe_rotate(key)
+
+
+def _enable_prefill_cp(module) -> bool:
+    """fork 把 ``nsa_enable_prefill_cp`` 改名为 ``dsa_enable_prefill_cp``；
+    两代名字都兼容，避免插件在旧/新 fork 上二选一。"""
+    for name in ("dsa_enable_prefill_cp", "nsa_enable_prefill_cp"):
+        if hasattr(module, name):
+            return bool(getattr(module, name))
+    return False
+
+
+def _get_k_bf16_compat(indexer, x, positions):
+    """K-only 路径，兼容 indexer 的融合/非融合两种形态。
+
+    fork 的 ``Indexer._get_k_bf16`` 只处理非融合分支（直接 ``self.wk``）。EB5 的
+    ``EB5FullMLAIndexer`` 走融合分支（``use_dsa_indexer_fusion=True``，只有
+    ``wk_weights_proj``，没有 ``wk``），直接调用会 ``AttributeError: ... has no
+    attribute 'wk'``（2026-10-20 20:31 实测，decode 的 ``kv_len <= index_topk`` 快路径）。
+    """
+    if getattr(indexer, "use_dsa_indexer_fusion", False):
+        key, _ = indexer._fused_k_weights(x)
+    else:
+        key, _ = indexer.wk(x)
+    key = indexer.k_norm(key)
+    k_rope, _ = torch.split(
+        key,
+        [indexer.rope_head_dim, indexer.head_dim - indexer.rope_head_dim],
+        dim=-1,
+    )
+    # rotary 可能原地改两个输入，K-only 路径不能拿 k_rope 自己当 dummy query。
+    dummy_q_rope = torch.empty_like(k_rope)
+    _, k_rope = indexer.rotary_emb(positions, dummy_q_rope, k_rope)
+    indexer._update_rope_guarded(key[..., : indexer.rope_head_dim], k_rope)
+    return indexer._maybe_rotate(key)
+
+
+def _k_proj(self, x: torch.Tensor) -> torch.Tensor:
+    """Index-K 投影：fused indexer 没有 ``self.wk``（EB5 就是这种）。"""
+    if getattr(self, "use_dsa_indexer_fusion", False) and hasattr(self, "_fused_k_weights"):
+        key, _ = self._fused_k_weights(x)
+        return key
+    key = _k_proj(self, x)
+    return key
+
+
+def _maybe_rotate(self, t: torch.Tensor) -> torch.Tensor:
+    """fused indexer 不做 Hadamard 旋转（基类 ``_maybe_rotate`` 的语义）。"""
+    fn = getattr(self, "_maybe_rotate", None)
+    return fn(t) if fn is not None else _rotate_activation(t)
+
+
+def _get_k_bf16_compat(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    """``Indexer._get_k_bf16`` 的 fusion-aware 版本（基类只支持 non-fusion）。"""
+    key = _k_proj(self, x)
+    key = self.k_norm(key)
+    k_rope, _ = torch.split(
+        key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+    )
+    dummy_q_rope = torch.empty_like(k_rope)
+    _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
+    self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
+    return _maybe_rotate(self, key)
 
 
 def _shape_meta(tensor):
@@ -645,7 +734,7 @@ def _get_q_k_bf16(
             dim=-1,
         )
         with torch.cuda.stream(self.alt_stream):
-            key, _ = self.wk(x)
+            key = _k_proj(self, x)
             key = self.k_norm(key)
             k_rope, _ = torch.split(
                 key,
@@ -659,7 +748,7 @@ def _get_q_k_bf16(
         q_rope, _ = torch.split(
             query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
-        key, _ = self.wk(x)
+        key = _k_proj(self, x)
         key = self.k_norm(key)
         k_rope, _ = torch.split(
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -672,15 +761,15 @@ def _get_q_k_bf16(
     if enable_dual_stream:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        query = _rotate_activation(query)
+        query = _maybe_rotate(self, query)
         with torch.cuda.stream(self.alt_stream):
-            key = _rotate_activation(key)
+            key = _maybe_rotate(self, key)
         current_stream.wait_stream(self.alt_stream)
     else:
-        query = _rotate_activation(query)
-        key = _rotate_activation(key)
+        query = _maybe_rotate(self, query)
+        key = _maybe_rotate(self, key)
 
-    if forward_batch.attn_cp_metadata is not None and self.nsa_enable_prefill_cp:
+    if forward_batch.attn_cp_metadata is not None and getattr(self, "dsa_enable_prefill_cp", False):
         from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 
         key = cp_all_gather_rerange_output(
@@ -713,7 +802,7 @@ def _forward_cuda_k_only(
     assert forward_batch.forward_mode.is_extend_without_speculative()
     x_meta = x[0] if isinstance(x, tuple) else x
 
-    key = self._get_k_bf16(x, positions, enable_dual_stream)
+    key = _get_k_bf16_compat(self, x, positions)
     key_shape = key.shape
     key = key.view(-1, self.block_size)
     k_fp8 = torch.empty(key.shape, device=key.device, dtype=torch.int8)
@@ -767,7 +856,7 @@ def forward_cuda(
     if TYPE_CHECKING:
         assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
     x_meta = x[0] if isinstance(x, tuple) else x
-    metadata = forward_batch.attn_backend.get_indexer_metadata(layer_id, forward_batch)
+    metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
     enable_dual_stream = False
 
     if metadata is None:
@@ -779,7 +868,7 @@ def forward_cuda(
             max_kv_len = forward_batch.seq_lens_cpu.max().item()
             skip_logits_computation = max_kv_len <= self.index_topk
 
-    if skip_logits_computation and (not self.nsa_enable_prefill_cp):
+    if skip_logits_computation and (not getattr(self, "dsa_enable_prefill_cp", False)):
         return self._forward_cuda_k_only(
             x,
             positions,

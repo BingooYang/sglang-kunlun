@@ -48,6 +48,15 @@ OVERRIDE_ARG=()
 MEM_FRACTION=${MEM_FRACTION:-0.90}
 CONTEXT_LENGTH=${CONTEXT_LENGTH:-32768}
 MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-8}
+# KV cache 必须显式给 bf16。默认 `auto` 落到 FP8(uint8) 布局，而 SWA 的 K 写入
+# （`set_swa_key_buffer_radix_fused_norm_rope`）在 fp8 布局下走
+# `dsv4_torch_shim._e4m3_to_uint8`，里面有一次 `.cpu()`（昆仑没有设备侧 fp32→fp8
+# 转换，只能在 host 上转）。2026-10-20 实测：4 rank 首次前向永久停在那个 `.cpu()`，
+# watchdog 300 s 后退出，并在 4 张卡上各留一条 KL_XID_KERNEL_EXCEPTION。
+# bf16 布局改走 `fused_k_norm_rope_flashmla_bf16` → 插件原生
+# `kunlun_ops.rmsnorm` + `xspeedgate_ops.flashinfer_rotary_embedding` +
+# `xspeedgate_ops.set_k_and_s_v4`，与 DSV4 已跑通的那条同类。
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-bfloat16}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 LOG=$BINGOO/logs/eb5_kunlun_$(date +%Y%m%d_%H%M%S).log
 mkdir -p "$BINGOO/logs"
@@ -74,17 +83,9 @@ export SGLANG_OPT_USE_TOPK_V2=False SGLANG_TOPK_TRANSFORM_512_TORCH=False
 export SGLANG_OPT_USE_JIT_INDEXER_METADATA=False SGLANG_OPT_USE_TILELANG_INDEXER=False SGLANG_OPT_USE_AITER_INDEXER=False
 export SGLANG_OPT_USE_FUSED_STORE_CACHE=0 SGLANG_OPT_USE_COMPRESSOR_V2=False
 export SGLANG_OPT_USE_TILELANG_MHC_PRE=0 SGLANG_OPT_USE_TILELANG_MHC_POST=0
-# `mhc_pre` / `mhc_post` 的散装 torch 实现（不调 split-k / tf32 / tilelang 融合 kernel）。
-# 参照 DSV4 在昆仑上跑通的 `hc_pre_torch_impl` / `hc_post_torch_impl`；2026-10-20
-# 融合路径在服务首次前向挂死（`kernel_0`），先默认走这条。
-# 要回到融合实现：EB5_MHC_TORCH_REF=0。
-export EB5_MHC_TORCH_REF=${EB5_MHC_TORCH_REF:-1}
-# `mhc_pre` 有两条实现：1 → `tf32_hc_prenorm_gemm`（纯 torch 拆解），
-# 0 → `mhc_pre_gemm_sqrsum_splitk_kernel`（split-k 拆解）。
-# 服务默认走 0；2026-10-20 实测它在 4 rank 首次前向会挂死（py-spy 停在 `kernel_0`
-# 的 strided `.contiguous()`），而 1 那条路在单测里稳定通过，所以留一个覆盖口子：
-#   SGLANG_OPT_DEEPGEMM_HC_PRENORM=1 bash run_eb5_kunlun.sh ...
-export SGLANG_OPT_DEEPGEMM_HC_PRENORM=${SGLANG_OPT_DEEPGEMM_HC_PRENORM:-0}
+# `mhc_pre` / `mhc_post` 由适配层整体换成散装 torch 实现（与 DSV4 的
+# `hc_pre` / `hc_post_torch_impl` 逐式一致：GEMM → sinkhorn → combine → layernorm），
+# 不再经过任何融合 kernel，也没有回退开关。
 export SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=0
 export SGLANG_HACK_FLASHMLA_BACKEND=kunlun SGLANG_FIX_DSV4_BASE_MODEL_LOAD=1 SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 SGLANG_DSV4_FP4_EXPERTS=0
 export SGLANG_IS_FLASHINFER_AVAILABLE=False SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
@@ -140,6 +141,7 @@ nohup sglang-kunlun-launch \
   --trust-remote-code \
   --dtype bfloat16 \
   --context-length "$CONTEXT_LENGTH" \
+  --kv-cache-dtype "$KV_CACHE_DTYPE" \
   --mem-fraction-static "$MEM_FRACTION" \
   --max-running-requests "$MAX_RUNNING_REQUESTS" \
   --disable-cuda-graph \

@@ -19,10 +19,8 @@ case 列表：
     memcpy-full      memcpy_triton：整块拷贝（旧单测唯一的参数）
     memcpy-partial   memcpy_triton：非零 offset + 截断（2026-10-20 挂死点）
     memcpy-scatter   memcpy_triton：`offset_src=False`
-    splitk           mhc_pre 的 split-k 拆解（split_k=32，服务真实形状）
-    tf32             mhc_pre 的 tf32_hc_prenorm_gemm 拆解
     mhc-pre          直接调 fork 的 `mhc.mhc_pre`（3 token，最接近服务）
-                     加 `EB5_MHC_TORCH_REF=1` 可验证散装 torch 实现
+                     走适配层的散装 torch 实现（与 DSV4 同构）
     mhc-post         直接调 fork 的 `mhc.mhc_post`（同上）
 
 **挂死时不要 kill**（doc/3 开头）：等它自己超时退出。
@@ -52,7 +50,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--case", required=True, choices=[
         "baseline", "memcpy-full", "memcpy-partial", "memcpy-scatter",
-        "splitk", "tf32", "mhc-pre", "mhc-post",
+        "mhc-pre", "mhc-post",
     ])
     ap.add_argument("--splits", type=int, default=32, help="split-k 段数（默认 32，服务真实值）")
     args = ap.parse_args()
@@ -126,23 +124,6 @@ def main() -> int:
             sz = torch.tensor(4, dtype=torch.int32, device=dev)
             offset_src = args.case == "memcpy-partial"
         memcpy_triton(dst, src, 0, off, sz, offset_src)
-        torch.cuda.synchronize()
-
-    elif args.case in ("splitk", "tf32"):
-        step(args.case)
-        x = torch.randn(TOKENS, HC_HIDDEN, dtype=torch.bfloat16, device=dev)
-        fn = torch.randn(HC_MULT3, HC_HIDDEN, dtype=torch.float32, device=dev)
-        out = torch.empty(args.splits, TOKENS, HC_MULT3, dtype=torch.float32, device=dev)
-        sq = torch.empty(args.splits, TOKENS, dtype=torch.float32, device=dev)
-        if args.case == "splitk":
-            # 服务里 out 的最后一维固定 32（kernel 契约），而 tf32 用 hc_mult3。
-            out = torch.empty(args.splits, TOKENS, 32, dtype=torch.float32, device=dev)
-            kernel_0, _ = A.mhc_pre_gemm_sqrsum_splitk_kernel(
-                HC_MULT3, HC_HIDDEN, args.splits
-            )
-            kernel_0(x, fn, out, sq)
-        else:
-            A.tf32_hc_prenorm_gemm(x, fn, out, sq, args.splits)
         torch.cuda.synchronize()
 
     elif args.case == "mhc-pre":

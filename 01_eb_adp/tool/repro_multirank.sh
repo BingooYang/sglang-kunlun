@@ -8,9 +8,9 @@
 # 用法：
 #   bash repro_multirank.sh <case> [gpus] [wait_seconds]
 #   bash repro_multirank.sh memcpy-partial 0,1,2,3 90
-#   EB5_MHC_SINGLE_SPLIT=1 bash repro_multirank.sh splitk 0,1,2,3 60
+#   bash repro_multirank.sh mhc-pre 0,1,2,3 90
 #
-# case：baseline | memcpy-full | memcpy-partial | memcpy-scatter | splitk | tf32 | mhc-pre
+# case：baseline | memcpy-full | memcpy-partial | memcpy-scatter | mhc-pre | mhc-post
 #
 # 🔴 挂死时**不要 kill**：进程会自己超时退出（doc/3 开头）。脚本只报告，不发信号。
 set -uo pipefail
@@ -29,7 +29,10 @@ say() { echo "[repro] $*"; }
 # ---- 设备必须空闲，否则测的是上一个残留 ----
 free=0
 for d in $(tr ',' ' ' <<<"$GPUS"); do
-  xpu-smi -i "$d" 2>/dev/null | grep -qE '0MiB / 98304MiB' && free=$((free + 1))
+  # 不能写成 `xpu-smi -i "$d" | grep -q`：`set -o pipefail` 下 grep 命中后提前退出，
+  # xpu-smi 收 SIGPIPE(141)，整条管道判失败 → 空闲卡被误判成占用（与 preflight §10.4 同型）。
+  out=$(xpu-smi -i "$d" 2>/dev/null) || continue
+  grep -qE '0MiB / 98304MiB' <<<"$out" && free=$((free + 1))
 done
 if [ "$free" -ne "$NGPU" ]; then
   say "❌ 只有 $free/$NGPU 张卡空闲，先按 doc/3 第五节恢复，别硬上"
@@ -42,7 +45,7 @@ export MASTER_ADDR=127.0.0.1 MASTER_PORT=$PORT
 : > "$LOG"
 
 say "case=$CASE gpus=$GPUS ws=$NGPU port=$PORT log=$LOG"
-say "参数：splits=${REPRO_SPLITS:-32} EB5_MHC_SINGLE_SPLIT=${EB5_MHC_SINGLE_SPLIT:-0}"
+say "参数：splits=${REPRO_SPLITS:-32}"
 say "🔴 若挂死不要 kill，等它自行超时退出"
 
 for r in $(seq 0 $((NGPU - 1))); do

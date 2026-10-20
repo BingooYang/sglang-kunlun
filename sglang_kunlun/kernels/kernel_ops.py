@@ -229,6 +229,15 @@ def repair_imported_bindings() -> int:
 _RELOCATED_PATHS: Dict[str, Tuple[str, ...]] = {
     "sglang.srt.mem_cache.common": ("sglang.kernels.ops.memory.common",),
     "sglang.srt.layers.dp_attention": ("sglang.kernels.ops.memory.memcpy_triton",),
+    # fork 把 paged allocator 的 kernel 从 ``mem_cache.triton_ops.allocator``
+    # 搬到了 ``mem_cache.allocator.{paged,swa,common}``；注册键仍是旧路径，
+    # 不打这个补丁的话 decode 第一次分配就会
+    # ``TypeError: 'function' object is not subscriptable``（alloc_decode_kernel）。
+    "sglang.srt.mem_cache.triton_ops.allocator": (
+        "sglang.srt.mem_cache.allocator.paged",
+        "sglang.srt.mem_cache.allocator.swa",
+        "sglang.srt.mem_cache.allocator.common",
+    ),
 }
 
 
@@ -717,15 +726,33 @@ def set_mla_kv_buffer_kernel(
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
     loc: torch.Tensor,
-    buffer_stride: int,
-    nope_stride: int,
-    rope_stride: int,
-    nope_dim: int,
-    rope_dim: int,
+    reserved_skip_index: int = 0,
+    buffer_stride: int = 0,
+    nope_stride: int = 0,
+    rope_stride: int = 0,
+    nope_dim: int = 0,
+    rope_dim: int = 0,
     *,
     BLOCK: int,
+    **kwargs,
 ) -> None:
-    """Store MLA KV tensors into the paged KV buffer."""
+    """Store MLA KV tensors into the paged KV buffer.
+
+    ``**kwargs`` 用于吞掉 fork 新增的 ``DCP_RANK``（2026-10-20 实测：
+    ``TypeError: set_mla_kv_buffer_kernel() got an unexpected keyword argument
+    'DCP_RANK'``）。本机 ``dcp_size=1`` → DCP_RANK 恒为 0，整行写入即正确；
+    真开 DCP 时必须在这里实现分片语义，不能继续忽略。
+
+    ``reserved_skip_index`` 是 fork 新加的**第 5 个位置参数**（默认 0，
+    ``mla_buffer.py:_set_mla_kv_buffer_impl`` 显式传入）。少这个形参时昆仑上
+    实测 ``TypeError: takes 9 positional arguments but 10 were given``
+    （2026-10-20，EB5 full 层写 latent KV）。本机调用方恒传 0，语义上不需要
+    跳行；真要非 0 时应先在这里实现"跳过保留行"再放开。
+    """
+    assert reserved_skip_index == 0, (
+        "set_mla_kv_buffer_kernel: reserved_skip_index != 0 is not implemented "
+        f"on Kunlun (got {reserved_skip_index})"
+    )
 
     from kunlun_ops import set_mla_kv_buffer_triton as impl
 
@@ -754,6 +781,7 @@ def get_mla_kv_buffer_kernel(
     torch.ops.xspeedgate_ops.get_mla_kv_buffer(kv_buffer, loc, cache_k_nope, cache_k_rope)
 
 
+@register_triton_op("sglang.kernels.ops.memory.allocator", "alloc_extend_kernel")
 @register_triton_op("sglang.srt.mem_cache.triton_ops.allocator", "alloc_extend_kernel")
 def alloc_extend_kernel(
     prefix_lens: torch.Tensor,
@@ -958,6 +986,7 @@ def _combine_topk_swa_indices_kernel(
     )
 
 
+@register_triton_op("sglang.kernels.ops.memory.allocator", "alloc_decode_kernel")
 @register_triton_op("sglang.srt.mem_cache.triton_ops.allocator", "alloc_decode_kernel")
 def alloc_decode_kernel(
     seq_lens: torch.Tensor,

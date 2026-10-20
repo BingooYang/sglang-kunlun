@@ -43,6 +43,10 @@ class TestMultirankRepro(unittest.TestCase):
             f"case={case} 失败：\n{proc.stdout[-4000:]}\n{proc.stderr[-2000:]}",
         )
 
+    # 注意：`splitk` / `tf32` 两个 case 已从 `tool/repro_multirank.py` 的 `--case`
+    # choices 里删除（mHC 融合路径不再使用），对应的用例也一并删除；现在只剩
+    # baseline + memcpy 三兄弟，它们仍对应复现器里真实存在的 case。
+
     def test_baseline_xccl_d2h(self):
         """设备基线：init_process_group + all_reduce + D2H（doc/3 §4 最小复现）。"""
         self._run("baseline")
@@ -59,13 +63,6 @@ class TestMultirankRepro(unittest.TestCase):
         """`offset_src=False`（dp_gather 的方向）。"""
         self._run("memcpy-scatter")
 
-    def test_mhc_pre_splitk(self):
-        """mhc_pre split-k 拆解，服务真实形状（3 token / split_k=32）。"""
-        self._run("splitk")
-
-    def test_mhc_pre_tf32(self):
-        """mhc_pre 的 tf32_hc_prenorm_gemm 拆解。"""
-        self._run("tf32")
 
 
 if __name__ == "__main__":

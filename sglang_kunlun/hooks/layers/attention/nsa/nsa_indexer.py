@@ -26,14 +26,20 @@ math is expressed via ``torch.compile(dynamic=True)`` to mirror mimo.
 
 from __future__ import annotations
 
+import importlib
 import logging
-from typing import TYPE_CHECKING, List, Optional, Tuple
+import os
+from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 if TYPE_CHECKING:
@@ -42,73 +48,228 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _get_k_bf16_compat(module, x, positions):
-    """K-only 路径，兼容 fork 的两代实现。
+def _topk_all_visible(metadata, topk: int, device) -> torch.Tensor:
+    """``kv_len <= topk`` 的免 logits 快路径：返回每个 query token 的全部可见 slot。
 
-    fork 的 ``Indexer._get_k_bf16`` 只支持非融合（``self.wk``），而 EB5 的
-    ``EB5FullMLAIndexer`` 走 ``use_dsa_indexer_fusion=True``（只有
-    ``wk_weights_proj``，没有 ``wk``），直接调基类会
-    ``AttributeError: 'EB5FullMLAIndexer' object has no attribute 'wk'``。
-    这里按基类 ``_get_q_k_bf16`` 的融合分支重写一份 K-only 版本。
+    上游用 ``metadata.topk_transform(zeros, topk)`` 走 sgl-kernel 的
+    ``fast_topk_transform_fused``（昆仑 stub 未实现，2026-10-20 实测抛
+    ``NotImplementedError``）。该函数的语义是"先 topk 再经 page_table_1 映射成
+    slot id"，而在长度不超过 topk 时 topk 就是全部位置，所以直接用 torch 拼：
+    ``slot = page_table_1[batch_of_token, :visible]``，右侧补 -1。
+
+    形状/语义与 ``_get_topk_ragged`` 一致：``dsa_seqlens_expanded`` 是 per-token
+    可见 KV 长度，``page_table_1`` 在常规 prefill 下是 per-request，需要按
+    extend 长度展开行。
     """
-    if getattr(module, "use_dsa_indexer_fusion", False):
-        key, _ = module._fused_k_weights(x)
-    else:
-        key, _ = module.wk(x)
-    key = module.k_norm(key)
-    k_rope, _ = torch.split(
-        key,
-        [module.rope_head_dim, module.head_dim - module.rope_head_dim],
-        dim=-1,
+    page_table_1 = metadata.get_page_table_1()
+    visible = metadata.get_seqlens_expanded().to(torch.int64)
+    rows = page_table_1
+    if page_table_1.shape[0] != visible.shape[0]:
+        extend = torch.tensor(
+            metadata.get_dsa_extend_len_cpu(), device=device, dtype=torch.int64
+        )
+        batch_idx = torch.repeat_interleave(
+            torch.arange(extend.numel(), device=device), extend
+        )
+        rows = page_table_1.index_select(0, batch_idx)
+
+    width = min(int(topk), rows.shape[1])
+    cols = torch.arange(width, device=device, dtype=torch.int64)
+    out = torch.where(
+        cols.unsqueeze(0) < visible.unsqueeze(1),
+        rows[:, :width].to(torch.int32),
+        torch.full((), -1, dtype=torch.int32, device=device),
     )
-    # rotary 可能原地改两个输入，dummy_q 不能与 k_rope 共享内存。
-    dummy_q_rope = torch.empty_like(k_rope)
-    _, k_rope = module.rotary_emb(positions, dummy_q_rope, k_rope)
-    module._update_rope_guarded(key[..., : module.rope_head_dim], k_rope)
-    return module._maybe_rotate(key)
+    if width < int(topk):
+        out = torch.cat(
+            [out, out.new_full((out.shape[0], int(topk) - width), -1)], dim=1
+        )
+    _indexer_trace(f"topk-all-visible:done shape={tuple(out.shape)}")
+    return out
+
+
+def _indexer_kv_pool():
+    """indexer 侧真正要写的 KV pool（EB5 是 full latent 子池）。
+
+    fork 的 EB5 运行时（``internal/models/eb5/runtime_patch.py`` →
+    ``register_dsa_full_pool_patch``）只把
+    ``sglang.srt.layers.attention.dsa.dsa_indexer.get_token_to_kv_pool`` 这个
+    **模块属性**换成"若外层池有 ``full_kv_pool`` 就返回它"的包装。本文件用
+    ``from ... import`` 绑定的是原函数，直接调用会拿到外层 256 页的 HCA 池，
+    ``set_index_k_scale_buffer`` 按 ``layer_mapping`` 找到 ratio=128 的 HCA 层，
+    直接断言 ``No indexer pool for compression ratio 128``（2026-10-20 实测）。
+
+    所以这里优先走被 patch 过的模块属性，再按同一语义兜底解包
+    ``full_kv_pool``（DSV4 的池没有该属性，行为不变）。
+    """
+    import sglang.srt.layers.attention.dsa.dsa_indexer as _dsa_indexer
+
+    fn = getattr(_dsa_indexer, "get_token_to_kv_pool", get_token_to_kv_pool)
+    pool = fn()
+    full_pool = getattr(pool, "full_kv_pool", None)
+    return full_pool if full_pool is not None else pool
+
+
+def _install_forward_mode_compat() -> None:
+    """fork 把 ``ForwardMode.is_draft_extend`` 删了，只留 ``is_draft_extend_v2``。
+
+    插件（本文件与 ``_nsa_backend_impl.py``）有十几处旧调用
+    ``forward_mode.is_draft_extend(include_v2=True)``，2026-10-20 21:56 实测
+    ``AttributeError: 'ForwardMode' object has no attribute 'is_draft_extend'``。
+    在类上补一个兼容方法，一处修复所有调用点。
+    """
+    try:
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        if hasattr(ForwardMode, "is_draft_extend"):
+            return
+        v2 = getattr(ForwardMode, "is_draft_extend_v2", None)
+        if v2 is None:
+            return
+
+        def is_draft_extend(self, include_v2: bool = True):
+            return bool(v2(self))
+
+        setattr(ForwardMode, "is_draft_extend", is_draft_extend)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_install_forward_mode_compat()
+
+
+def _seqlens_cpu(metadata, forward_batch, *, expanded: bool):
+    """host 侧 seq_lens（fork 的 ``DSAIndexerMetadata`` 没有 ``*_cpu`` 访问器）。
+
+    2026-10-20 22:02 实测：``AttributeError: 'DSAIndexerMetadata' object has no
+    attribute 'get_seqlens_int32_cpu'``（decode 第一步）。
+
+    decode 是每层都会走的热路径：优先用 ``ForwardBatch.seq_lens_cpu``（host 侧
+    现成副本，零 D2H），只有 target_verify / draft_extend 这种 expand 过的形状
+    才退回一次 ``.cpu()``（EAGLE 关闭时不会走到）。
+    """
+    name = "get_seqlens_expanded_cpu" if expanded else "get_seqlens_int32_cpu"
+    fn = getattr(metadata, name, None)
+    if fn is not None:
+        return fn()
+    if not expanded:
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None:
+            # vendor dsa_paged_mqa_logits 要求 host 侧 context_lens 是 int32；
+            # ForwardBatch.seq_lens_cpu 是 int64（22:28 实测 ValueError）。
+            return seq_lens_cpu.to(torch.int32)
+    src = metadata.get_seqlens_expanded() if expanded else metadata.get_seqlens_int32()
+    return src.detach().to("cpu", torch.int32)
+
+
+def _extend_lens_cpu(metadata):
+    """本 batch 每请求的 query 长度列表（fork 上叫 ``get_dsa_extend_len_cpu``）。
+
+    旧 API 名 ``get_nsa_extend_len_cpu`` 已被 fork 删除；decode 时 fork 的
+    ``dsa_extend_seq_lens_list`` 是 ``[1] * bs``，与旧语义一致。
+    """
+    fn = getattr(metadata, "get_nsa_extend_len_cpu", None)
+    if fn is None:
+        fn = metadata.get_dsa_extend_len_cpu
+    return fn()
+
+
+def _indexer_trace(tag: str) -> None:
+    """``EB5_INDEXER_TRACE=1`` 时打点（只在需要逐层定位时开，正常服务零开销）。"""
+    if os.environ.get("EB5_INDEXER_TRACE", "0") == "1":
+        print(f"[eb5-indexer-trace] {tag}", flush=True)
 
 
 def _enable_prefill_cp(module) -> bool:
-    """fork 把 ``nsa_enable_prefill_cp`` 改名为 ``dsa_enable_prefill_cp``；
-    两代名字都兼容，避免插件在旧/新 fork 上二选一。"""
+    """fork 把 ``nsa_enable_prefill_cp`` 改名为 ``dsa_enable_prefill_cp``。"""
     for name in ("dsa_enable_prefill_cp", "nsa_enable_prefill_cp"):
         if hasattr(module, name):
             return bool(getattr(module, name))
     return False
 
 
-def _get_k_bf16_compat(indexer, x, positions):
-    """K-only 路径，兼容 indexer 的融合/非融合两种形态。
+def _linear_w(module, x: torch.Tensor) -> torch.Tensor:
+    """直接拿模块自己的权重做 ``F.linear``。
 
-    fork 的 ``Indexer._get_k_bf16`` 只处理非融合分支（直接 ``self.wk``）。EB5 的
-    ``EB5FullMLAIndexer`` 走融合分支（``use_dsa_indexer_fusion=True``，只有
-    ``wk_weights_proj``，没有 ``wk``），直接调用会 ``AttributeError: ... has no
-    attribute 'wk'``（2026-10-20 20:31 实测，decode 的 ``kv_len <= index_topk`` 快路径）。
+    EB5 的 indexer 是 **fused** 形态（``use_dsa_indexer_fusion=True``）：只有
+    ``wk_weights_proj``，没有 ``wk`` / ``weights_proj``。而 fork 基类的
+    ``_get_k_bf16`` 只支持非 fused 分支（直接 ``self.wk``），插件原来又硬用了
+    ``self.wk`` → ``AttributeError: 'EB5FullMLAIndexer' object has no attribute 'wk'``。
+    走 ``module.weight`` 可以同时绕开 ``wk`` / ``_fused_k_weights`` / ``weights_proj``
+    这三套 API 差异。
     """
-    if getattr(indexer, "use_dsa_indexer_fusion", False):
-        key, _ = indexer._fused_k_weights(x)
+    w = getattr(module, "weight", None)
+    if w is None:  # 兜底：没有 weight 的模块（理论上不会走到）
+        out = module(x)
+        return out[0] if isinstance(out, tuple) else out
+    return F.linear(x, w)
+
+
+def _k_weights(self):
+    """返回 ``(k_weight, gate_weight_or_None)``，同时覆盖 fused / 非 fused。"""
+    if bool(getattr(self, "use_dsa_indexer_fusion", False)):
+        w = self.wk_weights_proj.weight  # [head_dim + n_heads, hidden]
+        return w[: self.head_dim], w[self.head_dim :]
+    return self.wk.weight, None
+
+
+def _qk_from_weights(self, q_lora, x, positions):
+    """纯 torch 的 q/k 投影 + k_norm + rotary + （非 fused 的）Hadamard 旋转。"""
+    fusion = bool(getattr(self, "use_dsa_indexer_fusion", False))
+    q = _linear_w(self.wq_b, q_lora).view(-1, self.n_heads, self.head_dim)
+    kw, gate_w = _k_weights(self)
+    if fusion:
+        kw_out = F.linear(x, self.wk_weights_proj.weight)
+        key = kw_out[..., : self.head_dim]
+        gate_w = kw_out[..., self.head_dim :]
     else:
-        key, _ = indexer.wk(x)
-    key = indexer.k_norm(key)
-    k_rope, _ = torch.split(
-        key,
-        [indexer.rope_head_dim, indexer.head_dim - indexer.rope_head_dim],
-        dim=-1,
-    )
-    # rotary 可能原地改两个输入，K-only 路径不能拿 k_rope 自己当 dummy query。
-    dummy_q_rope = torch.empty_like(k_rope)
-    _, k_rope = indexer.rotary_emb(positions, dummy_q_rope, k_rope)
-    indexer._update_rope_guarded(key[..., : indexer.rope_head_dim], k_rope)
-    return indexer._maybe_rotate(key)
+        key = F.linear(x, kw)
+    key = self.k_norm(key)
+
+    rope = self.rope_head_dim
+    q_rope = q[..., :rope].contiguous()
+    k_rope = key[..., :rope].contiguous()
+    q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+    q = torch.cat([q_rope, q[..., rope:]], dim=-1)
+    key = torch.cat([k_rope, key[..., rope:]], dim=-1)
+    if not fusion:
+        # fused 路径在训练时就去掉了 Hadamard（基类 ``_maybe_rotate`` 的语义）。
+        q = _rotate_activation(q)
+        key = _rotate_activation(key)
+    _indexer_trace(f"qk:done n={x.shape[0]} fusion={fusion} gate={'yes' if gate_w is not None else 'no'}")
+    return q, key, gate_w
+
+
+def _k_from_weights(self, x, positions):
+    """K-only（``kv_len <= index_topk`` 的短上下文快路径）。"""
+    fusion = bool(getattr(self, "use_dsa_indexer_fusion", False))
+    if fusion:
+        kw_out = F.linear(x, self.wk_weights_proj.weight)
+        key = kw_out[..., : self.head_dim]
+    else:
+        key = F.linear(x, self.wk.weight)
+    key = self.k_norm(key)
+    rope = self.rope_head_dim
+    k_rope = key[..., :rope].contiguous()
+    dummy = torch.empty_like(k_rope)
+    _, k_rope = self.rotary_emb(positions, dummy, k_rope)
+    key = torch.cat([k_rope, key[..., rope:]], dim=-1)
+    if not fusion:
+        key = _rotate_activation(key)
+    _indexer_trace(f"k-only:done n={x.shape[0]} fusion={fusion}")
+    return key
+
+
+def _get_k_bf16_compat(module, x, positions):
+    """兼容层：调用上面的纯 torch K-only 实现。"""
+    return _k_from_weights(module, x, positions)
 
 
 def _k_proj(self, x: torch.Tensor) -> torch.Tensor:
-    """Index-K 投影：fused indexer 没有 ``self.wk``（EB5 就是这种）。"""
-    if getattr(self, "use_dsa_indexer_fusion", False) and hasattr(self, "_fused_k_weights"):
-        key, _ = self._fused_k_weights(x)
-        return key
-    key = _k_proj(self, x)
-    return key
+    """融合 / 非融合都能用的 K 投影（非 fused 走 ``self.wk``）。"""
+    if bool(getattr(self, "use_dsa_indexer_fusion", False)):
+        return F.linear(x, self.wk_weights_proj.weight)[..., : self.head_dim]
+    return F.linear(x, self.wk.weight)
 
 
 def _maybe_rotate(self, t: torch.Tensor) -> torch.Tensor:
@@ -117,17 +278,176 @@ def _maybe_rotate(self, t: torch.Tensor) -> torch.Tensor:
     return fn(t) if fn is not None else _rotate_activation(t)
 
 
-def _get_k_bf16_compat(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-    """``Indexer._get_k_bf16`` 的 fusion-aware 版本（基类只支持 non-fusion）。"""
-    key = _k_proj(self, x)
-    key = self.k_norm(key)
-    k_rope, _ = torch.split(
-        key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+_KERNEL_BINDINGS_FIXED = False
+
+
+def _fix_kernel_bindings_once() -> None:
+    """把晚导入的模块里的 Triton kernel 统一重装成 ``KernelLauncher``。
+
+    根因：``kernel_ops`` 的安装/修复 pass 发生在这些模块被 import 之前。之后
+    sglang 在第一次 prefill / decode 时才 import
+    ``mem_cache.allocator.paged``、``attention.dsa.transform_index`` 等，
+    这些模块里的 kernel 仍是原始函数，``kernel[grid](...)`` 直接抛
+    ``TypeError: 'function' object is not subscriptable``（本次先后命中
+    ``transform_index_page_table_prefill_kernel`` 与 ``alloc_decode_kernel``）。
+
+    做法：在第一次 indexer 调用（prefill）时先把常见晚加载模块 import 进来，
+    再执行一次 ``reapply_all()`` + ``repair_imported_bindings()``。只做一次。
+    """
+    global _KERNEL_BINDINGS_FIXED
+    if _KERNEL_BINDINGS_FIXED:
+        return
+    _KERNEL_BINDINGS_FIXED = True
+    for mod in (
+        "sglang.kernels.ops.attention.dsa.transform_index",
+        "sglang.srt.mem_cache.allocator.paged",
+        "sglang.srt.mem_cache.allocator.swa",
+        "sglang.srt.mem_cache.allocator.common",
+        "sglang.srt.mem_cache.utils",
+    ):
+        try:
+            importlib.import_module(mod)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        from sglang_kunlun.kernels.kernel_ops import (
+            reapply_all,
+            repair_imported_bindings,
+        )
+
+        reapply_all()
+        n = repair_imported_bindings()
+        _indexer_trace(f"kernel-bindings:reapplied (repaired={n})")
+    except Exception as exc:  # noqa: BLE001
+        _indexer_trace(f"kernel-bindings:skip ({exc})")
+
+
+def _indexer_torch_ref(
+    self,
+    x: torch.Tensor,
+    q_lora: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    layer_id: int,
+    return_indices: bool = True,
+):
+    """indexer 的**纯 torch 散算子**实现（默认启用）。
+
+    与 mHC 的 ``mhc_pre_torch_ref`` 同一思路：只把"投影 / norm / rotary / 门控"
+    用 torch 表达，logits 与 topk 复用插件里已经在昆仑上跑通的
+    ``_get_topk_paged`` / ``_get_topk_ragged``（它们内部走 paged MQA logits 与
+    ``metadata.topk_transform``），**不重新实现一套 paged logits**。
+
+    这样 EB5（fused indexer）和 DSV3/DSV4（非 fused）走同一条 torch 通路，
+    不再依赖 ``wk`` / ``_fused_k_weights`` / ``weights_proj`` 的 API 形态。
+    ``EB5_INDEXER_TORCH_REF=0`` 可退回原插件实现做对照。
+    """
+    import kunlun_ops
+
+    _fix_kernel_bindings_once()
+    x_meta = x[0] if isinstance(x, tuple) else x
+    metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+    if metadata is None:
+        return None
+
+    skip_logits = False
+    if (
+        forward_batch.forward_mode.is_extend_without_speculative()
+        and forward_batch.seq_lens_cpu is not None
+    ):
+        skip_logits = int(forward_batch.seq_lens_cpu.max().item()) <= self.index_topk
+    _indexer_trace(f"enter layer={layer_id} skip_logits={skip_logits}")
+
+    if skip_logits and not _enable_prefill_cp(self):
+        key = _k_from_weights(self, x_meta, positions)
+        key_shape = key.shape
+        key2 = key.view(-1, self.block_size)
+        k_fp8 = torch.empty(key2.shape, device=key2.device, dtype=torch.int8)
+        k_scale = torch.empty([key2.shape[0], 1], device=key2.device, dtype=torch.float32)
+        kunlun_ops.quant2d(key2, k_fp8, k_scale, force_sdnn=True)
+        k_fp8 = k_fp8.view(key_shape)
+        k_scale = k_scale.view(key_shape[0], -1)
+        if not forward_batch.out_cache_loc.is_contiguous():
+            forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
+        _indexer_kv_pool().set_index_k_scale_buffer(
+            layer_id=layer_id,
+            loc=forward_batch.out_cache_loc,
+            index_k=k_fp8,
+            index_k_scale=k_scale,
+        )
+        if not return_indices:
+            return None
+        return _topk_all_visible(metadata, self.index_topk, x_meta.device)
+
+    query, key, gate_w = _qk_from_weights(self, q_lora, x_meta, positions)
+    query_shape, key_shape = query.shape, key.shape
+    query = query.view(-1, self.block_size)
+    key = key.view(-1, self.block_size)
+    q_fp8 = torch.empty(query.shape, device=query.device, dtype=torch.int8)
+    q_scale = torch.empty([query.shape[0], 1], device=query.device, dtype=torch.float32)
+    k_fp8 = torch.empty(key.shape, device=key.device, dtype=torch.int8)
+    k_scale = torch.empty([key.shape[0], 1], device=key.device, dtype=torch.float32)
+    kunlun_ops.quant2d(query, q_fp8, q_scale, force_sdnn=True)
+    q_fp8 = q_fp8.view(query_shape)
+    q_scale = q_scale.view(query_shape[0], -1)
+    kunlun_ops.quant2d(key, k_fp8, k_scale, force_sdnn=True)
+    k_fp8 = k_fp8.view(key_shape)
+    k_scale = k_scale.view(key_shape[0], -1)
+    _indexer_trace("quant:done")
+
+    if not forward_batch.out_cache_loc.is_contiguous():
+        forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
+    _indexer_kv_pool().set_index_k_scale_buffer(
+        layer_id=layer_id,
+        loc=forward_batch.out_cache_loc,
+        index_k=k_fp8,
+        index_k_scale=k_scale,
     )
-    dummy_q_rope = torch.empty_like(k_rope)
-    _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
-    self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
-    return _maybe_rotate(self, key)
+
+    if gate_w is not None:
+        # fused 路径：head-gate 与 K 同一次投影出来（等价于基类 _get_logits_head_gate）
+        weights = gate_w.float() * self.n_heads**-0.5
+        weights = weights * q_scale * self.softmax_scale
+    else:
+        x_for_gate = x_meta
+        if isinstance(x, tuple) and len(x) in (2, 3):
+            x_q, x_s = x[0], x[1]
+            if x_s is not None and x_q.dim() == 2 and x_s.dim() == 2 and x_q.shape[0] == x_s.shape[0]:
+                m, n = x_q.shape
+                ng = x_s.shape[1]
+                if ng > 0 and n % ng == 0:
+                    group = n // ng
+                    x_for_gate = (
+                        x_q.to(torch.float32).view(m, ng, group)
+                        .mul_(x_s.to(torch.float32).unsqueeze(-1))
+                        .view(m, n).to(torch.bfloat16)
+                    )
+                else:
+                    x_for_gate = x_q.to(torch.bfloat16)
+            else:
+                x_for_gate = x_q.to(torch.bfloat16)
+        weights = self._get_logits_head_gate(x_for_gate, q_scale)
+    if q_fp8.dtype is torch.int8:
+        weights /= 127
+
+    assert forward_batch.seq_lens_cpu is not None
+    if len(forward_batch.seq_lens_cpu) == 0:
+        return torch.full(
+            (x_meta.shape[0], self.index_topk), -1, dtype=torch.int, device=x_meta.device
+        )
+
+    if (
+        forward_batch.forward_mode.is_decode_or_idle()
+        or forward_batch.forward_mode.is_target_verify()
+        or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+    ):
+        out = self._get_topk_paged(forward_batch, layer_id, q_fp8, weights, metadata)
+        _indexer_trace(f"topk-paged:done shape={tuple(out.shape)}")
+        return out
+
+    out = self._get_topk_ragged(forward_batch, layer_id, q_fp8, weights, metadata)
+    _indexer_trace(f"topk-ragged:done shape={tuple(out.shape)}")
+    return out
 
 
 def _shape_meta(tensor):
@@ -262,13 +582,13 @@ def _get_topk_paged(
     import kunlun_ops
 
     if TYPE_CHECKING:
-        assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+        assert isinstance(_indexer_kv_pool(), NSATokenToKVPool)
 
-    page_size = forward_batch.token_to_kv_pool.page_size
+    page_size = _indexer_kv_pool().page_size
     assert page_size == 64, "only support page size 64"
     block_tables = metadata.get_page_table_64()
     max_seq_len = block_tables.shape[1] * page_size
-    kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+    kv_cache_fp8 = _indexer_kv_pool().get_index_k_with_scale_buffer(
         layer_id=layer_id
     )
     block_kv = 64
@@ -279,10 +599,10 @@ def _get_topk_paged(
         or forward_batch.forward_mode.is_draft_extend(include_v2=True)
     ):
         seqlens_32 = metadata.get_seqlens_expanded()
-        seqlens_32_cpu = metadata.get_seqlens_expanded_cpu()
+        seqlens_32_cpu = _seqlens_cpu(metadata, forward_batch, expanded=True)
     else:
         seqlens_32 = metadata.get_seqlens_int32()
-        seqlens_32_cpu = metadata.get_seqlens_int32_cpu()
+        seqlens_32_cpu = _seqlens_cpu(metadata, forward_batch, expanded=False)
 
     assert len(q_fp8.shape) == 3, f"q_fp8.shape: {q_fp8.shape}"
     q_fp8 = q_fp8.unsqueeze(1)
@@ -290,16 +610,20 @@ def _get_topk_paged(
     if len(weights.shape) == 2:
         weights = weights.unsqueeze(1)
 
-    q_offset = sum(metadata.get_nsa_extend_len_cpu())
+    q_offset = sum(_extend_lens_cpu(metadata))
 
-    head_dim = forward_batch.token_to_kv_pool.index_head_dim
+    head_dim = _indexer_kv_pool().index_head_dim
     k_fp8 = (
         kv_cache_fp8[:, : page_size * head_dim]
         .view(kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim)
         .to(torch.int8)
     )
     k_scale = torch.ops.xspeedgate_ops.gather_paged_scale(
-        kv_cache=kv_cache_fp8,
+        # indexer 的 k 缓存按 fp8 存，但 buffer 的 dtype 是 uint8(Byte)；vendor 算子
+        # 只收 Char(int8)。2026-10-20 22:24 实测：
+        # ``RuntimeError: dtype of kv_cache (Byte) must be one of [Char]``。
+        # ``view`` 同 itemsize，零拷贝。
+        kv_cache=kv_cache_fp8.view(torch.int8),
         block_tables=block_tables,
         page_size=page_size,
         head_dim=head_dim,
@@ -329,6 +653,8 @@ def _get_topk_paged(
     )
 
     logits = logits.reshape(-1, max_seq_len)
+    # ``fast_topk_transform_fused`` 由 ``sgl_kernel_kunlun/top_k.py`` 的 torch 版
+    # 实现在 stub 层兜住（pipeline10 已端到端验证，见 doc §11.13），调用点保持上游写法。
     topk_result = metadata.topk_transform(logits, self.index_topk)
     if q_offset < q_fp8.shape[0]:
         pad_len = q_fp8.shape[0] - q_offset
@@ -359,10 +685,10 @@ def _get_topk_ragged(
     import kunlun_ops
 
     if TYPE_CHECKING:
-        assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+        assert isinstance(_indexer_kv_pool(), NSATokenToKVPool)
     assert forward_batch.forward_mode.is_extend_without_speculative()
 
-    page_size = forward_batch.token_to_kv_pool.page_size
+    page_size = _indexer_kv_pool().page_size
     assert page_size == 64, "only support page size 64"
     if len(weights.shape) == 3:
         weights = weights.squeeze(-1)
@@ -389,10 +715,10 @@ def _get_topk_ragged(
     for i in range(batch_size):
         seq_len = indexer_seq_lens_cpu[i].item()
         assert isinstance(seq_len, int)
-        k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
+        k_fp8 = _indexer_kv_pool().get_index_k_continuous(
             layer_id, seq_len, block_tables[i]
         )
-        k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
+        k_scale = _indexer_kv_pool().get_index_k_scale_continuous(
             layer_id, seq_len, block_tables[i]
         )
         k_fp8_list.append(k_fp8)
@@ -414,7 +740,13 @@ def _get_topk_ragged(
     need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
 
     context_q_lens_xpu = metadata.get_cu_seqlens_q()
-    context_q_lens_cpu = metadata.get_cu_seqlens_q_cpu()
+    # fork 的 ``DSAIndexerMetadata`` 没有 ``get_cu_seqlens_q_cpu``（只有 xpu 版）。
+    _cu_cpu_fn = getattr(metadata, "get_cu_seqlens_q_cpu", None)
+    context_q_lens_cpu = (
+        _cu_cpu_fn()
+        if _cu_cpu_fn is not None
+        else metadata.get_cu_seqlens_q().detach().to("cpu", torch.int32)
+    )
     context_k_lens_cpu, context_k_lens_xpu = _make_cu_seqlens_from_lens(
         indexer_seq_lens_cpu, device
     )
@@ -533,180 +865,7 @@ def _get_topk_ragged(
         del logits_chunk
         topk_result[start:end] = raw_topk_chunk
     del ks, q_fp8, k_fp8, k_scale
-    del q_interval_cpu, q_interval_xpu, k_interval_cpu, k_interval_xpu
-    return topk_result
-
-
-@plugin_hook(
-    target="sglang.srt.layers.attention.dsa.dsa_indexer.Indexer._get_topk_ragged_with_cp",
-    type=HookType.REPLACE,
-)
-def _get_topk_ragged_with_cp(
-    self,
-    forward_batch: ForwardBatch,
-    layer_id: int,
-    q_fp8: torch.Tensor,
-    weights: torch.Tensor,
-    metadata,
-    kv_len: int,
-    actual_seq_q: int,
-    cp_index: List[Tuple[int, int, int]] = None,
-) -> torch.Tensor:
-    """_get_topk_ragged_with_cp Kunlun replacement."""
-    import kunlun_ops
-
-    if TYPE_CHECKING:
-        assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
-    page_size = forward_batch.token_to_kv_pool.page_size
-    assert page_size == 64, "only support page size 64"
-    if len(weights.shape) == 3:
-        weights = weights.squeeze(-1)
-    k_fp8_list = []
-    k_scale_list = []
-    ks_list = []
-    ke_offset_list = []
-    offset = 0
-    actual_seq_q_list = []
-    batch_idx_list = []
-
-    block_tables = metadata.get_page_table_64()
-    assert (
-        forward_batch.seq_lens_cpu is not None
-        and forward_batch.extend_seq_lens_cpu is not None
-    )
-    if cp_index is not None:
-        for batch_idx, start_seq_position, end_seq_position in cp_index:
-            pre_chunk_offset = (
-                forward_batch.seq_lens_cpu[batch_idx].item()
-                - forward_batch.extend_seq_lens_cpu[batch_idx]
-            )
-            start_seq_position += pre_chunk_offset
-            end_seq_position += pre_chunk_offset
-            if offset == 0 and batch_idx != 0:
-                offset += forward_batch.extend_seq_lens_cpu[batch_idx - 1]
-            k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
-                layer_id, end_seq_position, block_tables[batch_idx]
-            )
-            k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
-                layer_id, end_seq_position, block_tables[batch_idx]
-            )
-            extend_seq_len = end_seq_position - start_seq_position
-            ks = torch.full(
-                (extend_seq_len,), offset, dtype=torch.int32, device="cuda"
-            )
-            k_fp8_list.append(k_fp8)
-            k_scale_list.append(k_scale)
-            ks_list.append(ks)
-            ke_offset = torch.arange(
-                start_seq_position + 1,
-                end_seq_position + 1,
-                dtype=torch.int32,
-                device="cuda",
-            )
-            ke_offset_list.append(ke_offset)
-            actual_seq_q_t = torch.tensor(
-                [extend_seq_len], dtype=torch.int32, device="cuda"
-            )
-            actual_seq_q_list.append(actual_seq_q_t)
-            batch_idx_list.append(batch_idx)
-
-        k_fp8 = torch.cat(k_fp8_list, dim=0)
-        k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
-        k_scale /= 127
-        ks = torch.cat(ks_list, dim=0)
-        ke_offset = torch.cat(ke_offset_list, dim=0)
-        actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
-
-        context_q_lens_xpu = torch.tensor(
-            [0, q_fp8.shape[0]], dtype=torch.int32, device="cuda"
-        )
-        context_q_lens_cpu = torch.tensor(
-            [0, q_fp8.shape[0]], dtype=torch.int32, device="cpu"
-        )
-        context_k_lens_xpu = torch.tensor(
-            [0, k_fp8.shape[0]], dtype=torch.int32, device="cuda"
-        )
-        context_k_lens_cpu = torch.tensor(
-            [0, k_fp8.shape[0]], dtype=torch.int32, device="cpu"
-        )
-        logits = torch.zeros(
-            (q_fp8.shape[0], k_fp8.shape[0]), dtype=torch.float32, device=q_fp8.device
-        )
-        kunlun_ops.I8_mqa_logits(
-            q=q_fp8,
-            fused_kv_cache=(k_fp8.contiguous(), k_scale.contiguous()),
-            weights=weights,
-            context_q_lens=(context_q_lens_cpu, context_q_lens_xpu),
-            context_k_lens=(context_k_lens_cpu, context_k_lens_xpu),
-            logits=logits,
-            clean_logits=True,
-            use_xfa_boost=False,
-        )
-        topk_result = metadata.topk_transform(
-            logits,
-            self.index_topk,
-            ks=ks,
-            cu_seqlens_q=actual_seq_q,
-            ke_offset=ke_offset,
-            batch_idx_list=batch_idx_list,
-        )
-    else:
-        kv_len = (
-            forward_batch.seq_lens_cpu[0].item()
-            - forward_batch.extend_seq_lens_cpu[0]
-            + kv_len
-        )
-        k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
-            layer_id, kv_len, block_tables[0]
-        )
-        k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
-            layer_id, kv_len, block_tables[0]
-        )
-        k_scale = k_scale.view(torch.float32).squeeze(-1)
-        ks = torch.full((actual_seq_q,), offset, dtype=torch.int32, device="cuda")
-        ke_offset = torch.arange(
-            (kv_len - actual_seq_q) + 1,
-            kv_len + 1,
-            dtype=torch.int32,
-            device="cuda",
-        )
-        context_q_lens_xpu = torch.tensor(
-            [0, q_fp8.shape[0]], dtype=torch.int32, device="cuda"
-        )
-        context_q_lens_cpu = torch.tensor(
-            [0, q_fp8.shape[0]], dtype=torch.int32, device="cpu"
-        )
-        context_k_lens_xpu = torch.tensor(
-            [0, k_fp8.shape[0]], dtype=torch.int32, device="cuda"
-        )
-        context_k_lens_cpu = torch.tensor(
-            [0, k_fp8.shape[0]], dtype=torch.int32, device="cpu"
-        )
-        logits = torch.zeros(
-            (q_fp8.shape[0], k_fp8.shape[0]), dtype=torch.float32, device=q_fp8.device
-        )
-        kunlun_ops.I8_mqa_logits(
-            q=q_fp8,
-            fused_kv_cache=(k_fp8.contiguous(), k_scale.contiguous()),
-            weights=weights,
-            context_q_lens=(context_q_lens_cpu, context_q_lens_xpu),
-            context_k_lens=(context_k_lens_cpu, context_k_lens_xpu),
-            logits=logits,
-            clean_logits=True,
-            use_xfa_boost=False,
-        )
-        # Synchronous H2D: see _make_cu_seqlens_from_lens for why non_blocking
-        # copies of temporary host tensors are unsafe here.
-        actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
-            device="cuda"
-        )
-        topk_result = metadata.topk_transform(
-            logits,
-            self.index_topk,
-            ks=ks,
-            cu_seqlens_q=actual_seq_q,
-            ke_offset=ke_offset,
-        )
+    del q_interval_cpu, q_interval_xpu
     return topk_result
 
 
@@ -816,7 +975,7 @@ def _forward_cuda_k_only(
     if not forward_batch.out_cache_loc.is_contiguous():
         forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
 
-    forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+    _indexer_kv_pool().set_index_k_scale_buffer(
         layer_id=layer_id,
         loc=forward_batch.out_cache_loc,
         index_k=k_fp8,
@@ -826,14 +985,7 @@ def _forward_cuda_k_only(
     if not return_indices:
         return None
 
-    seq_lens_expanded = metadata.get_seqlens_expanded()
-    dummy_logits = torch.zeros(
-        seq_lens_expanded.shape[0],
-        self.index_topk,
-        dtype=torch.float32,
-        device=x_meta.device,
-    )
-    return metadata.topk_transform(dummy_logits, self.index_topk)
+    return _topk_all_visible(metadata, self.index_topk, x_meta.device)
 
 
 @plugin_hook(
@@ -849,16 +1001,24 @@ def forward_cuda(
     layer_id: int,
     return_indices: bool = True,
 ) -> Optional[torch.Tensor]:
-    """forward_cuda Kunlun replacement."""
+    """forward_cuda Kunlun replacement.
+
+    ``EB5_INDEXER_TORCH_REF=1``（默认）走纯 torch 散算子实现；EB5 的 fused indexer
+    与 DSV4 的 non-fused indexer 共用一条通路，不再逐点适配 ``wk``。
+    """
+    if os.environ.get("EB5_INDEXER_TORCH_REF", "1") == "1":
+        return _indexer_torch_ref(
+            self, x, q_lora, positions, forward_batch, layer_id, return_indices
+        )
     import kunlun_ops
     from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
     if TYPE_CHECKING:
-        assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+        assert isinstance(_indexer_kv_pool(), NSATokenToKVPool)
     x_meta = x[0] if isinstance(x, tuple) else x
-    metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
     enable_dual_stream = False
 
+    metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
     if metadata is None:
         return None
 
@@ -946,7 +1106,7 @@ def forward_cuda(
 
     if not forward_batch.out_cache_loc.is_contiguous():
         forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-    forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+    _indexer_kv_pool().set_index_k_scale_buffer(
         layer_id=layer_id,
         loc=forward_batch.out_cache_loc,
         index_k=k_fp8,
@@ -971,41 +1131,26 @@ def forward_cuda(
     ):
         return self._get_topk_paged(forward_batch, layer_id, q_fp8, weights, metadata)
 
-    from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
+    # CP-v1 "in-seq-split" went away with the fork's CP V1 deprecation, together
+    # with ``Indexer._get_topk_ragged_with_cp`` (and ``ForwardBatch.nsa_cp_metadata``
+    # itself). EB5 runs with prefill CP disabled, so this branch is unreachable;
+    # keep an explicit guard so that turning CP on fails loudly at the first
+    # forward instead of with an AttributeError from a missing method/attribute.
+    from sglang.srt.layers.attention.dsa import utils as _dsa_utils
 
+    _cp_metadata = getattr(forward_batch, "nsa_cp_metadata", None)
+    _is_in_seq_split = getattr(_dsa_utils, "is_dsa_prefill_cp_in_seq_split", None)
     if (
-        forward_batch.nsa_cp_metadata is not None
-        and is_nsa_prefill_cp_in_seq_split()
+        _cp_metadata is not None
+        and _is_in_seq_split is not None
+        and _is_in_seq_split()
     ):
-        kv_len_prev = forward_batch.nsa_cp_metadata.kv_len_prev
-        kv_len_next = forward_batch.nsa_cp_metadata.kv_len_next
-        actual_seq_q_prev = forward_batch.nsa_cp_metadata.actual_seq_q_prev
-        actual_seq_q_next = forward_batch.nsa_cp_metadata.actual_seq_q_next
-        q_fp8_prev, q_fp8_next = torch.split(
-            q_fp8, (q_fp8.shape[0] + 1) // 2, dim=0
+        raise NotImplementedError(
+            "NSA in-seq-split prefill CP is not supported by the Kunlun plugin: "
+            "the fork removed the Indexer CP top-k helper and "
+            "dsa.utils.is_dsa_prefill_cp_in_seq_split. Run with prefill CP "
+            "disabled (attn_cp_size=1) or use the round-robin/interleave strategy."
         )
-        weights_prev, weights_next = torch.split(
-            weights, (weights.shape[0] + 1) // 2, dim=0
-        )
-        topk_result_prev = self._get_topk_ragged_with_cp(
-            forward_batch,
-            layer_id,
-            q_fp8_prev,
-            weights_prev,
-            metadata,
-            kv_len_prev,
-            actual_seq_q_prev,
-        )
-        topk_result_next = self._get_topk_ragged_with_cp(
-            forward_batch,
-            layer_id,
-            q_fp8_next,
-            weights_next,
-            metadata,
-            kv_len_next,
-            actual_seq_q_next,
-        )
-        return torch.cat([topk_result_prev, topk_result_next], dim=0)
 
     return self._get_topk_ragged(forward_batch, layer_id, q_fp8, weights, metadata)
 

@@ -57,10 +57,12 @@ class TestAdaptCoverage(unittest.TestCase):
     def test_replaced_symbol_set_is_non_trivial(self):
         """自检：解析本身没坏（不然下面那条会假绿）。"""
         syms = _replaced_symbols()
-        # mHC 的融合替代实现（tilelang post / big_fuse pre / split-K / tf32）已删除，
-        # 适配层只保留散装 torch 的 mhc_pre/mhc_post，被替换符号从 30 降到 24。
+        # mHC 的融合 kernel（tilelang post / big_fuse pre / big_fuse pre + norm /
+        # split-K / sqrsum dispatch / deep_gemm tf32）**在 kernel 级**恢复了 torch
+        # 替代，被替换符号 24 -> 31（2026-10-20）。阈值跟着抬，防止再被悄悄删掉：
+        # 一旦有人把某个 kernel 级替代实现删了，符号数会掉到 31 以下，这里立刻 fail。
         self.assertGreaterEqual(
-            len(syms), 20, f"只解析出 {len(syms)} 个被替换符号，解析逻辑可能坏了"
+            len(syms), 31, f"只解析出 {len(syms)} 个被替换符号，解析逻辑/实现可能被删"
         )
 
     def test_every_replaced_symbol_is_referenced_by_some_test(self):

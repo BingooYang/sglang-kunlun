@@ -196,6 +196,32 @@ class TestForwardBatchAttnBackend(unittest.TestCase):
         self.assertEqual(layer_id, 7)
         self.assertIs(seen_fb, fb)
 
+    def test_decoy_attn_backend_on_batch_is_never_read(self):
+        """即便 batch 上有 ``attn_backend`` 诱饵，也不能被读到（防"fork 又加回来"时静默走旧路）。"""
+        import sglang.srt.model_executor.forward_context as forward_context
+
+        class _Decoy:
+            def get_indexer_metadata(self, *a, **k):  # noqa: D401
+                raise AssertionError(
+                    "插件读了 forward_batch.attn_backend（fork 已移除的旧 API）"
+                )
+
+        batch_like = SimpleNamespace(attn_backend=_Decoy())
+        backend = _RecordingIndexerMetadataBackend(metadata=None)
+        with forward_context.forward_context(
+            forward_context.ForwardContext(attn_backend=backend)
+        ):
+            out = self.nsa_indexer.forward_cuda(
+                object(),
+                torch.zeros(1, 4),
+                None,
+                torch.zeros(1, dtype=torch.int64),
+                batch_like,
+                0,
+            )
+        self.assertIsNone(out)
+        self.assertEqual(len(backend.calls), 1, "没有走 forward context 的后端")
+
     def test_forward_cuda_without_forward_context_fails_loudly(self):
         """没有 publish context 时要报 ``get_forward_context`` 的 assert，而不是静默用错后端。"""
         nsa_indexer = self.nsa_indexer
@@ -210,6 +236,26 @@ class TestForwardBatchAttnBackend(unittest.TestCase):
                 0,
             )
         self.assertIn("forward context", str(ctx.exception))
+
+
+class _StopPathReached(RuntimeError):
+    """属性触碰记录器的截断信号（不是被测代码的异常）。"""
+
+
+class _AttrTouchRecorder:
+    """记录 ``forward_cuda`` 读过的 self 属性；未预置的属性一读就截断。"""
+
+    def __init__(self, **known):
+        object.__setattr__(self, "_known", known)
+        object.__setattr__(self, "touched", [])
+
+    def __getattr__(self, name):
+        known = object.__getattribute__(self, "_known")
+        if name in known:
+            return known[name]
+        touched = object.__getattribute__(self, "touched")
+        touched.append(name)
+        raise _StopPathReached(name)
 
 
 # ---------------------------------------------------------------------------
@@ -272,33 +318,28 @@ class TestPrefillCPRename(unittest.TestCase):
             )
         )
 
-    # -- 行为：forward_cuda 的 "k-only 快路径" 由 dsa_ 这个开关决定 ----------
+    # -- 行为：热路径必须只认 fork 的新名字，且不因属性缺失抛异常 -------------
+    #
+    # 2026-10-20 服务里那次的形态是 ``AttributeError: ... has no attribute
+    # 'nsa_enable_prefill_cp'``（直接读旧名、且 fork 上没有该属性）。
+    # 这里不绑定具体实现（helper 叫什么、k-only 是方法还是模块级函数都在变），
+    # 只观察两个稳定事实：① 不会去读旧名字；② 只挂新名字的 indexer 不会炸。
 
-    def _run_forward_cuda_with_cp_flag(self, *, dsa_value):
-        """让 ``forward_cuda`` 在 "skip_logits + CP 关闭" 时才走 ``_forward_cuda_k_only``。
+    def _probe(self, **known):
+        """跑一次 ``forward_cuda``，返回 ``(读过的属性名, 抛出的异常或 None)``。
 
-        返回 (走没走 k_only, 是否进入了更深的分支)。两条分支都用 sentinel 截断，
-        所以不需要真的张量 / 设备。
+        ``known`` 是决策必需的属性（``index_topk`` / ``dsa_enable_prefill_cp`` /
+        旧名 ``nsa_enable_prefill_cp``）；其余任何属性一被读到就记录并抛
+        :class:`_StopPathReached` 截断 —— 既不需要真张量，也不依赖后续实现细节。
         """
         import sglang.srt.model_executor.forward_context as forward_context
 
-        class _DeepPathReached(RuntimeError):
-            pass
-
-        k_only_calls = []
-
-        indexer = SimpleNamespace(
-            index_topk=8,
-            dsa_enable_prefill_cp=dsa_value,
-            _forward_cuda_k_only=lambda *a, **k: k_only_calls.append(a) or "k_only",
-            _get_q_k_bf16=lambda *a, **k: (_ for _ in ()).throw(_DeepPathReached()),
-        )
+        indexer = _AttrTouchRecorder(**known)
         fb = _minimal_forward_batch(
             self.ForwardMode.EXTEND, seq_lens_cpu=torch.tensor([4], dtype=torch.int64)
         )
         backend = _RecordingIndexerMetadataBackend(metadata=object())
-
-        deep = False
+        exc = None
         with forward_context.forward_context(
             forward_context.ForwardContext(attn_backend=backend)
         ):
@@ -311,55 +352,40 @@ class TestPrefillCPRename(unittest.TestCase):
                     fb,
                     0,
                 )
-            except _DeepPathReached:
-                deep = True
-        return bool(k_only_calls), deep
+            except _StopPathReached:
+                pass
+            except Exception as e:  # noqa: BLE001 - 只做记录，下面按类型断言
+                exc = e
+        return indexer.touched, exc
 
-    def test_cp_enabled_skips_k_only_fast_path(self):
-        """``dsa_enable_prefill_cp=True`` 时**不能**走 k-only 快路径（CP 需要完整 logits）。"""
-        k_only, deep = self._run_forward_cuda_with_cp_flag(dsa_value=True)
-        self.assertFalse(
-            k_only, "CP 打开时仍走了 _forward_cuda_k_only（旧属性名读串了？）"
-        )
-        self.assertTrue(deep, "CP 打开时应继续走向 _get_q_k_bf16 那条路")
+    def test_hot_path_never_reads_old_attribute_name(self):
+        """不管 CP 开关取值，热路径都不许读 ``nsa_enable_prefill_cp``。
 
-    def test_cp_disabled_takes_k_only_fast_path(self):
-        """``dsa_enable_prefill_cp=False`` 时走 k-only 快路径（短 prefill 的早退分支）。"""
-        k_only, deep = self._run_forward_cuda_with_cp_flag(dsa_value=False)
-        self.assertTrue(k_only, "CP 关闭时没走 _forward_cuda_k_only，分发逻辑变了")
-        self.assertFalse(deep)
-
-    def test_old_attribute_name_alone_is_not_read_by_hot_path(self):
-        """热路径只认 ``dsa_``：只挂旧名 ``nsa_`` 的 fake indexer 应被当作 "CP 关闭"。
-
-        这条用例把 "旧名还能不能用" 这个隐含假设钉死：``_enable_prefill_cp``
-        才是双名兜底的地方，热路径不兜底（fork 里只有新名）。
+        "新名字真的被用到" 由 TestStaticApiRegression 正向断言
+        （扫源码里的 ``dsa_enable_prefill_cp``）兜底 —— 这里只钉行为：
+        读旧名 / 因属性缺失抛 AttributeError 都算错配。
         """
-        import sglang.srt.model_executor.forward_context as forward_context
+        for cp_on in (True, False):
+            with self.subTest(dsa_enable_prefill_cp=cp_on):
+                touched, _ = self._probe(
+                    index_topk=8, dsa_enable_prefill_cp=cp_on
+                )
+                self.assertNotIn(
+                    "nsa_enable_prefill_cp",
+                    touched,
+                    "forward_cuda 仍在读旧名 nsa_enable_prefill_cp"
+                    f"（触碰过的属性：{touched}）",
+                )
 
-        k_only_calls = []
-        indexer = SimpleNamespace(
-            index_topk=8,
-            nsa_enable_prefill_cp=True,  # 只有旧名
-            _forward_cuda_k_only=lambda *a, **k: k_only_calls.append(a) or "k_only",
-        )
-        fb = _minimal_forward_batch(
-            self.ForwardMode.EXTEND, seq_lens_cpu=torch.tensor([4], dtype=torch.int64)
-        )
-        backend = _RecordingIndexerMetadataBackend(metadata=object())
-        with forward_context.forward_context(
-            forward_context.ForwardContext(attn_backend=backend)
-        ):
-            out = self.nsa_indexer.forward_cuda(
-                indexer,
-                torch.zeros(4, 4),
-                None,
-                torch.zeros(4, dtype=torch.int64),
-                fb,
-                0,
-            )
-        self.assertEqual(out, "k_only")
-        self.assertEqual(len(k_only_calls), 1)
+    def test_fork_shaped_indexer_never_raises_attribute_error(self):
+        """只挂 ``dsa_``（fork 现状）的 indexer 不会因为 CP 属性缺失而 AttributeError。"""
+        for cp_on in (True, False):
+            with self.subTest(dsa_enable_prefill_cp=cp_on):
+                _, exc = self._probe(index_topk=8, dsa_enable_prefill_cp=cp_on)
+                self.assertFalse(
+                    isinstance(exc, AttributeError),
+                    f"forward_cuda 抛了 AttributeError（旧 API 错配的典型形态）：{exc}",
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +394,14 @@ class TestPrefillCPRename(unittest.TestCase):
 
 
 class TestGetKBf16Signature(unittest.TestCase):
-    """``_get_k_bf16`` 的 fork 签名是 ``(x, positions)``；插件调用点必须只传两个。"""
+    """K-only 路径（``_get_k_bf16`` 家族）的签名/调用点必须和 fork 对得上。
+
+    这条错配的**本质**是"调用点实参个数 ≠ 目标签名"，所以除了比对 fork 的
+    ``(x, positions)``，还做一条与具体实现名无关的 AST 检查：插件里任何
+    ``*_get_k_bf16*`` 的调用，实参个数都必须落在目标签名的可接受范围内。
+    这样插件把 helper 改名（``_get_k_bf16`` -> ``_get_k_bf16_compat``）、或换成
+    ``_k_proj`` 之类的新实现，本用例都不需要跟着改。
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -384,39 +417,82 @@ class TestGetKBf16Signature(unittest.TestCase):
         self.assertEqual(
             params,
             ["self", "x", "positions"],
-            f"fork 的 _get_k_bf16 签名变了：{params}；插件的 _forward_cuda_k_only 需要同步",
+            f"fork 的 _get_k_bf16 签名变了：{params}；插件的 K-only 路径需要同步",
         )
 
-    def test_plugin_call_site_passes_exactly_two_args(self):
-        """AST 找 ``self._get_k_bf16(...)``：必须是 2 个位置参数、无关键字参数。"""
-        src = pathlib.Path(self.nsa_indexer.__file__).read_text(encoding="utf-8")
-        tree = ast.parse(src)
-        calls = []
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_get_k_bf16"
+    @staticmethod
+    def _accepted_positional(fn, *, is_bound_method: bool) -> tuple[int, set]:
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.values())
+        n_pos = 0
+        names = set()
+        for i, prm in enumerate(params):
+            if prm.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
             ):
-                calls.append(
-                    (node.lineno, len(node.args), [kw.arg for kw in node.keywords])
+                if is_bound_method and i == 0:
+                    continue  # self
+                n_pos += 1
+                names.add(prm.name)
+            elif prm.kind == inspect.Parameter.KEYWORD_ONLY:
+                names.add(prm.name)
+        return n_pos, names
+
+    def test_k_only_call_sites_match_target_signature(self):
+        """AST 遍历：``*_get_k_bf16*`` 的每个调用点，实参都能被目标签名接住。"""
+        import sglang_kunlun.hooks.layers.attention.nsa.nsa_indexer as plugin
+
+        src = pathlib.Path(plugin.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        indexer_cls = self.dsa_indexer.Indexer
+
+        checked, problems, unresolved = 0, [], []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if isinstance(fn, ast.Attribute) and "_get_k_bf16" in fn.attr:
+                target = getattr(indexer_cls, fn.attr, None)
+                is_bound = target is not None
+            elif isinstance(fn, ast.Name) and "_get_k_bf16" in fn.id:
+                target = getattr(plugin, fn.id, None)
+                is_bound = False
+            else:
+                continue
+            if target is None or not callable(target):
+                unresolved.append(f"{plugin.__file__}:{node.lineno} {ast.unparse(fn)}")
+                continue
+            try:
+                n_pos, kw_names = self._accepted_positional(
+                    target, is_bound_method=is_bound
                 )
-        self.assertTrue(calls, "插件里找不到 self._get_k_bf16(...) 调用点（被删了？）")
-        for lineno, n_args, kwargs in calls:
-            with self.subTest(line=lineno):
-                self.assertEqual(
-                    n_args,
-                    2,
-                    f"{self.nsa_indexer.__file__}:{lineno} 传了 {n_args} 个位置参数",
+            except (TypeError, ValueError):
+                unresolved.append(f"{plugin.__file__}:{node.lineno} {ast.unparse(fn)}")
+                continue
+            checked += 1
+            if len(node.args) > n_pos:
+                problems.append(
+                    f"{plugin.__file__}:{node.lineno} 调用 {ast.unparse(fn)} 传了 "
+                    f"{len(node.args)} 个位置参数，签名只接 {n_pos} 个"
                 )
-                self.assertFalse(
-                    kwargs,
-                    f"{self.nsa_indexer.__file__}:{lineno} 用了关键字参数 {kwargs}",
-                )
+            for kw in node.keywords:
+                if kw.arg is not None and kw.arg not in kw_names:
+                    problems.append(
+                        f"{plugin.__file__}:{node.lineno} 关键字参数 {kw.arg} 不在签名里"
+                    )
+        self.assertTrue(
+            checked, f"没找到任何可解析的 *_get_k_bf16* 调用点（unresolved={unresolved}）"
+        )
+        self.assertFalse(
+            problems,
+            "K-only 路径的调用点与目标签名不匹配（服务里那次 TypeError 就长这样）：\n  "
+            + "\n  ".join(problems),
+        )
 
     def test_get_k_bf16_runs_with_two_args_and_returns_key_shape(self):
-        """最小张量（CPU）走一遍：返回 ``(num_tokens, head_dim)`` 的 key。"""
-        head_dim, num_tokens = 64, 4
+        """最小张量（CPU）按 ``(x, positions)`` 调 fork 实现：返回 ``(T, head_dim)``。"""
+        head_dim, rope_head_dim, num_tokens = 64, 32, 4
         positions = torch.arange(num_tokens, dtype=torch.int64)
 
         class _Fake:
@@ -439,6 +515,9 @@ class TestGetKBf16Signature(unittest.TestCase):
                 self.dsa_indexer.Indexer._update_rope_guarded
             )
 
+        # fork 的 _get_k_bf16 读这两个属性（类属性在类体里不能写成 `x = x`）
+        _Fake.head_dim = head_dim
+        _Fake.rope_head_dim = rope_head_dim
         fake = _Fake()
         x = torch.zeros(num_tokens, 128, dtype=torch.bfloat16)
 
@@ -461,8 +540,10 @@ class TestGetKBf16Signature(unittest.TestCase):
         head_dim = 8
 
         class _Fake:
+            rope_head_dim = 4
+
             def wk(self, x):
-                return torch.zeros(x.shape[0], head_dim), None
+                return torch.zeros(x.shape[0], head_dim, dtype=torch.bfloat16), None
 
             def k_norm(self, key):
                 return key
@@ -474,7 +555,8 @@ class TestGetKBf16Signature(unittest.TestCase):
                 self.dsa_indexer.Indexer._update_rope_guarded
             )
 
-        x = torch.zeros(2, 16)
+        _Fake.head_dim = head_dim
+        x = torch.zeros(2, 16, dtype=torch.bfloat16)
         positions = torch.zeros(2, dtype=torch.int64)
         with self.assertRaises(TypeError):
             self.dsa_indexer.Indexer._get_k_bf16(_Fake(), x, positions, None)
@@ -518,24 +600,44 @@ class TestStaticApiRegression(unittest.TestCase):
         )
 
     def test_replacement_apis_are_actually_used(self):
-        """正向断言：光 "没有旧名" 不够，新名/新入口必须真的在。"""
-        src = (
-            _plugin_package_dir() / "hooks/layers/attention/nsa/nsa_indexer.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn(
-            "from sglang.srt.model_executor.forward_context import get_attn_backend",
-            src,
-            "nsa_indexer 没有 import get_attn_backend（错配 1 的修复被回退了？）",
+        """正向断言：光 "没有旧名" 不够，新名/新入口必须真的在。
+
+        用 AST 而不是字符串匹配 —— 插件的 import 形态会变（单行 / 括号多行 /
+        顺带多导入 ``get_token_to_kv_pool``），字符串断言会假红。
+        """
+        import sglang_kunlun.hooks.layers.attention.nsa.nsa_indexer as plugin
+
+        src = pathlib.Path(plugin.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+
+        imported_from_fc = False
+        calls_get_attn_backend = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (
+                node.module == "sglang.srt.model_executor.forward_context"
+            ):
+                imported_from_fc = imported_from_fc or any(
+                    a.name == "get_attn_backend" for a in node.names
+                )
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "get_attn_backend"
+            ):
+                calls_get_attn_backend = True
+
+        self.assertTrue(
+            imported_from_fc,
+            "nsa_indexer 没有从 forward_context import get_attn_backend（错配 1 的修复被回退了？）",
         )
-        self.assertIn(
-            "get_attn_backend()", src, "nsa_indexer 没有调用 get_attn_backend()"
+        self.assertTrue(
+            calls_get_attn_backend, "nsa_indexer 没有调用 get_attn_backend()"
         )
         self.assertIn(
             "dsa_enable_prefill_cp",
             src,
             "nsa_indexer 里找不到 dsa_enable_prefill_cp（错配 2 的修复被回退了？）",
         )
-
 
 if __name__ == "__main__":
     unittest.main()

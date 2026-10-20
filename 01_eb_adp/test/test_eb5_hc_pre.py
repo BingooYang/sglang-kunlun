@@ -432,6 +432,102 @@ class TestHcPreSqrsumFamily(CustomTestCase):
                     f"n={n}: comb 列和不为 1",
                 )
 
+    def test_mhc_pre_big_fuse_tilelang_no_norm(self):
+        """`mhc_pre_big_fuse_tilelang`（**不带 norm** 的 big fuse）与 fp32 参考一致。
+
+        `mhc_pre` 在 `norm_weight is None` 时走这个 kernel。它的 layer_input 是
+        "fp32 加权和 → round 到 bf16"，**不做** RMSNorm —— 与 `..._with_norm_` 版的
+        差别只在这一步，所以单独钉一条：post_mix / comb_mix / layer_input 三者
+        都要对上，且 layer_input 不能被 norm 过。
+        """
+        from sglang.kernels.ops.layernorm.mhc import (
+            mhc_pre_big_fuse_tilelang,
+            mhc_pre_gemm_sqrsum_splitk_kernel,
+        )
+
+        for n in (8, 256):
+            with self.subTest(num_tokens=n):
+                x, fn = self._make_inputs(n)
+                split_k = self.SPLIT_K
+                out_partial = torch.zeros(
+                    split_k, n, 32, dtype=torch.float32, device=_DEVICE
+                )
+                sq_partial = torch.zeros(
+                    split_k, n, dtype=torch.float32, device=_DEVICE
+                )
+                kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
+                    self.HC_MULT3, self.HC_HIDDEN, split_k=split_k
+                )
+                kernel_0(x, fn, out_partial, sq_partial)
+
+                residual = _rand(n, self.HC_MULT, self.HIDDEN)
+                post_mix = torch.empty(
+                    n, self.HC_MULT, dtype=torch.float32, device=_DEVICE
+                )
+                comb_mix = torch.empty(
+                    n, self.HC_MULT**2, dtype=torch.float32, device=_DEVICE
+                )
+                layer_input = torch.empty(n, self.HIDDEN, dtype=_DTYPE, device=_DEVICE)
+                hc_scale = torch.ones(3, dtype=torch.float32, device=_DEVICE)
+                hc_base = torch.zeros(self.HC_MULT3, dtype=torch.float32, device=_DEVICE)
+                rms_eps = hc_pre_eps = sink_eps = 1e-6
+                sink_iters = 2
+                post_mult = 2.0
+
+                mhc_pre_big_fuse_tilelang(
+                    out_partial, sq_partial, hc_scale, hc_base, residual,
+                    post_mix, comb_mix, layer_input,
+                    self.HIDDEN, rms_eps, hc_pre_eps, sink_eps, post_mult,
+                    sink_iters, split_k, self.HC_MULT, 32, 0,
+                )
+                torch.cuda.synchronize()
+
+                # ---- 独立 fp32 参考（按 kernel 公式逐行写，不复用适配层 helper）----
+                sq = sq_partial.float().sum(0)
+                rms = torch.rsqrt(sq / (self.HC_MULT * self.HIDDEN) + rms_eps)
+                mixes = out_partial[:, :, :32].float().sum(0) * rms.unsqueeze(-1)
+                ref_pre = torch.sigmoid(
+                    mixes[:, : self.HC_MULT] * hc_scale[0] + hc_base[: self.HC_MULT]
+                ) + hc_pre_eps
+                ref_post = post_mult * torch.sigmoid(
+                    mixes[:, self.HC_MULT : 2 * self.HC_MULT] * hc_scale[1]
+                    + hc_base[self.HC_MULT : 2 * self.HC_MULT]
+                )
+                # 无 norm：layer_input = round_bf16(Σ_hc pre * residual)
+                ref_li = (
+                    ref_pre.unsqueeze(-1) * residual.float()
+                ).sum(1).to(_DTYPE)
+
+                self.assertEqual(layer_input.dtype, _DTYPE)
+                self.assertTrue(torch.isfinite(layer_input).all())
+                self.assertTrue(
+                    torch.allclose(post_mix.float(), ref_post, atol=1e-5, rtol=1e-5),
+                    f"n={n}: post_mix 与参考不一致",
+                )
+                self.assertTrue(
+                    torch.allclose(
+                        layer_input.float(), ref_li.float(), atol=2e-2, rtol=2e-2
+                    ),
+                    f"n={n}: layer_input（无 norm）与参考不一致",
+                )
+                # 没被 norm：与"归一化过的版本"必须不同（防止误走 with_norm 分支）
+                normed = ref_li.float() * torch.rsqrt(
+                    (ref_li.float() ** 2).mean(-1, keepdim=True) + 1e-6
+                )
+                self.assertFalse(
+                    torch.allclose(layer_input.float(), normed, atol=1e-3, rtol=1e-3),
+                    f"n={n}: layer_input 看起来被 RMSNorm 过（不该走 with_norm 语义）",
+                )
+                # sinkhorn 归一化后 comb 的列和为 1
+                self.assertTrue(
+                    torch.allclose(
+                        comb_mix.view(n, self.HC_MULT, self.HC_MULT).float().sum(-2),
+                        torch.ones(n, self.HC_MULT, device=_DEVICE),
+                        atol=1e-3,
+                    ),
+                    f"n={n}: comb 列和不为 1",
+                )
+
     def test_mhc_pre_gemm_sqrsum_dispatch(self):
         """`_mhc_pre_gemm_sqrsum_dispatch()` 返回单链实现（mhc.py 会直接调用它）。"""
         from sglang.kernels.ops.layernorm.mhc import (

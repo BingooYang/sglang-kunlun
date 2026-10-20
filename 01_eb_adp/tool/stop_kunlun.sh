@@ -87,7 +87,7 @@ if alive; then
     wchan=$(cat /proc/"$p"/wchan 2>/dev/null)
     case "$st:$wchan" in
       Z:*) say "  $p 已是僵尸，跳过" ;;
-      S:ep_poll|S:do_epoll_wait|S:futex_wait_queue_me|S:poll_schedule_timeout)
+      S:ep_poll|S:do_epoll_wait|S:futex_wait_queue_me|S:poll_schedule_timeout|S:do_poll*)
         kill -9 "$p" 2>/dev/null && say "  -9 -> $p（空闲 CPU worker，状态 $st/$wchan）" ;;
       *) say "  ⚠️ $p 状态 $st/$wchan 不像空闲 worker，**跳过**（不冒险）" ;;
     esac

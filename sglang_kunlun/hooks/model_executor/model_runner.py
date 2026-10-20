@@ -71,6 +71,17 @@ def _repair_kernel_bindings(result, self):
         from sglang_kunlun.kernels.kernel_ops import repair_imported_bindings
 
         repair_imported_bindings()
+        # 22:33 实测：indexer 的 late-bindings 修复 pass 落在首个 forward 内，
+        # DP3 比 DP0-2 晚 10s+，首包 rank skew（trace 2160/2160/2160/1487）。
+        # 权重加载后先把晚导入模块拉起来做同一遍修复。
+        try:
+            from sglang_kunlun.hooks.layers.attention.nsa.nsa_indexer import (
+                _fix_late_kernel_bindings,
+            )
+
+            _fix_late_kernel_bindings()
+        except Exception:  # noqa: BLE001
+            pass
     except Exception:  # noqa: BLE001 - never block model loading
         import logging
 

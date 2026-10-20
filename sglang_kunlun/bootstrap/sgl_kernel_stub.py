@@ -172,17 +172,23 @@ def install() -> None:
     # Bind real Kunlun implementations for sgl_kernel top-k APIs.
     # fast_topk: pure-Python fallback (no XPU kernel needed), identical to
     #   the mimo-branch reference in sgl-kernel/python/sgl_kernel/top_k.py.
-    # fast_topk_v2 / fast_topk_transform_* rely on CUDA kernels
-    #   (torch.ops.sgl_kernel.*) only available in the CUDA sgl_kernel build
-    #   (NSA path). They are intentionally left as _StubModule callables and
-    #   will raise NotImplementedError if called.
+    # fast_topk_transform_fused / fast_topk_transform_ragged_fused: pure-torch
+    #   re-implementations of the CUDA kernels in csrc/elementwise/topk.cu
+    #   (windowed top-k + page-table / ragged-offset transform, NSA-DSA path).
+    # fast_topk_v2 still relies on torch.ops.sgl_kernel.fast_topk (CUDA only)
+    #   and stays a _StubModule callable -> NotImplementedError if reached; it
+    #   is gated behind SGLANG_OPT_USE_TOPK_V2, which is off on Kunlun.
     from sglang_kunlun.kernels.sgl_kernel_kunlun.top_k import (
         fast_topk as _fast_topk,
+        fast_topk_transform_fused as _fast_topk_transform_fused,
+        fast_topk_transform_ragged_fused as _fast_topk_transform_ragged_fused,
         moe_fused_gate as _moe_fused_gate,
     )
 
     for module in (root, sys.modules["sgl_kernel.top_k"]):
         module.fast_topk = _fast_topk  # type: ignore[attr-defined]
+        module.fast_topk_transform_fused = _fast_topk_transform_fused  # type: ignore[attr-defined]
+        module.fast_topk_transform_ragged_fused = _fast_topk_transform_ragged_fused  # type: ignore[attr-defined]
         module.moe_fused_gate = _moe_fused_gate  # type: ignore[attr-defined]
 
     # Bind real Kunlun implementations for sgl_kernel sampling APIs used by

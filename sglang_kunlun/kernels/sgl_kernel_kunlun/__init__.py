@@ -24,11 +24,18 @@ from .sampling import (
     tree_speculative_sampling_target_only,
 )
 from .speculative import build_tree_kernel_efficient, verify_tree_greedy
-from .top_k import fast_topk, moe_fused_gate
+from .top_k import (
+    fast_topk,
+    fast_topk_transform_fused,
+    fast_topk_transform_ragged_fused,
+    moe_fused_gate,
+)
 
 __all__ = [
     "build_tree_kernel_efficient",
     "fast_topk",
+    "fast_topk_transform_fused",
+    "fast_topk_transform_ragged_fused",
     "fused_add_rmsnorm",
     "moe_fused_gate",
     "rmsnorm",

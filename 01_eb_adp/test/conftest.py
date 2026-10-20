@@ -11,6 +11,10 @@ import pathlib
 #     * 单测：没设 → 默认 True → 走 `tf32_hc_prenorm_gemm`
 #     * 服务：显式 0    → 走 `kernel_0`（splitk）→ 崩
 # 同一个分发器、**不同分支**，所以"单测全绿"证明不了服务那条路能跑。
+# 2026-10-20 起该分发器下的融合 kernel 已由适配层在 **kernel 级**换成 torch 替代
+# （`tf32_hc_prenorm_gemm` / `mhc_pre_gemm_sqrsum_*` / `mhc_pre_big_fuse*` 都被
+# `eb5_kunlun_adapt.apply()` 逐个 patch），这个开关不再决定 mHC 走哪条分支；
+# 保留它只为复现服务环境的其余行为。
 #
 # 用法：  EB5_TEST_PROFILE=service CUDA_VISIBLE_DEVICES=0 python -m pytest ... -q
 # 建议**两套都跑**（默认 + service）。
@@ -30,7 +34,7 @@ _SERVICE_PROFILE = {
     "SGLANG_KUNLUN_INDEXER_FP32": "1",
     "SGLANG_OPT_BF16_FP32_GEMM_ALGO": "torch",
     "SGLANG_OPT_CP_REARRANGE_TRITON": "False",
-    "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "0",   # ← 就是它让两条路分叉
+    "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "0",   # 历史开关；kernel 已被 torch 替代，不再分叉
     "SGLANG_OPT_FP8_WO_A_GEMM": "False",
     "SGLANG_OPT_USE_AITER_INDEXER": "False",
     "SGLANG_OPT_USE_COMPRESSOR_V2": "False",

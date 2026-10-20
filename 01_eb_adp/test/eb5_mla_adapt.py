@@ -12,7 +12,8 @@ fork 的调用点上，供 `test_eb5_attn_mla.py` 的 kernel 级单测真跑。
 * `topk_transform_ragged_v2` —— ragged prefill fused top-k
 * `jit_kernel.internal.dsa.fused_{q,k}_indexer_*` —— indexer Q/K 的 rope+hadamard+fp8
 * `concat_mla_absorb_q` / `set_mla_kv_buffer` / `quantize_k_cache{,_separate}`
-* `append_indexer_swa_triton` / `GetKAndS.triton`
+* `append_indexer_swa_triton` —— fork 实现漏了 padding 行语义，这里用向量化 torch 覆盖
+* `GetKAndS.triton`
 * `eb5_sigmoid_gate_mul`
 * `sgl_kernel.flash_mla.{get_mla_metadata, flash_mla_with_kvcache}`
 
@@ -583,9 +584,10 @@ def quantize_k_cache(cache_k: torch.Tensor) -> torch.Tensor:
     return packed.view(num_blocks, block_size, 1, -1).view(torch.float8_e4m3fn)
 
 
-# --------------------------------------------------------------------------- #
-# indexer 索引构建 / 收集
-# --------------------------------------------------------------------------- #
+# fork 的 `dsa_swa_index.append_indexer_swa_triton` 已是向量化 torch，但 padding 行
+# （`num_rows > live_rows`，CUDA-graph 预留行）会去写 top-k 尾部列，而 kernel/ref 语义是
+# 整行保持 -1；ragged 模式还会因 `row_aux[:num_rows]` 长度不足直接 shape mismatch。
+# 这里用**一次 `tolist()` + 全向量化**的实现覆盖它（禁止 `int(tensor[i])` 逐元素循环）。
 def append_indexer_swa_triton(
     topk_indices: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -599,54 +601,116 @@ def append_indexer_swa_triton(
     page_row_indices: Optional[torch.Tensor] = None,
     ragged_offsets: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """torch 拆解：拼出 ``top-k ∪ 最近 window`` 的稀疏索引行 + 行长度。
+    """拼出 ``top-k ∪ 最近 window`` 的稀疏索引行 + 行长度（向量化 torch）。
 
     行长度 = ``min(max(seq_len - window, 0), topk) + min(seq_len, window)``。
-    前段写 top-k 的槽位号，``[indexer_len, indexer_len+window)`` 写窗口内的
-    KV 槽位（ragged / paged-identity / paged-mapped 三种模式，与 kernel 一致）。
+    主拷贝写 ``cols < indexer_len`` 的 top-k 槽位；``cols ∈ [indexer_len+window, topk)``
+    原样搬运；其余列保持 -1（**非 live 的 padding 行整行为 -1**）。window 段写在
+    ``[indexer_len, indexer_len+window)``：ragged 用 ``ragged_offsets[row]+pos``，
+    paged 用 ``page_table[page_row, pos//page_size]*page_size + pos%page_size``。
     """
+    if topk_indices.ndim != 2 or topk_indices.shape[1] != topk:
+        raise ValueError(
+            f"expected top-k shape [N, {topk}], got {tuple(topk_indices.shape)}"
+        )
+    if topk_indices.shape[0] < num_rows:
+        raise ValueError(
+            f"top-k has {topk_indices.shape[0]} rows for {num_rows} launched rows"
+        )
+
     device = topk_indices.device
     output_width = -(-(topk + window) // alignment) * alignment
     output = torch.full(
         (num_rows, output_width), -1, dtype=torch.int32, device=device
     )
     lengths = torch.zeros(num_rows, dtype=torch.int32, device=device)
-    live_rows = seq_lens.numel()
     if num_rows == 0:
         return output, lengths
 
-    cols = torch.arange(output_width, device=device)
-    for r in range(num_rows):
-        if r >= live_rows:
-            continue
-        sl = max(int(seq_lens[r]), 0)
-        ilen = min(max(sl - window, 0), topk)
-        swa_len = min(sl, window)
-
-        keep = (cols < ilen) | (cols >= ilen + window)
-        src = torch.where(
-            cols < topk,
-            topk_indices[r, cols.clamp(max=max(topk - 1, 0))].to(torch.int32),
-            torch.full_like(cols, -1),
+    live_rows = seq_lens.numel()
+    n_live = min(live_rows, num_rows)
+    # 一次性 D2H（每个元数据向量只同步一次），后面全是设备侧向量运算。
+    seq_lens_list = seq_lens.tolist()
+    seq_len = torch.zeros(num_rows, dtype=torch.int64, device=device)
+    if n_live:
+        seq_len[:n_live] = torch.as_tensor(
+            seq_lens_list[:n_live], dtype=torch.int64, device=device
         )
-        output[r][keep] = src[keep]
+    seq_len.clamp_(min=0)
+    indexer_len = (seq_len - window).clamp(min=0, max=topk)
+    swa_len = seq_len.clamp(max=window)
 
-        if swa_len > 0:
-            pos = sl - swa_len + torch.arange(swa_len, device=device)
-            if ragged_offsets is not None:
-                vals = int(ragged_offsets[r]) + pos
-            else:
-                page_row = (
-                    int(page_row_indices[r])
-                    if page_row_indices is not None
-                    else r
+    rows = torch.arange(num_rows, dtype=torch.int64, device=device)
+    cols = torch.arange(output_width, dtype=torch.int64, device=device)
+    live = (rows < live_rows).unsqueeze(1)
+
+    # ── 1) 主拷贝（只对 live 行；padding 行保持 -1，与 kernel/ref 一致）──────
+    src = topk_indices[:num_rows].to(torch.int32)
+    safe_cols = cols.clamp(max=max(topk - 1, 0)).unsqueeze(0).expand(num_rows, -1)
+    gathered = torch.gather(src, 1, safe_cols)
+    head = live & (cols.unsqueeze(0) < indexer_len.unsqueeze(1))
+    tail = (
+        live
+        & (cols.unsqueeze(0) >= (indexer_len + window).unsqueeze(1))
+        & (cols.unsqueeze(0) < topk)
+    )
+    output = torch.where(head | tail, gathered, output)
+
+    # ── 2) window 段 ────────────────────────────────────────────────────────
+    wo = torch.arange(window, dtype=torch.int64, device=device)
+    valid = live & (wo.unsqueeze(0) < swa_len.unsqueeze(1))
+    position = seq_len.unsqueeze(1) - swa_len.unsqueeze(1) + wo.unsqueeze(0)
+    if ragged_offsets is not None:
+        row_aux = torch.zeros(num_rows, dtype=torch.int64, device=device)
+        if n_live:
+            row_aux[:n_live] = torch.as_tensor(
+                ragged_offsets.tolist()[:n_live], dtype=torch.int64, device=device
+            )
+        values = row_aux.unsqueeze(1) + position
+    else:
+        if page_table is None:
+            raise ValueError("paged SWA index requires a page table")
+        if page_row_indices is None and page_table.shape[0] < live_rows:
+            # identity mode: one page-table row per live query row
+            raise ValueError(
+                f"page table has {page_table.shape[0]} rows for {live_rows} "
+                "live query rows and no token_to_batch_idx to map them"
+            )
+        if page_row_indices is not None:
+            page_row = torch.zeros(num_rows, dtype=torch.int64, device=device)
+            if n_live:
+                page_row[:n_live] = torch.as_tensor(
+                    page_row_indices.tolist()[:n_live],
+                    dtype=torch.int64,
+                    device=device,
                 )
-                page_id = torch.div(pos, page_size, rounding_mode="floor")
-                page = page_table[page_row, page_id].to(torch.int32)
-                vals = page * page_size + (pos % page_size)
-            output[r, ilen : ilen + swa_len] = vals.to(torch.int32)
+        else:
+            page_row = rows
+        page_id = position // page_size
+        valid = (
+            valid
+            & (page_row.unsqueeze(1) >= 0)
+            & (page_row.unsqueeze(1) < page_table.shape[0])
+            & (page_id < page_table.shape[1])
+        )
+        pr = page_row.clamp(min=0, max=page_table.shape[0] - 1).unsqueeze(1)
+        pr = pr.expand(-1, window)
+        pc = page_id.clamp(min=0, max=page_table.shape[1] - 1)
+        flat = (pr * page_table.shape[1] + pc).reshape(-1)
+        page = (
+            page_table.reshape(-1)
+            .index_select(0, flat)
+            .view(num_rows, window)
+            .to(torch.int32)
+        )
+        values = page * page_size + (position % page_size)
 
-        lengths[r] = ilen + swa_len
+    dst_cols = (indexer_len.unsqueeze(1) + wo.unsqueeze(0)).clamp(
+        max=output_width - 1
+    )
+    neg = output.new_full(values.shape, -1)
+    output.scatter_(1, dst_cols, torch.where(valid, values.to(torch.int32), neg))
+    lengths.copy_((indexer_len + swa_len).to(torch.int32))
     return output, lengths
 
 
@@ -970,7 +1034,10 @@ def flash_mla_sparse_fwd(
         ``(output [s_q,h_q,d_v], max_logits [s_q,h_q], lse [s_q,h_q])``（lse 为 2 底）
     """
     kvs = kv[:, 0, :] if kv.dim() == 3 else kv
-    kvs = kvs.float()
+    # 不要在这里整体升 fp32：``kv`` 是整块 full latent KV cache（8L 单 rank
+    # 也有 ~22 GB bf16；整网更大）。``.float()`` 会再要一份等大的 fp32，
+    # 2026-10-20 实测 OOM 42.51 GiB（GPU1 free 22.29 GiB）。先按 index gather
+    # 出 [s_q, topk, d]（MB 级），只对这一小块升精度。
     s_q, h_q, _ = q.shape
     s_kv, d_qk = kvs.shape
     topk = indices.shape[-1]
@@ -985,7 +1052,7 @@ def flash_mla_sparse_fwd(
         )
     gathered = kvs[idx.masked_fill(invalid, 0).reshape(-1)].reshape(
         s_q, topk, d_qk
-    )
+    ).float()
 
     scores = torch.einsum("shd,std->sht", q.float(), gathered) * sm_scale
     scores = scores * math.log2(math.e)

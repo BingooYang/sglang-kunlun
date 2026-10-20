@@ -39,17 +39,15 @@ from sglang.srt.layers.attention.dsa.transform_index import (
     transform_index_page_table_prefill,
 )
 from sglang.srt.layers.attention.dsa.utils import (
-    can_dsa_prefill_cp_round_robin_split as can_nsa_prefill_cp_round_robin_split,
+    can_dsa_prefill_cp_interleave as can_nsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens as compute_nsa_seqlens,
     is_dsa_enable_prefill_cp as is_nsa_enable_prefill_cp,
-    is_dsa_prefill_cp_in_seq_split as is_nsa_prefill_cp_in_seq_split,
     is_dsa_prefill_cp_round_robin_split as is_nsa_prefill_cp_round_robin_split,
-    dsa_cp_round_robin_split_data as nsa_cp_round_robin_split_data,
-    dsa_cp_round_robin_split_q_seqs as nsa_cp_round_robin_split_q_seqs,
     pad_dsa_cache_seqlens as pad_nsa_cache_seqlens,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -65,6 +63,126 @@ _NSA_IMPL_T: TypeAlias = Literal["flashmla_sparse", "flashmla_kv", "fa3", "tilel
 
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
+
+
+# ---------------------------------------------------------------------------
+# Fork-API compatibility (CP helpers + KV pool accessor)
+# ---------------------------------------------------------------------------
+def _kv_pool():
+    """Active KV pool for MLA buffer reads/writes.
+
+    The fork removed ``ForwardBatch.token_to_kv_pool``; the pool now lives on
+    the attention backend published in the forward context. Return it as-is so
+    hybrid pools (EB5's ``EB5MLAHCAKVPool``) can route full-MLA layer ids to
+    their latent sub-pool themselves.
+    """
+    return get_token_to_kv_pool()
+
+
+def _dsa_kv_pool():
+    """Page-64 DSA latent sub-pool when the active pool wraps one (EB5).
+
+    Mirrors ``nsa_indexer._indexer_kv_pool``: the published HCA pool is the
+    page-256 outer pool, while the DSA index/latent caches live in
+    ``full_kv_pool``. Other stacks (DSV4) have no ``full_kv_pool`` and get the
+    active pool unchanged.
+    """
+    pool = get_token_to_kv_pool()
+    full_pool = getattr(pool, "full_kv_pool", None)
+    return full_pool if full_pool is not None else pool
+
+
+def is_nsa_prefill_cp_in_seq_split() -> bool:
+    """Guarded probe for the fork's removed CP-v1 ``in-seq-split`` mode.
+
+    ``nsa.utils`` is now a deprecated re-export of ``dsa.utils`` and no longer
+    defines ``is_nsa_prefill_cp_in_seq_split``. EB5 runs with prefill CP off, so
+    "missing" means "this mode is not selected"; if a fork revision restores the
+    predicate we honour it.
+    """
+    from sglang.srt.layers.attention.dsa import utils as _dsa_utils
+
+    fn = getattr(_dsa_utils, "is_dsa_prefill_cp_in_seq_split", None)
+    return bool(fn()) if fn is not None else False
+
+
+def _round_robin_split_data(input_):
+    """Round-robin token split: keep ``token_idx % cp_size == cp_rank``.
+
+    Pure-torch port of the fork's removed ``dsa_cp_round_robin_split_data``
+    (CP V1 deprecation). Only reachable with prefill CP enabled.
+    """
+    from sglang.srt.runtime_context import get_parallel
+
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
+    if isinstance(input_, (tuple, list)):
+        return input_[range(cp_rank, len(input_), cp_size)]
+
+    tokens = len(input_)
+    if tokens % cp_size != 0:
+        cur_len = tokens // cp_size + (int(tokens % cp_size) > cp_rank)
+        if cur_len == 0:
+            return input_.new_empty(0, *input_.shape[1:])
+        indices = torch.arange(cp_rank, tokens, cp_size, device=input_.device)
+        return input_[indices]
+
+    shard = input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank]
+    # A size-1 outer dim has no contiguity constraint, so ``.contiguous()`` can
+    # be a no-op while stride(0) still carries the cp_size-inflated pitch.
+    if shard.stride(0) != input_.stride(0):
+        shard = shard.clone(memory_format=torch.contiguous_format)
+    return shard
+
+
+def _round_robin_split_q_seqs_cpu(extend_seqs):
+    from sglang.srt.runtime_context import get_parallel
+
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
+    extra_seq = 0
+    q_seqs = []
+    for cur_len in extend_seqs:
+        cur_len += extra_seq
+        cur_seq = cur_len // cp_size + int(cur_len % cp_size > cp_rank)
+        q_seqs.append(cur_seq)
+        extra_seq = cur_len - cur_seq * cp_size
+    bs_idx = [i for i, x in enumerate(q_seqs) if x > 0]
+    q_seqs = [q_len for q_len in q_seqs if q_len > 0]
+    return q_seqs, bs_idx
+
+
+def _round_robin_split_q_seqs(extend_seqs_cpu, extend_seqs):
+    """Per-rank query lengths and the batch rows that land on this rank.
+
+    Same contract as the fork's removed ``dsa_cp_round_robin_split_q_seqs``:
+    ``(ret_q_lens_cpu, ret_q_lens, bs_idx_cpu, bs_idx)``. The device tensors are
+    built with one vectorised ``torch.tensor`` from the host-known split lengths
+    instead of a Triton launch.
+    """
+    ret_q_lens_cpu, bs_idx_cpu = _round_robin_split_q_seqs_cpu(extend_seqs_cpu)
+    device = extend_seqs.device
+    ret_q_lens = torch.tensor(ret_q_lens_cpu, device=device, dtype=extend_seqs.dtype)
+    bs_idx = torch.tensor(bs_idx_cpu, device=device, dtype=torch.int32)
+    return ret_q_lens_cpu, ret_q_lens, bs_idx_cpu, bs_idx
+
+
+# Use a fork implementation again if a future revision restores one; otherwise
+# keep the pure-torch ports. CP is disabled on EB5, so this is a guard.
+nsa_cp_round_robin_split_data = _round_robin_split_data
+nsa_cp_round_robin_split_q_seqs = _round_robin_split_q_seqs
+try:  # pragma: no cover - depends on fork revision
+    from sglang.srt.layers.attention.dsa.utils import (
+        dsa_cp_round_robin_split_data as nsa_cp_round_robin_split_data,
+    )
+except ImportError:
+    pass
+try:  # pragma: no cover - depends on fork revision
+    from sglang.srt.layers.attention.dsa.utils import (
+        dsa_cp_round_robin_split_q_seqs as nsa_cp_round_robin_split_q_seqs,
+    )
+except ImportError:
+    pass
 
 
 @dataclass(frozen=True)
@@ -328,7 +446,7 @@ class NativeSparseAttnBackend(
         self.nsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -578,8 +696,7 @@ class NativeSparseAttnBackend(
 
             # Check if MHA FP8 dequantization is needed
             mha_dequantize_needed = (
-                self.use_mha
-                and forward_batch.token_to_kv_pool.dtype == torch.float8_e4m3fn
+                self.use_mha and _dsa_kv_pool().dtype == torch.float8_e4m3fn
             )
             forward_batch.using_mha_one_shot_fp8_dequant = mha_dequantize_needed
 
@@ -603,10 +720,8 @@ class NativeSparseAttnBackend(
 
                 # Validate indices when logical tokens exceed physical capacity
                 # This is likely to be triggered by PP with high kv reuse & parallelism
-                kv_cache_capacity = (
-                    forward_batch.token_to_kv_pool.size
-                    + forward_batch.token_to_kv_pool.page_size
-                )
+                dsa_pool = _dsa_kv_pool()
+                kv_cache_capacity = dsa_pool.size + dsa_pool.page_size
                 if forward_batch.seq_lens_sum > kv_cache_capacity:
                     max_idx = page_table_1_flattened.max().item()
                     assert max_idx < kv_cache_capacity, (
@@ -1252,7 +1367,7 @@ class NativeSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                _kv_pool().set_mla_kv_buffer(  # type: ignore
                     layer,
                     cache_loc,
                     k,
@@ -1281,7 +1396,7 @@ class NativeSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = _kv_pool().get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1437,7 +1552,7 @@ class NativeSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                _kv_pool().set_mla_kv_buffer(  # type: ignore
                     layer,
                     cache_loc,
                     k,
@@ -1449,7 +1564,7 @@ class NativeSparseAttnBackend(
         assert causal, "NSA is causal only"
 
         # Do absorbed multi-latent attention
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = _kv_pool().get_key_buffer(layer.layer_id)
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -1619,7 +1734,7 @@ class NativeSparseAttnBackend(
                     device_sm == 90 or (device_sm >= 100 and device_sm < 110)
                 )  # SM90/SM100 only
                 and max_kv_len <= nsa_max_kv_len  # Short enough for MHA
-                and forward_batch.token_to_kv_pool.dtype
+                and _dsa_kv_pool().dtype
                 in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk

@@ -7,8 +7,11 @@
 层内 7 个模块与真实执行的 kernel：
 
     前处理   -> EB5LayerRMSNorm.forward        rms_norm (ATen CUDA RMSNorm)
-    hc_pre  -> EB5DecoderLayer._mhc_pre        deep_gemm tf32_hc_prenorm_gemm +
-                                               tilelang mhc_pre_big_fuse_with_norm_tilelang
+    hc_pre  -> EB5DecoderLayer._mhc_pre        kernel 级 torch 替代:
+                                               tf32_hc_prenorm_gemm /
+                                               mhc_pre_gemm_sqrsum_{tilelang,splitk_kernel} /
+                                               mhc_pre_big_fuse_with_norm_tilelang
+                                               (由 eb5_kunlun_adapt.apply() 逐个 patch)
     HCA     -> EB5AttentionCSAHCA.forward      整模块真跑(MQALayer): 投影 GEMM + q/kv
                                                norm + rope + compressor(compress_norm_rope_store)
                                                + KV store + attention(dsv4 backend)
@@ -16,7 +19,7 @@
                                                整模块真跑: fused qkv_a GEMM + q/kv norm +
                                                rope + q_b_proj + w_kc absorb bmm +
                                                attention(triton MLA) + gate + o_proj
-    hc_post -> EB5DecoderLayer._mhc_post        tilelang mhc_post_tilelang
+    hc_post -> EB5DecoderLayer._mhc_post        kernel 级 torch 替代: mhc_post_tilelang
     moe     -> EB5MoE.forward                  moe_fused_gate (router topk) + triton
                                                fused_moe (expert GEMM) + silu_and_mul；
                                                另直调 EB5 专属 eb5_fused_topk 融合路由 kernel
@@ -230,9 +233,10 @@ def _make_decoder_layer() -> "ernie5.EB5DecoderLayer":
 class TestHcPre(CustomTestCase):
     """hc_pre：``EB5DecoderLayer._mhc_pre``。
 
-    真实覆盖 kernel：
-      - ``deep_gemm`` ``tf32_hc_prenorm_gemm``（``SGLANG_OPT_DEEPGEMM_HC_PRENORM=1``，默认）
-      - tilelang ``mhc_pre_big_fuse_with_norm_tilelang``
+    真实覆盖实现（融合 kernel 已换成 kernel 级 torch 替代，见 ``eb5_kunlun_adapt``）：
+      - ``deep_gemm.tf32_hc_prenorm_gemm``（torch 实现）
+      - ``mhc_pre_gemm_sqrsum_{tilelang,splitk_kernel}`` / ``_mhc_pre_gemm_sqrsum_dispatch``
+      - ``mhc_pre_big_fuse_with_norm_tilelang``（torch 实现）
 
     整模块 forward 真跑：``_mhc_pre -> mhc.mhc_pre``。仅 mock 权重（随机张量）；
     TP/CP 并行上下文由真实单进程 dist + ServerArgs 提供，未 patch。
@@ -714,7 +718,7 @@ class TestMla(CustomTestCase):
 class TestHcPost(CustomTestCase):
     """hc_post：``EB5DecoderLayer._mhc_post``。
 
-    真实覆盖 kernel：tilelang ``mhc_post_tilelang``。
+    真实覆盖实现：``mhc_post_tilelang`` 的 kernel 级 torch 替代。
     整模块 forward 真跑：``_mhc_post -> mhc.mhc_post``。仅 mock 权重（随机张量）。
     """
 

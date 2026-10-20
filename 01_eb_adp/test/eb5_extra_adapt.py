@@ -776,8 +776,14 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src) -> None:
     在本机 XPU 上，这种标量 D2H 会让所有 rank 一起挂死（doc/3 记录的同一现象；
     2026-10-19 实测 4 rank 全部停在那一行，`py-spy` 可见）。
 
-    这里改成**纯 device 侧**实现：用 `arange` + 布尔 mask 完成动态切片，
-    不需要把 offset/size 取回主机。
+    这里改成**纯 device 侧**实现，且**形状必须全程静态**：
+    - 不能 `int(offset)` / `.item()` —— 标量 D2H；
+    - 也不能用布尔 mask 去索引（`x[mask]` / `nonzero`）—— 输出长度依赖 data，
+      torch 会为此做一次隐式 D2H。2026-10-20 实测：4 个 scheduler 全停在
+      `src.index_select(0, src_idx[mask])`，现象与 `int(offset)` 完全一样。
+    所以用「固定长度的 gather + `torch.where` 回写」：gather 的索引长度恒为
+    `dst.shape[0]`（Python int），越界位置 clamp 成合法索引、再用 mask 丢弃。
+    代价是每次整块回写 dst（比只拷 n 行多些带宽），换来零同步。
     """
     assert dim == 0, "dim != 0 unsupported"
     assert src.shape[1:] == dst.shape[1:], "src and dst must have same shape"
@@ -786,27 +792,26 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src) -> None:
 
     dev = dst.device
     dst_rows, src_rows = int(dst.shape[0]), int(src.shape[0])
-    max_rows = min(dst_rows, src_rows)
-    if max_rows <= 0:
+    if dst_rows <= 0 or src_rows <= 0:
         return
 
     # 标量交给 device；Python int 走这条也没问题（as_tensor 不产生 D2H）。
     off = torch.as_tensor(offset, device=dev).reshape(-1)[0].to(torch.long)
     size = torch.as_tensor(sz, device=dev).reshape(-1)[0].to(torch.long)
-    n = size.clamp(min=0, max=max_rows)
+    n = size.clamp(min=0, max=max(dst_rows, src_rows))
 
-    r = torch.arange(max_rows, device=dev, dtype=torch.long)
+    # dst 的每个槽位对应哪一行 src（越界会被 clamp，随后由 mask 丢弃）。
+    r = torch.arange(dst_rows, device=dev, dtype=torch.long)
     if offset_src:
-        src_idx = off + r
-        mask = (r < n) & (src_idx < src_rows)
-        dst_idx = r
+        rel = off + r                     # dst[0:] ← src[off:]
+        mask = (r < n) & (rel < src_rows)
     else:
-        dst_idx = off + r
-        mask = (r < n) & (dst_idx < dst_rows)
-        src_idx = r
+        rel = r - off                     # dst[off:] ← src[0:]
+        mask = (rel >= 0) & (rel < n) & (rel < src_rows)
 
-    src_sel = src.index_select(0, src_idx[mask])
-    dst[dst_idx[mask]] = src_sel
+    gathered = src[rel.clamp(0, src_rows - 1)]
+    mask = mask.reshape((dst_rows,) + (1,) * (dst.dim() - 1))
+    dst.copy_(torch.where(mask, gathered, dst))
 
 
 def get_paged_mqa_logits_metadata_torch(

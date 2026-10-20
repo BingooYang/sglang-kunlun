@@ -73,7 +73,18 @@ export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=True SGLANG_OPT_USE_JIT_NORM=True
 export SGLANG_OPT_USE_TOPK_V2=False SGLANG_TOPK_TRANSFORM_512_TORCH=False
 export SGLANG_OPT_USE_JIT_INDEXER_METADATA=False SGLANG_OPT_USE_TILELANG_INDEXER=False SGLANG_OPT_USE_AITER_INDEXER=False
 export SGLANG_OPT_USE_FUSED_STORE_CACHE=0 SGLANG_OPT_USE_COMPRESSOR_V2=False
-export SGLANG_OPT_USE_TILELANG_MHC_PRE=0 SGLANG_OPT_DEEPGEMM_HC_PRENORM=0 SGLANG_OPT_USE_TILELANG_MHC_POST=0
+export SGLANG_OPT_USE_TILELANG_MHC_PRE=0 SGLANG_OPT_USE_TILELANG_MHC_POST=0
+# `mhc_pre` / `mhc_post` 的散装 torch 实现（不调 split-k / tf32 / tilelang 融合 kernel）。
+# 参照 DSV4 在昆仑上跑通的 `hc_pre_torch_impl` / `hc_post_torch_impl`；2026-10-20
+# 融合路径在服务首次前向挂死（`kernel_0`），先默认走这条。
+# 要回到融合实现：EB5_MHC_TORCH_REF=0。
+export EB5_MHC_TORCH_REF=${EB5_MHC_TORCH_REF:-1}
+# `mhc_pre` 有两条实现：1 → `tf32_hc_prenorm_gemm`（纯 torch 拆解），
+# 0 → `mhc_pre_gemm_sqrsum_splitk_kernel`（split-k 拆解）。
+# 服务默认走 0；2026-10-20 实测它在 4 rank 首次前向会挂死（py-spy 停在 `kernel_0`
+# 的 strided `.contiguous()`），而 1 那条路在单测里稳定通过，所以留一个覆盖口子：
+#   SGLANG_OPT_DEEPGEMM_HC_PRENORM=1 bash run_eb5_kunlun.sh ...
+export SGLANG_OPT_DEEPGEMM_HC_PRENORM=${SGLANG_OPT_DEEPGEMM_HC_PRENORM:-0}
 export SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=0
 export SGLANG_HACK_FLASHMLA_BACKEND=kunlun SGLANG_FIX_DSV4_BASE_MODEL_LOAD=1 SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 SGLANG_DSV4_FP4_EXPERTS=0
 export SGLANG_IS_FLASHINFER_AVAILABLE=False SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1

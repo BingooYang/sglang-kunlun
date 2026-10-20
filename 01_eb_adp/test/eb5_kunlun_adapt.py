@@ -67,12 +67,35 @@ def mhc_post_tilelang(a, b, c, d, x, hc: int, hidden: int, n_thr: int = 128, h_b
 # --------------------------------------------------------------------------- #
 # hc_pre
 # --------------------------------------------------------------------------- #
+def _mhc_single_split() -> bool:
+    """是否把 mhc_pre 的 split-K 折叠成一次 matmul（``EB5_MHC_SINGLE_SPLIT=1``）。
+
+    `mhc_pre_big_fuse_with_norm_tilelang` 对 ``gemm_out_mul`` / ``gemm_out_sqrsum``
+    都是**沿 split 维求和**（``[:n_splits].sum(0)``），所以只把完整结果写进 split 0、
+    其余置零，数学上与原 split-K 等价（仅 fp32 累加顺序不同，故默认关闭，
+    确定性推理场景不要开）。
+
+    为什么要这个开关：split 循环里每个操作数都是非连续切片
+    （``xf[:, lo:hi]`` / ``ff[:, lo:hi].t()``），2026-10-20 服务首次前向就是卡在
+    这条路径的 strided matmul/`.contiguous()` 上（py-spy 可复现）。
+    折叠后只剩一次连续 matmul。
+    """
+    return os.environ.get("EB5_MHC_SINGLE_SPLIT", "0") == "1"
+
+
 def tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=None):
     """torch 拆解（split-K）：out[s] = x[:, chunk] @ fn[:, chunk].T；sqrsum[s] = Σ x[:,chunk]²。"""
     xf = x.float()
     ff = fn.float()
     k = xf.shape[-1]
     ns = out.shape[0]
+    if _mhc_single_split():
+        # 消费者只对 split 求和，等价于一次全量 matmul。
+        out.zero_()
+        sqrsum.zero_()
+        out[0].copy_(xf @ ff.t().contiguous())
+        sqrsum[0].copy_((xf * xf).sum(-1))
+        return None
     chunk = math.ceil(k / ns) if ns > 0 else k
     for s in range(ns):
         lo, hi = s * chunk, min((s + 1) * chunk, k)
@@ -130,6 +153,13 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
         # kernel 里 out_frag 宽 32、只写前 hc_mult3 列；剩下的列在 big_fuse 里被
         # 求和但从不读取，这里显式清零避免 empty() 的垃圾值参与求和。
         out_partial[:, :n, :].zero_()
+        if _mhc_single_split():
+            # big_fuse 只沿 split 求和 → 完整结果写 split 0、其余置零即可。
+            # 只做一次连续 matmul，避开 32 次 strided 切片（见 `_mhc_single_split`）。
+            sqrsum_partial.zero_()
+            out_partial[0, :n, :j].copy_(xf @ f[:j].t().contiguous())
+            sqrsum_partial[0, :n].copy_((xf * xf).sum(-1))
+            return None
         for s in range(split_k):
             lo = s * split_size
             hi = lo + split_size
@@ -184,7 +214,12 @@ def mhc_pre_big_fuse_with_norm_tilelang(
         gemm_last_dim = hc_mult3
 
     sq = gemm_out_sqrsum[:n_splits].float().sum(0)                     # (n,)
-    rms = torch.rsqrt(sq / (hc_mult * hidden_size) + rms_eps)          # (n,)
+    if mhc_align_fleet:
+        # PaddleFleet 的 mHC：eps 在 sqrt **外**（`norm/sqrt(K)+eps`），
+        # 与 HF/DSV4 的 `rsqrt(mean+eps)` 不同。见 mhc.py 的 tilelang 分支。
+        rms = 1.0 / (torch.sqrt(sq / (hc_mult * hidden_size)) + rms_eps)
+    else:
+        rms = torch.rsqrt(sq / (hc_mult * hidden_size) + rms_eps)      # (n,)
     mixes = gemm_out_mul[:n_splits, :, :gemm_last_dim].float().sum(0) * rms.unsqueeze(-1)
 
     # post_mix: sigmoid(mixes[hc:2hc]*scale[1] + base[hc:2hc]) * post_mult
@@ -217,6 +252,140 @@ def mhc_pre_big_fuse_with_norm_tilelang(
         (ol_bf.float() * rsqrt_norm.unsqueeze(-1) * norm_weight.float()).to(layer_input.dtype)
     )
     return None
+
+
+def mhc_post_torch_ref(
+    x,
+    residual,
+    post_layer_mix,
+    comb_res_mix,
+):
+    """``sglang.kernels.ops.layernorm.mhc.mhc_post`` 的**散装 torch 实现**。
+
+    与 fork 自带的 ``_mhc_post_torch`` 同一公式（DSV4 在昆仑上走的也是它）：
+
+        out[n,hco,h] = post[n,hco] * x[n,h] + Σ_hci comb[n,hci,hco] * residual[n,hci,h]
+
+    ``post_layer_mix`` 允许 ``(n, hc, 1)``（EB5 的调用形状）或 ``(n, hc)``。
+    用 ``EB5_MHC_TORCH_REF=1`` 打开（见 `apply()`），与 `mhc_pre_torch_ref` 配套，
+    完全绕开 ``mhc_post_tilelang`` 融合 kernel。
+    """
+    if post_layer_mix.dim() == residual.dim():   # (n, hc, 1)
+        post = post_layer_mix
+    else:                                        # (n, hc)
+        post = post_layer_mix.unsqueeze(-1)
+    out = post * x.unsqueeze(1) + (
+        comb_res_mix.unsqueeze(-1) * residual.unsqueeze(2)
+    ).sum(dim=1)
+    return out.type_as(x)
+
+
+def mhc_pre_torch_ref(
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
+    n_splits: int = 1,
+    n_splits_pre: int = 32,
+    *,
+    norm_weight=None,
+    norm_eps=None,
+    mhc_align_fleet: bool = False,
+    mhc_align_accum_order: bool = False,
+):
+    """``sglang.kernels.ops.layernorm.mhc.mhc_pre`` 的**散装 torch 实现**。
+
+    参照 DSV4 在昆仑上验证过的那条路（`deepseek_v4.py::hc_pre_torch_impl`）：
+    不调任何融合 kernel，只做
+
+        mixes_raw = F.linear(x_flat, fn)          # 一次连续 GEMM
+        sqrsum    = Σ x_flat²
+        rms       = align_fleet ? 1/(sqrt(sq/D)+eps) : rsqrt(sq/D+eps)
+        post/comb/layer_input = <纯 torch 的 sinkhorn + rmsnorm>
+
+    用 ``EB5_MHC_TORCH_REF=1`` 打开（见 `apply()`）。为什么要它：EB5 走的是
+    fork 的融合 ``mhc_pre``（split-k ``kernel_0`` / ``tf32_hc_prenorm_gemm``），
+    2026-10-20 服务首次前向在这条路径上挂死；DSV4 同一台机器上从未调用过它，
+    而是走纯 torch，所以能跑通。
+
+    语义与 `mhc.py::mhc_pre` 对齐（返回形状 ``(*outer, hc, 1)`` /
+    ``(*outer, hc, hc)`` / ``(*outer, hidden)``），GEMM 之后的计算复用
+    `mhc_pre_big_fuse_with_norm_tilelang`（已是逐行核对过的纯 torch 拆解）。
+    """
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    outer_shape = residual.shape[:-2]
+    hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
+
+    residual_flat = residual.reshape(-1, hc_mult, hidden_size)
+    num_tokens = residual_flat.shape[0]
+
+    post_mix = torch.empty(
+        num_tokens, hc_mult, dtype=torch.float32, device=residual.device
+    )
+    comb_mix = torch.empty(
+        num_tokens, hc_mult * hc_mult, dtype=torch.float32, device=residual.device
+    )
+    layer_input = torch.empty(
+        num_tokens, hidden_size, dtype=residual.dtype, device=residual.device
+    )
+    if num_tokens == 0:
+        return (
+            post_mix.view(*outer_shape, hc_mult, 1),
+            comb_mix.view(*outer_shape, hc_mult, hc_mult),
+            layer_input.view(*outer_shape, hidden_size),
+        )
+
+    assert fn.shape[0] == hc_mult3, (
+        f"fn.shape[0]={fn.shape[0]} != hc_mult3={hc_mult3}"
+    )
+    assert fn.shape[1] == hc_mult * hidden_size, (
+        f"fn.shape[1]={fn.shape[1]} != hc_mult*hidden_size={hc_mult * hidden_size}"
+    )
+
+    # 一次连续 GEMM（`F.linear` 正是 DSV4 在昆仑上跑通的写法）。
+    x_flat = residual_flat.reshape(num_tokens, hc_mult * hidden_size).float()
+    gemm_out_mul = torch.nn.functional.linear(x_flat, fn.float())
+    gemm_out_sqrsum = (x_flat * x_flat).sum(-1)
+
+    if norm_weight is None:
+        # 与 fork 的 `mhc_pre_big_fuse_tilelang`（无 norm）等价：单位权重 + eps=0。
+        norm_weight = torch.ones(hidden_size, dtype=residual.dtype, device=residual.device)
+        norm_eps = 0.0
+
+    mhc_pre_big_fuse_with_norm_tilelang(
+        gemm_out_mul.unsqueeze(0),
+        gemm_out_sqrsum.unsqueeze(0),
+        hc_scale,
+        hc_base,
+        residual_flat,
+        post_mix,
+        comb_mix,
+        layer_input,
+        norm_weight,
+        hidden_size,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_eps,
+        1,                      # n_splits
+        hc_mult,
+        hc_mult3,               # gemm_last_dim
+        int(mhc_align_fleet),
+    )
+
+    return (
+        post_mix.view(*outer_shape, hc_mult, 1),
+        comb_mix.view(*outer_shape, hc_mult, hc_mult),
+        layer_input.view(*outer_shape, hidden_size),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -284,6 +453,15 @@ def apply() -> list[str]:
     _patch(mhc_mod, "mhc_pre_gemm_sqrsum_splitk_kernel", mhc_pre_gemm_sqrsum_splitk_kernel)
     _patch(mhc_mod, "mhc_pre_gemm_sqrsum_tilelang", mhc_pre_gemm_sqrsum_tilelang)
     _patch(mhc_mod, "_mhc_pre_gemm_sqrsum_dispatch", mhc_pre_gemm_sqrsum_dispatch)
+    # 可选：整体换成**散装 torch 实现**（不走 split-k / tf32 / big_fuse 的融合路径）。
+    # 2026-10-20 服务首次前向在 `kernel_0` 挂死；DSV4 在同一台机器上走纯 torch
+    # （`deepseek_v4.py::hc_pre_torch_impl`）能跑通，所以留这个开关。
+    if os.environ.get("EB5_MHC_TORCH_REF", "0") == "1":
+        _patch(mhc_mod, "mhc_pre", mhc_pre_torch_ref)
+        _patch(mhc_mod, "mhc_post", mhc_post_torch_ref)
+        # `ernie5.py` 在 import 期就 `from ...mhc import mhc_pre as _mhc_pre` /
+        # `mhc_post as _mhc_post`，`patch_everywhere` 会按对象身份把这类旧绑定
+        # 一并改掉（doc 第 8 节 ③）。
 
     dg_mod = "sglang.srt.layers.deep_gemm_wrapper.entrypoint"
     _patch(dg_mod, "tf32_hc_prenorm_gemm", tf32_hc_prenorm_gemm)

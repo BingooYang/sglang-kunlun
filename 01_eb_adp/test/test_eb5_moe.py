@@ -256,6 +256,36 @@ class TestMoeKernels(CustomTestCase):
         memcpy_triton(dst, src, 0, offset, sz, True)
         self.assertTrue(torch.equal(dst, src))
 
+        # 只有「整块拷贝」是不够的：适配层 2026-10-19 的 D2H 修复（`int(offset)` →
+        # device 侧）和 2026-10-20 的 mask 索引修复（`x[mask]` 隐式 D2H）都只在
+        # 非零 offset / 部分拷贝 / 两个方向下才走得到。这里按 `memcpy_cpu` 的语义
+        # （行窗口 + 截断 + 双向）逐个对照，offset/sz 一律用 **device 标量**。
+        for offset_src in (True, False):
+            for off, size in ((0, 8), (3, 4), (3, 99), (9, 4)):
+                with self.subTest(offset_src=offset_src, offset=off, size=size):
+                    dst = _rand(8, 32)
+                    src = _rand(12, 32)
+                    exp = dst.clone()
+                    dst_start = 0 if offset_src else off
+                    src_start = off if offset_src else 0
+                    end = min(
+                        min(dst_start + size, dst.shape[0]) - dst_start,
+                        min(src_start + size, src.shape[0]) - src_start,
+                    )
+                    if end > 0:
+                        exp[dst_start : dst_start + end] = src[
+                            src_start : src_start + end
+                        ]
+                    memcpy_triton(
+                        dst,
+                        src,
+                        0,
+                        torch.tensor(off, dtype=torch.int32, device=_DEVICE),
+                        torch.tensor(size, dtype=torch.int32, device=_DEVICE),
+                        offset_src,
+                    )
+                    self.assertTrue(torch.equal(dst, exp))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -114,7 +114,11 @@ echo "[run_eb5_kunlun] model=$MODEL_PATH port=$PORT gpus=$EB5_GPUS (n=$NGPU) log
 #   2) 对 launcher 用 -9 会留下 stuck kernel（doc/3 的「最重要的一条」）。
 # 换成 stop_kunlun.sh：先 TERM/INT，必要时只对空闲的纯 CPU worker 用 -9 解开
 # waitpid 死锁，launcher 绝不用 -9，最后校验 8 卡回到 0 MiB / 0%。
-if ! bash "$BINGOO/code/sglang-kunlun/01_eb_adp/tool/stop_kunlun.sh"; then
+# `SKIP_STOP=1`：别的卡上还有**别人**的任务时用（stop_kunlun 会按进程名清所有
+# sglang 进程，不管在哪几张卡）。此时调用方必须先自己确认目标卡干净。
+if [ "${SKIP_STOP:-0}" = "1" ]; then
+  echo "[run_eb5_kunlun] SKIP_STOP=1，跳过 stop_kunlun（请自行确认 $EB5_GPUS 上的残留）"
+elif ! STOP_GPUS=$EB5_GPUS bash "$BINGOO/code/sglang-kunlun/01_eb_adp/tool/stop_kunlun.sh"; then
   echo "[run_eb5_kunlun] ❌ 残留没清干净，放弃启动（不要硬上）"
   exit 1
 fi

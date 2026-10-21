@@ -32,6 +32,22 @@ import torch
 _LOG2E = 1.4426950408889634
 
 
+def _store_out(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+    """Write ``src`` into the pre-allocated ``dst`` without a D2D memcpy.
+
+    ``Tensor.copy_`` between same-dtype tensors lowers to XPU ``memcpy_1d``,
+    which spins inside ``xpu_launch_async`` when the stream is in CUDA-graph
+    capture mode (doc/7 §11: gdb caught exactly this in mHC pre).  An
+    elementwise add is recordable, so use it for these small out-params.
+    """
+    if src.dtype != dst.dtype:
+        src = src.to(dst.dtype)
+    if src.shape != dst.shape:
+        src = src.reshape(dst.shape)
+    torch.add(src, 0, out=dst)
+    return dst
+
+
 def _mhc_trace(tag: str) -> None:
     """``EB5_MHC_TRACE=1`` 时在每个子步骤后同步并打点，用来把挂死定位到具体 op。
 
@@ -695,8 +711,8 @@ def mhc_pre_torch_ref(
         hc_post_mult_value,
     )
     _mhc_trace("pre:sinkhorn-done")
-    post_mix.copy_(post)
-    comb_mix.copy_(comb.reshape(num_tokens, hc_mult * hc_mult))
+    _store_out(post_mix, post)
+    _store_out(comb_mix, comb.reshape(num_tokens, hc_mult * hc_mult))
 
     # 3) combine：与 DSV4 `hc_combine` 同式（fp32 累加后回 bf16）。
     y = (pre.unsqueeze(-1) * x_flat.view(num_tokens, hc_mult, hidden_size)).sum(dim=1)
@@ -705,10 +721,10 @@ def mhc_pre_torch_ref(
 
     # 4) 模型层 RMSNorm：DSV4 在 `hc_pre` 之后单独调 input_layernorm。
     if norm_weight is None:
-        layer_input.copy_(y)
+        _store_out(layer_input, y)
     else:
         assert norm_eps is not None, "norm_eps required when norm_weight is provided"
-        layer_input.copy_(_rmsnorm_torch(y, norm_weight, norm_eps))
+        _store_out(layer_input, _rmsnorm_torch(y, norm_weight, norm_eps))
     _mhc_trace("pre:norm")
 
     return (

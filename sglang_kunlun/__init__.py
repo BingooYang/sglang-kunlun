@@ -48,3 +48,14 @@ if _os.environ.get("EB5_COPY_TRACE") == "1":
     from sglang_kunlun.debug import collective_trace as _collective_trace_copy
 
     _collective_trace_copy.install_copy_trace()
+
+# Env-gated: keep EB5's per-layer DP collectives out of captured graph segments.
+if _os.environ.get("EB5_BREAKABLE_EAGER_COMM") == "1":
+    from sglang_kunlun.hooks.models import eb5_breakable_comm as _eb5_breakable_comm
+
+    _eb5_breakable_comm.install()
+
+if _os.environ.get("EB5_GRAPH_CAPTURE_BARRIER") == "1":
+    from sglang_kunlun.hooks.models import eb5_breakable_comm as _eb5_cap_barrier
+
+    _eb5_cap_barrier.install_capture_barrier()

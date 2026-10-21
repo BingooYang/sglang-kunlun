@@ -2792,3 +2792,182 @@ def topk_transform_512_v2(
         scores, seq_lens, page_tables, out_page_indices,
         512, None, page_size, True,
     )
+
+# --- DSA decode-graph metadata (page tables + seqlens) -----------------------
+# The upstream Triton kernel rebuilds, on every replay, the per-request kv/dsa
+# seqlens and the compact page table straight from ``req_to_token``.  It is the
+# only Triton kernel on the decode-graph replay path, so without a Kunlun
+# replacement ``kernel[grid]`` raises "'function' object is not subscriptable"
+# the moment the first graph batch is executed.
+@register_triton_op(
+    "sglang.kernels.ops.attention.dsa_kpool_metadata.decode",
+    "_fused_dsa_decode_metadata_kernel",
+)
+def fused_dsa_decode_metadata_torch(
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    page_table_1: torch.Tensor,
+    dsa_cache_seqlens: torch.Tensor,
+    dsa_cu_seqlens_k: torch.Tensor,
+    real_page_table: torch.Tensor,
+    seq_lens_stride: int,
+    req_pool_indices_stride: int,
+    req_to_token_stride_0: int,
+    req_to_token_stride_1: int,
+    page_table_stride_0: int,
+    page_table_stride_1: int,
+    real_page_table_stride_0: int,
+    real_page_table_stride_1: int,
+    bs: int,
+    max_len: int,
+    num_splits: int,
+    dsa_index_topk: int,
+    index_kpool: int,
+    real_page_size: int,
+    has_real_page_table: bool,
+    has_page_table_1: bool,
+    BLOCK_BS: int = 0,
+    BLOCK_N: int = 128,
+    **kwargs,
+) -> None:
+    """Torch replacement for ``_fused_dsa_decode_metadata_kernel``.
+
+    Same contract as upstream (see the Triton docstring): rows are written over
+    their live prefix only in the kernel; here the whole ``max_len`` width is
+    written vectorised, which is cheap at decode batch sizes and avoids a device
+    sync.  Consumers bound their reads by ``cache_seqlens`` so the tail is never
+    read.
+
+    Performance debt: this is host-issued torch indexing, not a fused kernel —
+    it runs once per graph replay (outside the captured graph).  See
+    ``doc/4. 临时D2H与性能债.md``.
+    """
+    del seq_lens_stride, req_pool_indices_stride, req_to_token_stride_0
+    del req_to_token_stride_1, page_table_stride_0, page_table_stride_1
+    del real_page_table_stride_0, real_page_table_stride_1, num_splits
+    del BLOCK_BS, BLOCK_N, kwargs
+
+    bs = int(bs)
+    if bs == 0:
+        cu_seqlens_k[:1].zero_()
+        dsa_cu_seqlens_k[:1].zero_()
+        return
+
+    index_kpool = int(index_kpool)
+    dsa_index_topk = int(dsa_index_topk)
+    real_page_size = int(real_page_size)
+    max_len = int(max_len)
+
+    seq = seq_lens[:bs].to(torch.int32)
+    if index_kpool <= 1:
+        dsa_seq = torch.clamp(seq, max=dsa_index_topk)
+    else:
+        # Keep the live partial pool after selecting pool-aligned history.
+        full_pool = (seq // index_kpool) * index_kpool
+        dsa_seq = torch.clamp(full_pool, max=dsa_index_topk) + (seq - full_pool)
+
+    cache_seqlens[:bs].copy_(seq)
+    cu_seqlens_k[:1].zero_()
+    cu_seqlens_k[1 : 1 + bs].copy_(torch.cumsum(seq, 0, dtype=torch.int32))
+    dsa_cache_seqlens[:bs].copy_(dsa_seq)
+    dsa_cu_seqlens_k[:1].zero_()
+    dsa_cu_seqlens_k[1 : 1 + bs].copy_(torch.cumsum(dsa_seq, 0, dtype=torch.int32))
+
+    if max_len <= 0:
+        return
+    # Gather only the first ``max_len`` columns: plain row indexing would copy
+    # the full (much wider) token-pool row for each request.
+    req_idx = req_pool_indices[:bs].to(torch.int64)
+    cols = torch.arange(max_len, device=req_to_token.device)
+    vals = req_to_token[req_idx[:, None], cols[None, :]].to(torch.int32)
+
+    if has_page_table_1:
+        page_table_1[:bs, :max_len].copy_(vals)
+    if has_real_page_table:
+        n_real = max_len // real_page_size
+        if n_real > 0:
+            real_vals = vals[:, ::real_page_size][:, :n_real] // real_page_size
+            real_page_table[:bs, :n_real].copy_(real_vals.to(real_page_table.dtype))
+
+
+# --- EB5 decode-graph：外层 fused_dsa_decode_metadata 的 torch 兜底 -----------
+# 背景：`fused_dsa_decode_metadata`（Triton，`kernel[grid](...)` 启动）只在
+# **decode CUDA graph 的 replay 路径**被调用（`dsa_backend._apply_cuda_graph_metadata`）。
+# 昆仑上 triton 被 stub 成普通函数，于是 `'function' object is not subscriptable`。
+# 上面 `fused_dsa_decode_metadata_torch` 只替换了内层 kernel，外层仍会 `[grid]`，
+# 所以这里在 **外层** 上也挂一个等价的 torch 实现。
+#
+# 开关：EB5_DSA_META_GRAPH_PATCH=1 生效；**默认关闭**，不影响其它任务。
+def _eb5_patch_outer_dsa_decode_metadata() -> None:
+    try:
+        decode_mod = importlib.import_module(
+            "sglang.kernels.ops.attention.dsa_kpool_metadata.decode"
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning("EB5 dsa meta graph patch skipped: %r", exc)
+        return
+
+    inner = fused_dsa_decode_metadata_torch
+
+    def _torch_outer(
+        seq_lens,
+        req_pool_indices,
+        req_to_token,
+        cache_seqlens,
+        cu_seqlens_k,
+        page_table_1,
+        dsa_cache_seqlens,
+        dsa_cu_seqlens_k,
+        real_page_table,
+        bs,
+        max_len,
+        dsa_index_topk,
+        real_page_size,
+        index_kpool=1,
+    ):
+        # 与上游 outer 完全同签名；这里只做「不需要 grid」的等价调用。
+        has_real_page_table = real_page_size > 1
+        has_page_table_1 = page_table_1 is not None
+        if not has_page_table_1:
+            page_table_1 = real_page_table
+        return inner(
+            seq_lens,
+            req_pool_indices,
+            req_to_token,
+            cache_seqlens,
+            cu_seqlens_k,
+            page_table_1,
+            dsa_cache_seqlens,
+            dsa_cu_seqlens_k,
+            real_page_table,
+            seq_lens.stride(0),
+            req_pool_indices.stride(0),
+            req_to_token.stride(0),
+            req_to_token.stride(1),
+            page_table_1.stride(0),
+            page_table_1.stride(1),
+            real_page_table.stride(0) if has_real_page_table else 0,
+            real_page_table.stride(1) if has_real_page_table else 0,
+            bs,
+            max_len,
+            1,
+            dsa_index_topk,
+            index_kpool,
+            real_page_size,
+            has_real_page_table,
+            has_page_table_1,
+        )
+
+    _torch_outer._eb5_torch_patched = True
+    decode_mod.fused_dsa_decode_metadata = _torch_outer
+    logger.info(
+        "EB5 dsa meta graph patch: outer fused_dsa_decode_metadata -> torch "
+        "(EB5_DSA_META_GRAPH_PATCH=1)"
+    )
+
+
+if os.environ.get("EB5_DSA_META_GRAPH_PATCH") == "1":
+    _eb5_patch_outer_dsa_decode_metadata()

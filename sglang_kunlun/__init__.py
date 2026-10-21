@@ -36,3 +36,10 @@ from sglang_kunlun.bootstrap import optional_kernel_stubs as _optional_stubs
 _optional_stubs.install_all()
 
 __all__ = ["_kunlun_pre_shim"]
+# Debug-only, env-gated: per-rank collective trace for capture-hang triage.
+import os as _os
+
+if _os.environ.get("EB5_COLLECTIVE_TRACE") == "1":
+    from sglang_kunlun.debug import collective_trace as _collective_trace
+
+    _collective_trace.install()

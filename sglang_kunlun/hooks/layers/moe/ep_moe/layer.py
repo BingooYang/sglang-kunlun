@@ -157,6 +157,51 @@ def _apply_masked_activation(
     return down_input
 
 
+def _situ_and_per_token_quant_I8(
+    gateup_output: torch.Tensor,
+    down_input: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    moe_runner_config,
+) -> None:
+    """SiTU + per-token INT8 quant for the DeepEP-LL masked path.
+
+    ``kunlun_ops`` only ships the fused **SiLU**+quant variant, while EB5 /
+    Kimi-K3 checkpoints run SiTU.  The activation therefore goes through
+    ``_situ_and_mul_masked`` into a bf16 scratch buffer and is quantized with the
+    same ``quant2d`` primitive the dense INT8 path uses (per-token raw absmax,
+    which is the convention ``m_grouped_gemm_I8_I8_bf16_nt_masked`` expects).
+
+    Rows past ``masked_m`` are zeroed *before* quantizing: they hold garbage from
+    the padded GroupGemm tile, and an inf/nan there would poison the row scale.
+
+    Performance debt: two extra full-tile passes per MoE layer per decode step
+    (see ``doc/4. 临时D2H与性能债.md``) — a fused ``situ_and_per_token_quant_I8``
+    kernel would remove them.
+    """
+    import kunlun_ops
+
+    num_groups, m, n2 = gateup_output.shape
+    n = n2 // 2
+    act = torch.empty(
+        (num_groups, m, n),
+        device=gateup_output.device,
+        dtype=gateup_output.dtype,
+    )
+    _situ_and_mul_masked(gateup_output, act, moe_runner_config)
+    valid = torch.arange(m, device=act.device).view(1, m, 1) < masked_m.to(
+        torch.int64
+    ).view(num_groups, 1, 1)
+    act.masked_fill_(~valid, 0.0)
+
+    flat = act.view(num_groups * m, n)
+    q = torch.empty(flat.shape, dtype=torch.int8, device=flat.device)
+    s = torch.empty((flat.shape[0], 1), dtype=torch.float32, device=flat.device)
+    kunlun_ops.quant2d(flat, q, s, force_sdnn=True)
+    down_input.copy_(q.view(num_groups, m, n))
+    down_input_scale.copy_(s.view(num_groups, m, 1))
+
+
 class _DSV4ClampedSiluAndMul(torch.nn.Module):
     """SiluAndMul with the DeepSeek-V4 swiglu_limit clamp on the gate/up inputs.
 
@@ -1331,7 +1376,10 @@ class DeepEPMoE(FusedMoE):
             return self.forward_deepgemm_masked_bfp16(
                 hidden_states_fp8, masked_m, expected_m
             )
-        assert self.moe_runner_config.activation == "silu"
+        activation = str(self.moe_runner_config.activation or "silu").lower()
+        assert activation in ("silu", "situ"), (
+            f"INT8 DeepEP-LL masked path supports silu/situ, got {activation!r}"
+        )
         # GroupGemm-0
         num_groups, m, k = hidden_states_fp8[0].size()
         n = self.w13_weight.size(1)
@@ -1375,10 +1423,18 @@ class DeepEPMoE(FusedMoE):
             device=gateup_output.device,
             dtype=torch.float32,
         )
-        kunlun_ops.silu_and_per_token_group_quant_I8(gateup_output,
-                                          down_input,
-                                          down_input_scale,
-                                          masked_m)
+        if activation == "situ":
+            _situ_and_per_token_quant_I8(
+                gateup_output,
+                down_input,
+                down_input_scale,
+                masked_m,
+                self.moe_runner_config,
+            )
+        else:
+            kunlun_ops.silu_and_per_token_group_quant_I8(
+                gateup_output, down_input, down_input_scale, masked_m
+            )
         del gateup_output
 
         # GroupGemm-1

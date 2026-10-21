@@ -67,6 +67,12 @@ MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-8}
 # `xspeedgate_ops.set_k_and_s_v4`，与 DSV4 已跑通的那条同类。
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-bfloat16}
 EXTRA_ARGS=${EXTRA_ARGS:-}
+# decode CUDA graph：默认关闭；开启示例见 01_eb/README.md「Decode CUDA graph」。
+# 注意 `--deepep-mode normal` 会被框架强制关图，开图必须 low_latency。
+GRAPH_ARGS=${GRAPH_ARGS:---disable-cuda-graph}
+# EB5 的 DSA decode metadata 外层仍是 Triton `kernel[grid]`；置 1 用 torch 兜底。
+# 只在 EB5 进程里生效，不开图时也无副作用。
+export EB5_DSA_META_GRAPH_PATCH=${EB5_DSA_META_GRAPH_PATCH:-1}
 LOG=$BINGOO/logs/eb5_kunlun_$(date +%Y%m%d_%H%M%S).log
 mkdir -p "$BINGOO/logs"
 
@@ -158,7 +164,7 @@ nohup sglang-kunlun-launch \
   --kv-cache-dtype "$KV_CACHE_DTYPE" \
   --mem-fraction-static "$MEM_FRACTION" \
   --max-running-requests "$MAX_RUNNING_REQUESTS" \
-  --disable-cuda-graph \
+  ${GRAPH_ARGS} \
   --swa-full-tokens-ratio 0.1 \
   --tp-size "$NGPU" --dp-size "$NGPU" --ep-size "$NGPU" \
   "${OVERRIDE_ARG[@]}" \

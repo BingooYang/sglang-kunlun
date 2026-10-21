@@ -139,3 +139,34 @@ bash "$W/code/xy/sglang-kunlun/01_eb/tool/stop_kunlun.sh"
 - 4/4 请求 HTTP 200，单请求约 25–44 s
 - 日志：`applied 142 EB5 Kunlun patches from sglang_kunlun.eb5_adapt`
 - 致命错误计数 0
+
+## 7. Decode CUDA graph（实验）
+
+当前 overlay 已补上源仓库 doc/7 定位的漏补点：
+
+- `eb5_adapt/kernels/kernel_ops.py` 增加 `fused_dsa_decode_metadata` 的内层 + 外层 torch 兜底；
+- 启动器默认设置 `EB5_DSA_META_GRAPH_PATCH=1`（不开图时也无副作用）。
+
+单卡已验证（8L / INT8 / tp1 / dp1 / ep1 / 不走 DeepEP）：
+
+```bash
+cd "$W"
+LAYERS=8 EB5_GPUS=0 CONTEXT_LENGTH=8192 MEM_FRACTION=0.85 \
+GRAPH_ARGS="--cuda-graph-backend-decode full --cuda-graph-max-bs-decode 2" \
+EXTRA_ARGS="--quantization blockwise_int8 --moe-a2a-backend none --ep-size 1 --disable-overlap-schedule --deepep-mode low_latency --dsa-topk-backend torch" \
+bash "$W/code/xy/sglang-kunlun/01_eb/tool/run_eb5_int8.sh" \
+     "$W/models/hf_checkpoint-48800" 30110
+```
+
+判据：
+
+- 日志出现 `Capture target decode CUDA graph begin`
+- 日志 / `server_args` 里 `cuda_graph` 的 decode 不再是 0
+- `bash 01_eb/tool/verify_eb5.sh 30110` 通过 4/4
+
+注意：
+
+- `--deepep-mode normal` 会被框架（`moe_hook.py`）强制关图，开图必须 `low_latency`。
+- 必须加 `--disable-overlap-schedule`。
+- INT8 wrapper 会先塞一个 `--deepep-mode normal`，上面的 `EXTRA_ARGS` 里再给 `low_latency`，argparse 取最后一个值。
+- **多卡（DeepEP low_latency + XCCL）目前仍可能在捕获期挂死**（源仓库 doc/7 §4 F3），所以默认 8 卡整网仍用 `--disable-cuda-graph`；单卡验证通过后再推进多卡。

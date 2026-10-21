@@ -161,6 +161,29 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
 
         return SGLangBackend
 
+    # ------------------------------------------------------------------
+    # Profiling
+    # ------------------------------------------------------------------
+    def get_torch_profiler_activity_str(self) -> str:
+        """Torch-profiler activity name for Kunlun.
+
+        Kunlun XPU presents as a CUDA device under ``torch_xmlir``, so the
+        torch profiler records device-side kernels on the CUDA activity.
+        ``profiler_manager`` gates the out-of-tree activity on
+        ``hasattr(ProfilerActivity, <this string>)``; "CUDA" always exists.
+
+        NOTE: device-side tracing additionally requires
+        ``XPU_ENABLE_PROFILER_TRACING=1`` in the environment; without it the
+        XPU CUPTI shim aborts when the profiler starts.
+        """
+        return "CUDA"
+
+    def get_torch_profiler_activity(self):
+        """Return the ``ProfilerActivity`` enum paired with the string above."""
+        import torch
+
+        return torch.profiler.ProfilerActivity.CUDA
+
 
 def activate() -> str | None:
     """Entry-point activator.

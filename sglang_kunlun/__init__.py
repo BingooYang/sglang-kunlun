@@ -43,3 +43,8 @@ if _os.environ.get("EB5_COLLECTIVE_TRACE") == "1":
     from sglang_kunlun.debug import collective_trace as _collective_trace
 
     _collective_trace.install()
+
+if _os.environ.get("EB5_COPY_TRACE") == "1":
+    from sglang_kunlun.debug import collective_trace as _collective_trace_copy
+
+    _collective_trace_copy.install_copy_trace()

@@ -162,6 +162,33 @@ def _seqlens_cpu(metadata, forward_batch, *, expanded: bool):
     return src.detach().to("cpu", torch.int32)
 
 
+
+def _cu_seqlens_q_pair(metadata, forward_batch):
+    """返回 (cpu, device) 两份 ``cu_seqlens_q``（query 的累计长度）。
+
+    fork 的 ``DSAIndexerMetadata`` 没有 ``get_cu_seqlens_q`` / ``*_cpu``：
+    ragged（长 prefill，seq_len > index_topk）路径需要它，否则必
+    ``AttributeError``。优先用 ``metadata.attn_metadata.cu_seqlens_q``，
+    其次由 ``forward_batch.extend_seq_lens_cpu`` 现算（零 D2H）。
+    """
+    attn_md = getattr(metadata, "attn_metadata", None)
+    cu = getattr(attn_md, "cu_seqlens_q", None) if attn_md is not None else None
+    if cu is not None:
+        cu_i32 = cu.to(torch.int32)
+        return cu_i32.detach().to("cpu"), cu_i32
+    lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    assert lens is not None, (
+        "ragged indexer requires forward_batch.extend_seq_lens_cpu "
+        "or metadata.attn_metadata.cu_seqlens_q"
+    )
+    cu_cpu = torch.nn.functional.pad(
+        torch.cumsum(lens.to(torch.int32), 0, dtype=torch.int32), (1, 0)
+    )
+    dev = getattr(forward_batch, "seq_lens", None)
+    dev = dev.device if isinstance(dev, torch.Tensor) else None
+    return cu_cpu, (cu_cpu.to(dev) if dev is not None else cu_cpu)
+
+
 def _extend_lens_cpu(metadata):
     """本 batch 每请求的 query 长度列表（fork 上叫 ``get_dsa_extend_len_cpu``）。
 
@@ -739,13 +766,9 @@ def _get_topk_ragged(
 
     need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
 
-    context_q_lens_xpu = metadata.get_cu_seqlens_q()
-    # fork 的 ``DSAIndexerMetadata`` 没有 ``get_cu_seqlens_q_cpu``（只有 xpu 版）。
-    _cu_cpu_fn = getattr(metadata, "get_cu_seqlens_q_cpu", None)
-    context_q_lens_cpu = (
-        _cu_cpu_fn()
-        if _cu_cpu_fn is not None
-        else metadata.get_cu_seqlens_q().detach().to("cpu", torch.int32)
+    # fork 没有 get_cu_seqlens_q / *_cpu：走兼容层（attn_metadata 优先，其次现算）
+    context_q_lens_cpu, context_q_lens_xpu = _cu_seqlens_q_pair(
+        metadata, forward_batch
     )
     context_k_lens_cpu, context_k_lens_xpu = _make_cu_seqlens_from_lens(
         indexer_seq_lens_cpu, device
@@ -780,7 +803,11 @@ def _get_topk_ragged(
         assert logits.shape[0] == len(seq_lens_expanded)
 
         page_table_1 = metadata.get_page_table_1()
-        cu_seqlens_q_topk = metadata.attn_metadata.cu_seqlens_q
+        cu_seqlens_q_topk = getattr(
+            getattr(metadata, "attn_metadata", None), "cu_seqlens_q", None
+        )
+        if cu_seqlens_q_topk is None:
+            cu_seqlens_q_topk = context_q_lens_xpu
         dst_page_table = logits.new_empty(
             (logits.size(0), self.index_topk), dtype=torch.int32
         )

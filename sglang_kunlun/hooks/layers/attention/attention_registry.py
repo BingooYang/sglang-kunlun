@@ -37,14 +37,14 @@ if register_attention_backend is not None:
     @register_attention_backend("kunlun")
     def create_kunlun_attention_backend(runner):
         """Lazy-construct the Kunlun attention backend."""
-        from .kunlun_backend import KunlunAttentionBackend
+        from sglang_kunlun.eb5_adapt.hooks.layers.attention.kunlun_backend import KunlunAttentionBackend
 
         return KunlunAttentionBackend(runner)
 
     @register_attention_backend("kunlun_dsv4")
     def create_kunlun_dsv4_attention_backend(runner):
         """Lazy-construct the Kunlun attention backend."""
-        from .deepseek_v4_backend import KunlunDeepseekV4AttnBackend
+        from sglang_kunlun.eb5_adapt.hooks.layers.attention.deepseek_v4_backend import KunlunDeepseekV4AttnBackend
 
         logger.info("Using KunlunDeepseekV4AttnBackend for dsv4 attention backend (kunlun).")
         return KunlunDeepseekV4AttnBackend(runner)

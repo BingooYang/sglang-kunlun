@@ -781,7 +781,7 @@ def fused_q_norm_rope(q_input, q_output, eps, freqs_cis, positions):
 # --------------------------------------------------------------------------- #
 # wo_a 低秩投影：替代 torch.einsum 的通用收缩
 # --------------------------------------------------------------------------- #
-def _apply_wo_a_bf16_matmul_torch(o, wo_a, is_decode=False):
+def _apply_wo_a_bf16_matmul_torch(o, wo_a, is_decode=False, **_ignored):
     """``[T,G,D] x [G,R,D] -> [T,G,R]``：group 作 batch 的 bmm + 按 token 分块。
 
     fork 的兜底是 ``torch.einsum("tgd,grd->tgr")``。通用收缩在昆仑上会把

@@ -751,7 +751,11 @@ def _get_topk_ragged(
         k_fp8_list.append(k_fp8)
         k_scale_list.append(k_scale)
 
-    k_fp8 = torch.cat(k_fp8_list, dim=0)
+    # index-K 池按 uint8 存（deepseek_v4_memory_pool.index_k_with_scale_buffer_dtype），
+    # 而 vendor 的 I8_mqa_logits 只收 int8（2026-10-21 实测：
+    # ``ValueError: ... left operand=unsigned char, right T=int8``）。
+    # 同 itemsize 的 view 是零拷贝位模式重解释，语义不变；与 paged 路径一致。
+    k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.int8)
     k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
     if q_fp8.dtype is torch.int8:
         k_scale /= 127

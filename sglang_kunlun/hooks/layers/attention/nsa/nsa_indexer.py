@@ -457,8 +457,20 @@ def _indexer_torch_ref(
     if q_fp8.dtype is torch.int8:
         weights /= 127
 
-    assert forward_batch.seq_lens_cpu is not None
-    if len(forward_batch.seq_lens_cpu) == 0:
+    # fork 只在普通 decode 的 batch 上填 ``ForwardBatch.seq_lens_cpu``；
+    # TARGET_VERIFY / DRAFT_EXTEND_V2 的 batch 只有 device 侧（expanded）的
+    # seq_lens，于是这里原来的硬 assert 在开 EAGLE 的第一次 verify 就炸
+    # （2026-10-21 12:12 `AssertionError` @ nsa_indexer.py:460）。
+    # 空 batch 判定改用 device 侧 seq_lens；expanded 的 host 副本由
+    # `_get_topk_paged` 自己通过 `_seqlens_cpu(..., expanded=True)` 取（零 D2H 优先
+    # 走 metadata 的 `*_cpu` 访问器，没有才回退一次 `.cpu()`）。
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    if seq_lens_cpu is not None:
+        is_empty_batch = len(seq_lens_cpu) == 0
+    else:
+        seq_lens_dev = getattr(forward_batch, "seq_lens", None)
+        is_empty_batch = seq_lens_dev is None or seq_lens_dev.numel() == 0
+    if is_empty_batch:
         return torch.full(
             (x_meta.shape[0], self.index_topk), -1, dtype=torch.int, device=x_meta.device
         )

@@ -342,6 +342,42 @@ index b7639efda5..23a67f2701 100644
 +    output.copy_(out)
 +    output_lengths.copy_((indexer_len + swa_len).to(torch.int32))
      return output, output_lengths
+diff --git a/python/sglang/srt/internal/layers/attention/mla_hca/pool_patch.py b/python/sglang/srt/internal/layers/attention/mla_hca/pool_patch.py
+index 27b13d2827..94f7d0a19c 100644
+--- a/python/sglang/srt/internal/layers/attention/mla_hca/pool_patch.py
++++ b/python/sglang/srt/internal/layers/attention/mla_hca/pool_patch.py
+@@ -458,6 +458,14 @@ def _patch_build_mla_kv_pool(original_fn, self, *args, **kwargs):
+     """For both DSA flavors of the draft: the flashmla sparse kernels are
+     hardwired to page 64 and a real ckpt needs the index-k cache, so build the
+     page-64 pool mirroring the target's full sub-pool; all else passes through.
++
++    Registered on **both** MLA-pool builders: `_build_mla_kv_pool` is what an
++    in-tree platform calls, while an out-of-tree platform (kunlun) takes the
++    `is_out_of_tree()` branch first and calls `_build_oot_mla_kv_pool`. Hooking
++    only the former made the EB5 MTP draft fall through to the stock MLA pool
++    and die there (`MLATokenToKVPool.__init__() got an unexpected keyword
++    argument 'index_head_dim'`, 2026-10-21 11:28). The hook already accepts the
++    keyword-only signature of both, so the same function serves each.
+     """
+     mode = (
+         _nextn_draft_dsa_mode(self.model_config.hf_config)
+@@ -554,9 +562,10 @@ def register_mla_hca_kv_pool_patch() -> None:
+         _patch_build_dsv4_kv_pool,
+         HookType.AROUND,
+     )
+-    HookRegistry.register(
+-        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator."
+-        "_build_mla_kv_pool",
+-        _patch_build_mla_kv_pool,
+-        HookType.AROUND,
+-    )
++    for _mla_pool_builder in ("_build_mla_kv_pool", "_build_oot_mla_kv_pool"):
++        HookRegistry.register(
++            "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator."
++            + _mla_pool_builder,
++            _patch_build_mla_kv_pool,
++            HookType.AROUND,
++        )
 diff --git a/python/sglang/srt/internal/layers/quantization/blockwise_int8_patch.py b/python/sglang/srt/internal/layers/quantization/blockwise_int8_patch.py
 new file mode 100644
 index 0000000000..99510b5078

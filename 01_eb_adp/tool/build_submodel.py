@@ -15,6 +15,14 @@ EB5 完整权重 573 GB：8 卡时每卡 ~72 GB（可用 96 GB），**4 卡时�
    本权重该层在 **index 7**，所以最小可用是 **8 层**；4 层会报
    `EB5 MLA+HCA: the full-token budget was not captured`。
 
+注意：**MTP 层不在本脚本的产物里**
+----------------------------------
+过滤条件是 `layers.<n>`，所以整网的 MTP 层（`model.layers.<num_hidden_layers>.*`，
+`compress_ratios` 末尾那个 `-2`）会被一起裁掉 —— 想开
+`--speculative-algorithm EAGLE` / NextN 时 draft 一个权重都读不到。
+MTP 用配套的 `tool/build_mtp_draft.py` 单独取成一个 draft 目录，
+见 `doc/8. EB5 8L MTP 适配.md`。
+
 用法
 ----
     python tool/build_submodel.py \

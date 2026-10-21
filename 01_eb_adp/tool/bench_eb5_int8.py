@@ -41,7 +41,7 @@ LONG_UNIT = (
     "In a distributed inference system, the scheduler assigns requests to data "
     "parallel ranks, and each rank executes its own prefill and decode steps. "
 )
-MEM_RE = re.compile(r"(\d+)MiB\s*/\s*(\d+)MiB")
+MEM_RE = re.compile(r"(\d+)MiB\s*/\s*98304MiB")  # 只看整卡显存行，跳过 L3 的 x/96MiB
 UTIL_RE = re.compile(r"(\d+)%\s+Default")
 
 
@@ -461,12 +461,12 @@ def render_markdown(groups: List[GroupStat], cfg: Dict[str, Any]) -> str:
     mem_groups = [g for g in main if g.peak_mem]
     if mem_groups:
         lines.append("### 显存 / 利用率峰值（`xpu-smi`，每组约 2 s 采样一次）\n")
-        lines.append("| 组 | 并发 | 显存峰值 MiB (min–max) | 显存峰值 GiB | util 峰值 |")
+        lines.append("| 组 | 并发 | 显存峰值 MiB | 显存峰值 GiB | util 峰值 |")
         lines.append("|---|---:|---:|---:|---:|")
         for g in mem_groups:
-            lo, hi = min(g.peak_mem), max(g.peak_mem)
+            hi = max(g.peak_mem)
             lines.append(
-                f"| {g.name} | {g.concurrency} | {lo}–{hi} | {hi / 1024:.2f} | "
+                f"| {g.name} | {g.concurrency} | {hi} | {hi / 1024:.2f} | "
                 f"{max(g.peak_util) if g.peak_util else '—'}% |"
             )
         lines.append("")

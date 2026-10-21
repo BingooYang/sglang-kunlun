@@ -59,3 +59,8 @@ if _os.environ.get("EB5_GRAPH_CAPTURE_BARRIER") == "1":
     from sglang_kunlun.hooks.models import eb5_breakable_comm as _eb5_cap_barrier
 
     _eb5_cap_barrier.install_capture_barrier()
+
+if _os.environ.get("EB5_GRAPH_CAPTURE_LAYERS"):
+    from sglang_kunlun.hooks.models import eb5_breakable_comm as _eb5_layer_limit
+
+    _eb5_layer_limit.install_capture_layer_limit()

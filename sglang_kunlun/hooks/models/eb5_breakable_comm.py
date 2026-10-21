@@ -141,3 +141,41 @@ def install_capture_barrier() -> bool:
     cls.capture = capture
     logger.warning("eb5_capture_barrier: installed around DecodeCudaGraphRunner.capture")
     return True
+
+def install_capture_layer_limit() -> bool:
+    """Diagnostic only: capture a graph with only the first N decoder layers.
+
+    ``EB5_GRAPH_CAPTURE_LAYERS=K`` truncates the layer loop *while the stream is
+    capturing*, so the resulting graph is incomplete (never replay it) — the
+    point is to bisect which layer first makes the multi-rank capture hang.
+    """
+    raw = os.environ.get("EB5_GRAPH_CAPTURE_LAYERS")
+    if not raw:
+        return False
+    layers = int(raw)
+    try:
+        import torch
+        from sglang.srt.internal.models.eb5 import ernie5
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("eb5_capture_layer_limit: import failed: %s", exc)
+        return False
+
+    cls = ernie5.EB5V2Model
+    original = cls.forward
+    if getattr(original, "_eb5_layer_limit", False):
+        return True
+
+    def forward(self, *args, **kwargs):
+        if torch.cuda.is_current_stream_capturing():
+            saved = self.end_layer
+            self.end_layer = min(saved, self.start_layer + layers)
+            try:
+                return original(self, *args, **kwargs)
+            finally:
+                self.end_layer = saved
+        return original(self, *args, **kwargs)
+
+    forward._eb5_layer_limit = True
+    cls.forward = forward
+    logger.warning("eb5_capture_layer_limit: capture limited to %d layer(s)", layers)
+    return True

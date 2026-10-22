@@ -101,14 +101,21 @@ def alloc_extend_kunlun(
 # ---------------------------------------------------------------------------
 from sglang.srt.platforms import interface as _platform_interface
 
-_ORIG_REJECT_OUT_OF_TREE_PATH = _platform_interface.reject_out_of_tree_path
-
-
-@plugin_hook(
-    "sglang.srt.platforms.interface.reject_out_of_tree_path",
-    type=HookType.REPLACE,
+# Only community main defines this guard; the internal fork does not.  Keep
+# the module importable either way -- this module is imported by
+# ``hooks.mem_cache`` and an import error aborts the rest of ``register_all()``
+# (which silently drops the distributed / model-executor hooks).
+_ORIG_REJECT_OUT_OF_TREE_PATH = getattr(
+    _platform_interface, "reject_out_of_tree_path", None
 )
-def reject_out_of_tree_path_kunlun(platform, *, subsystem: str):
-    if subsystem == "the DeepSeek-V4 KV pool":
-        return None
-    return _ORIG_REJECT_OUT_OF_TREE_PATH(platform, subsystem=subsystem)
+
+if _ORIG_REJECT_OUT_OF_TREE_PATH is not None:
+
+    @plugin_hook(
+        "sglang.srt.platforms.interface.reject_out_of_tree_path",
+        type=HookType.REPLACE,
+    )
+    def reject_out_of_tree_path_kunlun(platform, *, subsystem: str):
+        if subsystem == "the DeepSeek-V4 KV pool":
+            return None
+        return _ORIG_REJECT_OUT_OF_TREE_PATH(platform, subsystem=subsystem)

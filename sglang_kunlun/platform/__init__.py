@@ -13,7 +13,10 @@
 # limitations under the License.
 """Hardware platform entry point for the Kunlun SGLang plugin."""
 
-from sglang_kunlun.eb5_adapt.bootstrap import _kunlun_pre_shim
+try:
+    from sglang_kunlun import _kunlun_pre_shim
+except ImportError:  # partial package init: platform loaded via entry point
+    from sglang_kunlun.eb5_adapt.bootstrap import _kunlun_pre_shim
 
 _kunlun_pre_shim()
 

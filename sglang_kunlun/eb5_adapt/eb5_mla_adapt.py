@@ -852,7 +852,6 @@ def _mla_dequant_kv(k_cache: torch.Tensor, indices: torch.Tensor):
     * **656 B**（DSV4 MLA / `quantize_k_cache`）：单 token 块内 ``[512 fp8][16 B =
       4×fp32 scale][128 B rope]``。输出 576 维。
     """
-    device = k_cache.device
     b, _, topk = indices.shape
     idx = indices.reshape(b, topk).to(torch.int64).clamp(min=0)
     raw, page_size, page_stride, token_stride = _kv_raw_bytes(k_cache)
@@ -1289,7 +1288,10 @@ class _GridKernel:
         self._impl = impl
 
     def __getitem__(self, grid):
-        return self._impl
+        def run(*args, **kwargs):
+            return self._impl(*args, **kwargs)
+
+        return run
 
     def __call__(self, *args, **kwargs):
         return self._impl(*args, **kwargs)
@@ -1373,8 +1375,6 @@ _TARGETS = (
 
 def apply() -> list:
     """把 torch 拆解 patch 到 fork 的调用点上。返回已 patch 的符号列表。"""
-    import importlib
-
     patched = []
 
     if _install_fp8_upcast():

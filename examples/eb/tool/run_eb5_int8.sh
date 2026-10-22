@@ -39,7 +39,8 @@ if [ -n "$LAYERS" ] && [ "$LAYERS" != "43" ]; then
   RATIOS=$(python3 - "$LAYERS" "$RATIOS" <<'PY'
 import json, sys
 n = int(sys.argv[1]); r = json.loads(sys.argv[2])
-print(json.dumps(r[:n]))
+# 末尾额外保留一个 -2：它是 MTP（NextN）层，不能随减层一起截掉。
+print(json.dumps(r[:n] + [-2]))
 PY
 )
   export MODEL_OVERRIDE_ARGS="{\"num_hidden_layers\":$LAYERS,\"compress_ratios\":$RATIOS}"

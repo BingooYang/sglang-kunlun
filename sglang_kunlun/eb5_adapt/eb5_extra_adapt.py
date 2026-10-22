@@ -22,11 +22,14 @@ fork 自带 nvcc-JIT 建不起来）换成**语义等价的 torch 拆解**，注
 
 from __future__ import annotations
 
-import functools
-import math
 from typing import Optional, Tuple
 
 import torch
+
+from sglang_kunlun.eb5_adapt.eb5_mla_adapt import (
+    _GridKernel,
+    patch_everywhere as _patch_everywhere,
+)
 
 _FP8_MAX = 448.0
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -46,31 +49,6 @@ def _import_sibling(name: str):
     return importlib.import_module(name)
 
 
-def _dsv4_torch_shim_path() -> str:
-    """定位同包 ``kernels/dsv4_torch_shim.py``（不依赖工作区落在哪个绝对路径）。"""
-    import importlib.util
-    import os
-
-    here = os.path.dirname(os.path.abspath(__file__))
-    local = os.path.join(os.path.dirname(here), "kernels", "dsv4_torch_shim.py")
-    if os.path.exists(local):
-        return local
-    try:
-        spec = importlib.util.find_spec("sglang_kunlun")
-    except Exception:  # noqa: BLE001 - 解析失败就返回本地路径，由调用方报错
-        spec = None
-    if spec is not None and spec.origin:
-        candidate = os.path.join(
-            os.path.dirname(spec.origin), "kernels", "dsv4_torch_shim.py"
-        )
-        if os.path.exists(candidate):
-            return candidate
-    return local
-
-
-# --------------------------------------------------------------------------- #
-# 复用 eb5_mla_adapt 的 fp8 基础
-# --------------------------------------------------------------------------- #
 def _fp8_helpers():
     return _import_sibling("eb5_mla_adapt")
 
@@ -548,7 +526,7 @@ def dequantize_k_cache_paged(
     # 昆仑不支持 fp8 / uint8 张量的 index_select，改用高级索引 gather。
     u8_all = q.contiguous().view(torch.uint8)
     u8 = u8_all[idx]
-    dim_nope, dim_rope = 512, 64
+    dim_nope = 512
     nope = _fp8_to_fp32(
         u8[:, :dim_nope].contiguous().view(torch.float8_e4m3fn)
     )
@@ -1175,22 +1153,6 @@ def _install_alloc_decode() -> list:
     return ["sglang.srt.mem_cache.allocator.paged.PagedTokenToKVPoolAllocator.alloc_decode"]
 
 
-class _GridKernel:
-    """让 torch 拆解也能用 ``kernel[grid](...)`` 的 Triton 调用写法。"""
-
-    def __init__(self, impl):
-        self._impl = impl
-
-    def __getitem__(self, grid):
-        def run(*args, **kwargs):
-            return self._impl(*args, **kwargs)
-
-        return run
-
-    def __call__(self, *args, **kwargs):
-        return self._impl(*args, **kwargs)
-
-
 def fused_multimax_selu(
     x: torch.Tensor, ranges: torch.Tensor, ts: torch.Tensor, *, out=None
 ) -> torch.Tensor:
@@ -1241,38 +1203,6 @@ def build_causal_swa_page_indices_triton(
     if padded_width == swa_window:
         return swa
     return torch.nn.functional.pad(swa, (0, padded_width - swa_window), value=-1)
-
-
-def _patch_everywhere(module_name: str, attr: str, impl) -> list:
-    """把 ``impl`` 装到定义模块上，并修掉所有已 import 的旧绑定。
-
-    fork 里很多包 `__init__` 会 ``from .mod import f`` 再导出（例如
-    `sglang.kernels.ops.attention.dsv4.compress_norm_rope_store` 既在 `.compress`
-    里定义、又被包 `__init__` 重绑定）。只改定义模块的话，走包路径 import 的调用方
-    仍拿到旧函数。
-    """
-    import importlib
-    import sys
-
-    mod = importlib.import_module(module_name)
-    original = getattr(mod, attr, None)
-    if original is None:
-        return []
-    setattr(mod, attr, impl)
-    patched = [f"{module_name}.{attr}"]
-    # 再扫一遍所有 sglang 模块，把**任意名字**下仍指向旧对象的绑定重指过去：
-    # fork 里 `from x import f as _g`（改名导入）很常见，只按名字匹配会漏。
-    for name, other in list(sys.modules.items()):
-        if other is None or not name.startswith("sglang."):
-            continue
-        namespace = getattr(other, "__dict__", None)
-        if not namespace:
-            continue
-        for sym, value in list(namespace.items()):
-            if value is original:
-                setattr(other, sym, impl)
-                patched.append(f"{name}.{sym}")
-    return patched
 
 
 def _install_dsv4_metadata_kernels() -> list:
@@ -1328,53 +1258,6 @@ def _install_deep_gemm_extra() -> list:
             setattr(mod, name, impl)
             patched.append(f"deep_gemm.{name}")
     return patched
-
-
-def _dsv4_shim():
-    """按文件路径加载插件的 dsv4_torch_shim（复用它的 compress_forward 拆解）。"""
-    import importlib.util
-    import sys
-    import types
-
-    mod = sys.modules.get("_eb5_dsv4_torch_shim")
-    if mod is not None:
-        return mod
-    stub = "sglang_kunlun.hooks.layers.attention.nsa.triton_kernel"
-    if stub not in sys.modules:
-        # DSV4 的 indexer 量化路径会真的调它，要给能用的实现（同上，别 import 插件模块）。
-        def _act_quant_kunlun(x, block_size=128, scale_fmt=None):
-            import kunlun_ops
-
-            assert x.is_contiguous(), "Input tensor must be contiguous"
-            assert x.size(-1) % block_size == 0
-            assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
-            x_shape = x.shape
-            x_blocks = x.view(-1, block_size).contiguous()
-            y_int8 = torch.empty(x_blocks.shape, dtype=torch.int8, device=x.device)
-            y_max = torch.empty(x_blocks.shape[0], dtype=torch.float32, device=x.device)
-            kunlun_ops.quant2d(x_blocks, y_int8, y_max, force_sdnn=True)
-            return y_int8.view(x_shape), y_max.view(x_shape[0], -1)
-
-        m = types.ModuleType(stub)
-        m.act_quant_kunlun = _act_quant_kunlun
-        sys.modules[stub] = m
-    path = _dsv4_torch_shim_path()
-    spec = importlib.util.spec_from_file_location("_eb5_dsv4_torch_shim", path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["_eb5_dsv4_torch_shim"] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def _install_compress_forward() -> list:
-    """`compress_forward`（FlashCompress{4,128}Kernel）→ 复用插件的 torch 拆解。"""
-    shim = _dsv4_shim()
-    impl = getattr(shim, "_compress_forward_torch", None)
-    if impl is None:
-        return []
-    return _patch_everywhere(
-        "sglang.kernels.ops.attention.dsv4.compress", "compress_forward", impl
-    )
 
 
 def moe_align_block_size(
@@ -1659,22 +1542,6 @@ def _install_moe_align() -> list:
     )
 
 
-def _install_compress_plan() -> list:
-    """`CompressorPrefillPlan` 的两个 generate 都是 staticmethod，需按类属性替换。"""
-    from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
-
-    CompressorPrefillPlan.generate = staticmethod(_prefill_plan_generate)
-    CompressorPrefillPlan.generate_legacy = staticmethod(_prefill_plan_generate_legacy)
-    from sglang.kernels.ops.attention.dsv4.compress import CompressorDecodePlan
-
-    CompressorDecodePlan.generate = staticmethod(_decode_plan_generate)
-    return [
-        "CompressorPrefillPlan.generate",
-        "CompressorPrefillPlan.generate_legacy",
-        "CompressorDecodePlan.generate",
-    ]
-
-
 _TARGETS = (
     ("sglang.kernels.ops.attention.position", "compute_position_triton", compute_position_triton),
     ("sglang.kernels.ops.attention.dsv4_attn_metadata_kernels", "expand_prefill_causally_triton", expand_prefill_causally_triton),
@@ -1690,7 +1557,11 @@ _TARGETS = (
     ("sglang.srt.internal.layers.moe.eb5_fused_topk", "fused_split_feature_topk", fused_split_feature_topk),
     ("sglang.kernels.ops.kimi_k3.activation", "situ_and_mul", situ_and_mul),
     ("sglang.kernels.ops.memory.memcpy_triton", "memcpy_triton", memcpy_triton),
-    ("sglang.kernels.ops.kvcache.kv_indices", "create_flashinfer_kv_indices_triton", create_flashinfer_kv_indices_triton),
+    (
+        "sglang.kernels.ops.kvcache.kv_indices",
+        "create_flashinfer_kv_indices_triton",
+        _GridKernel(create_flashinfer_kv_indices_triton),
+    ),
     ("sglang.kernels.ops.attention.dsv4.attn", "get_paged_mqa_logits_metadata", get_paged_mqa_logits_metadata_torch),
     ("sglang.srt.layers.attention.dsv4.sparse_prefill_utils", "build_swa_token_ids", build_swa_token_ids),
     ("sglang.srt.layers.attention.dsv4.sparse_prefill_utils", "combine_topk_swa_indices", combine_topk_swa_indices),
@@ -1703,8 +1574,6 @@ _TARGETS = (
 
 def apply() -> list:
     """把 torch 拆解 patch 到 fork 的调用点上。返回已 patch 的符号列表。"""
-    import importlib
-
     patched = []
 
     for module_name, attr, impl in _TARGETS:
@@ -1713,31 +1582,13 @@ def apply() -> list:
         except Exception as exc:  # noqa: BLE001
             print(f"[eb5-extra-adapt] import {module_name} failed: {exc}")
 
-    # `alloc_decode_kernel` 不再走 `[grid]` 包装：改为在方法层替换
-    # `PagedTokenToKVPoolAllocator.alloc_decode`（见 `_install_alloc_decode`）。
-    for mod_name, attr, impl in (
-        (
-            "sglang.kernels.ops.kvcache.kv_indices",
-            "create_flashinfer_kv_indices_triton",
-            create_flashinfer_kv_indices_triton,
-        ),
-    ):
-        try:
-            mod = importlib.import_module(mod_name)
-            setattr(mod, attr, _GridKernel(impl))
-            patched.append(f"{mod_name}.{attr}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[eb5-extra-adapt] {mod_name}.{attr} failed: {exc}")
-
     for hook in (
         _install_alloc_decode,
         _install_deep_gemm_extra,
         _install_dsv4_metadata_kernels,
-        _install_compress_forward,
         _install_moe_align,
         _install_fused_moe_kernel,
         _install_activation,
-        _install_compress_plan,
         _install_expert_location_pad,
     ):
         try:

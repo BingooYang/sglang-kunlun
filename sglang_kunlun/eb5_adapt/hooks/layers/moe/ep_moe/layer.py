@@ -43,7 +43,6 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang_kunlun.environ import envs as patch_envs
 from sglang.srt.utils import get_bool_env_var, dispose_tensor
@@ -57,7 +56,7 @@ if TYPE_CHECKING:
     )
 
 
-from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config, W8A8Int8MoEMethod
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang_kunlun.hooks.layers.quantization.compressed_tensors.compressed_tensors import (
     KunlunCompressedTensorsConfig,
     KunlunCompressedTensorsWNA16MoE,
@@ -66,9 +65,7 @@ from kunlun_ops import (
     dequant2d_per_token,
     m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_v3,
     m_grouped_gemm_bf16_bf16_bf16_nt_masked_v3,
-    m_grouped_gemm_fp16_fp16_bf16_nt_contiguous_castte_v3,
     m_grouped_gemm_fp16_fp16_bf16_nt_contiguous_v3,
-    m_grouped_gemm_fp16_fp16_bf16_nt_masked_castte_v3,
     m_grouped_gemm_fp16_fp16_bf16_nt_masked_v3,
     m_grouped_gemm_fp16_I4_bf16_nt_contiguous_v3,
     m_grouped_gemm_fp16_I4_bf16_nt_masked_v3,
@@ -76,7 +73,6 @@ from kunlun_ops import (
     m_grouped_gemm_I8_I4_bf16_nt_masked_v3,
     m_grouped_gemm_I8_I8_bf16_nt_contiguous_v3,
     m_grouped_gemm_I8_I8_bf16_nt_masked,
-    m_grouped_gemm_I8_I8_bf16_nt_masked_v3,
     per_token_dequant2d_with_mask,
     silu_and_mul_mask_fwd,
     silu_and_per_token_group_quant_I8,

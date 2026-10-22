@@ -18,6 +18,7 @@ COMMON=(
   --model-path "$MODEL_PATH"
   --tp-size 8 --ep-size 8 --dp-size 8 --enable-dp-attention
   --port "$PORT" --host 0.0.0.0
+  --nccl-port 9999
   --quantization w8a8_int8 --trust-remote-code
   --kv-cache-dtype bfloat16 --dtype bfloat16
   --disable-radix-cache
@@ -48,6 +49,13 @@ case "$MODE" in
 esac
 
 echo "launch: MODE=$MODE PORT=$PORT CONDA_ENV=$CONDA_ENV TAG=$TAG"
-nohup python -m sglang.launch_server "${COMMON[@]}" "${EXTRA[@]}" > "$LOG" 2>&1 &
+
+# Clear leftovers safely (never kill -9 a launcher: it leaves stuck XPU kernels).
+STOP="$HERE/../../01_eb/tool/stop_kunlun.sh"
+if [ "${SKIP_STOP:-0}" != "1" ] && [ -f "$STOP" ]; then
+    bash "$STOP" || { echo "leftover sglang processes; refusing to start"; exit 1; }
+fi
+
+nohup sglang-kunlun-launch "${COMMON[@]}" "${EXTRA[@]}" > "$LOG" 2>&1 &
 echo $! > "$PIDFILE"
 echo "pid=$(cat $PIDFILE) log=$LOG"

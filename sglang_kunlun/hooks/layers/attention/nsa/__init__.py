@@ -17,5 +17,5 @@
 # limitations under the License.
 """NSA-related Kunlun hooks."""
 from . import index_buf_accessor  # noqa: F401
-from . import nsa_indexer  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.layers.attention.nsa import nsa_indexer  # noqa: F401
 from . import triton_kernel  # noqa: F401

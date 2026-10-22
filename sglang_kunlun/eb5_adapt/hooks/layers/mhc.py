@@ -15,15 +15,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""HookRegistry registration for the MHC split-Sinkhorn gate kernel.
+"""HookRegistry registration for the MHC split-Sinkhorn / combine kernels.
 
-Upstream ``sglang.kernels.ops.layernorm.mhc.hc_split_sinkhorn`` dispatches to a tilelang
-JIT kernel that cannot build on the Kunlun XPU. The REPLACE hook below keeps the
-same (pre, post, comb) contract: ``pre``/``post`` are per-token sigmoid gates and
-``comb`` is Sinkhorn-normalized.
+Both are tilelang/Triton kernels upstream and cannot build on Kunlun XPU.
+The implementations live in :mod:`sglang_kunlun.eb5_adapt.kernels.mhc_torch` -- the same
+functions EB5 uses for ``mhc_pre`` / ``mhc_post``, so DSV4 and EB5 share one
+definition of the maths.
 
-``sglang.srt.models.deepseek_v4`` imports the symbol lazily inside the call site,
-so it resolves the patched module attribute at call time.
+``sglang.srt.models.deepseek_v4`` imports the symbol lazily inside the call
+site, so it resolves the patched module attribute at call time.
 """
 
 from __future__ import annotations
@@ -31,6 +31,9 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+
+from sglang_kunlun.eb5_adapt.kernels.mhc_torch import hc_combine as _hc_combine
+from sglang_kunlun.eb5_adapt.kernels.mhc_torch import hc_split_sinkhorn as _hc_split_sinkhorn
 
 
 @plugin_hook(
@@ -45,94 +48,24 @@ def _hc_split_sinkhorn_torch(
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ):
-    """Kunlun fused split-Sinkhorn, falling back to pure torch."""
-    b, s, _ = mixes.size()
-    hc = int(hc_mult)
-    # Kunlun fused MHC split-Sinkhorn: same pre/post/comb definition and
-    # Sinkhorn iteration count as the torch reference below, but the 20-iteration
-    # row/col normalization loop runs in a single fused kernel. Falls back to the
-    # torch implementation if the fused op is unavailable.
-    try:
-        import kunlun_ops
-
-        _m = mixes.reshape(-1, (2 + hc) * hc).contiguous()
-        _nr = _m.shape[0]
-        _pre = torch.empty((_nr, hc), dtype=torch.float32, device=mixes.device)
-        _post = torch.empty((_nr, hc), dtype=torch.float32, device=mixes.device)
-        _comb = torch.empty((_nr, hc * hc), dtype=torch.float32, device=mixes.device)
-        kunlun_ops.mhc_split_sinkhorn(
-            _m,
-            hc_scale.float().contiguous(),
-            hc_base.float().contiguous(),
-            _pre,
-            _post,
-            _comb,
-            hc,
-            int(sinkhorn_iters),
-            float(eps),
-        )
-        return (
-            _pre.reshape(b, s, hc),
-            _post.reshape(b, s, hc),
-            _comb.reshape(b, s, hc, hc),
-        )
-    except Exception:
-        pass
-
-    m = mixes.reshape(-1, (2 + hc) * hc).float()
-    scale = hc_scale.float()
-    base = hc_base.float()
-    n = m.shape[0]
-
-    pre = torch.sigmoid(m[:, :hc] * scale[0] + base[:hc]) + eps
-    post = 2.0 * torch.sigmoid(m[:, hc : 2 * hc] * scale[1] + base[hc : 2 * hc])
-    comb = (m[:, 2 * hc :] * scale[2] + base[2 * hc :]).reshape(n, hc, hc)
-
-    # row softmax over k (dim=2)
-    row_max = comb.amax(dim=2, keepdim=True)
-    comb = torch.exp(comb - row_max)
-    row_sum = comb.sum(dim=2, keepdim=True)
-    comb = comb / row_sum + eps
-
-    # initial column normalization over j (dim=1)
-    col_sum = comb.sum(dim=1, keepdim=True)
-    comb = comb / (col_sum + eps)
-
-    for _ in range(int(sinkhorn_iters) - 1):
-        row_sum = comb.sum(dim=2, keepdim=True)
-        comb = comb / (row_sum + eps)
-        col_sum = comb.sum(dim=1, keepdim=True)
-        comb = comb / (col_sum + eps)
-
-    pre = pre.reshape(b, s, hc)
-    post = post.reshape(b, s, hc)
-    comb = comb.reshape(b, s, hc, hc)
-    return pre, post, comb
+    """DSV4 entry point: use the fused Kunlun op, fall back to torch."""
+    return _hc_split_sinkhorn(
+        mixes,
+        hc_scale,
+        hc_base,
+        hc_mult,
+        sinkhorn_iters,
+        eps,
+        use_fused=True,
+    )
 
 
 @plugin_hook(
-    "sglang.kernels.ops.layernorm.mhc.mhc_combine",
+    "sglang.kernels.ops.layernorm.mhc.hc_combine",
     type=HookType.REPLACE,
 )
 def hc_combine_kunlun(
-    x_flat: "torch.Tensor", pre: "torch.Tensor", hc: int, out_dtype: "torch.dtype"
+    x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ):
-    """Pure-torch ``hc_combine`` — the Triton kernel is CUDA-only.
-
-    Newer sglang extracted this weighted sum out of ``hc_pre`` into a fused
-    Triton kernel, but the maths is unchanged from v0.5.x, where it was simply::
-
-        y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
-
-    so the reference implementation is a few tensor ops — no new Kunlun kernel
-    is needed.
-    """
-    m = x_flat.shape[0]
-    h = x_flat.shape[1] // hc
-    y = torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
-    if m == 0:
-        return y
-    xv = x_flat.reshape(m, hc, h).to(torch.float32)
-    acc = (pre.to(torch.float32).unsqueeze(-1) * xv).sum(dim=1)
-    y.copy_(acc.to(out_dtype))
-    return y
+    """DSV4 entry point for the weighted sum (Triton is CUDA-only)."""
+    return _hc_combine(x_flat, pre, hc, out_dtype)

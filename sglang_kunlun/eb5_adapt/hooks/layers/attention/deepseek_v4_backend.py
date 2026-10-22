@@ -37,7 +37,6 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DSV4AttnMetadata,
     _pad_tensor_to_size,
 )
-from sglang.srt.layers.attention.dsv4 import indexer as _upstream_indexer
 from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
     DIM_NOPE,
     DIM_ROPE,
@@ -55,7 +54,6 @@ except ImportError:  # community main renamed it (layout-specific variants)
     )
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
-    PagedIndexerMetadata,
 )
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
@@ -146,12 +144,25 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
 
     @property
     def is_bf16_kv_cache(self):
-        """Community main dropped this cached flag; derive it from the pool."""
+        """Derive the flag from the pool unless upstream already assigned it.
+
+        Older community-main trees dropped the cached attribute, while the
+        internal fork's ``DeepseekV4AttnBackend.__init__`` assigns it.  A
+        setter is required: without it that assignment raises
+        ``AttributeError: can't set attribute`` during backend construction.
+        """
+        override = getattr(self, "_is_bf16_kv_cache", None)
+        if override is not None:
+            return override
         pool = getattr(self, "token_to_kv_pool", None)
         dtype = getattr(pool, "dtype", None)
         if dtype is None:
             dtype = getattr(pool, "store_dtype", None)
         return dtype in (torch.bfloat16, torch.float16)
+
+    @is_bf16_kv_cache.setter
+    def is_bf16_kv_cache(self, value):
+        self._is_bf16_kv_cache = bool(value)
 
     def forward_c4_indexer(
         self,
@@ -870,6 +881,8 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
+        moa_v2_nearest: bool = False,
+        moa_v2_merge_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Upstream ``_forward_prefill_sparse`` with ``flash_mla_sparse_fwd``
         replaced by pure-torch sparse attention over the gathered workspace.
@@ -879,9 +892,10 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
 
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
-            # Internal fork's ``SparsePrefillChunkCache.build`` additionally
-            # requires ``max_seq_len`` and ``total_swa`` (the upstream v0.5.x
-            # signature computed ``total_swa`` internally).  Mirror the internal
+            # Internal fork's ``SparsePrefillChunkCache.build`` takes
+            # ``max_seq_len`` / ``total_swa`` and no longer takes
+            # ``query_lens`` / ``query_pos`` (upstream v0.5.x derived both
+            # internally).  Mirror the internal
             # ``_build_sparse_prefill_chunk_cache`` computation.
             seq_lens_cpu_list = forward_batch.seq_lens_cpu.tolist()
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
@@ -891,32 +905,9 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                     seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
                 )
             )
-            _seq_flat = forward_batch.seq_lens.reshape(-1)
-            _ext_flat = forward_batch.extend_seq_lens.reshape(-1)
-            _n = min(_seq_flat.numel(), _ext_flat.numel())
-            _ext64 = _ext_flat[: _n].to(torch.int64)
-            _q_lens = _ext64.to(torch.int32)
-            _starts = _seq_flat[: _n].to(torch.int64) - _ext64
-            _rep_starts = torch.repeat_interleave(_starts, _ext64)
-            _total = _rep_starts.numel()
-            _row_ids = torch.arange(_total, device=_ext64.device, dtype=torch.int64)
-            _q_pos = (
-                _rep_starts
-                + _row_ids
-                - torch.repeat_interleave(torch.cumsum(_ext64, 0) - _ext64, _ext64)
-            ).to(torch.int32)
-            _want = q_flat.shape[0]
-            if _q_pos.numel() < _want:
-                _q_pos = torch.nn.functional.pad(
-                    _q_pos, (0, _want - _q_pos.numel()), value=0
-                )
-            elif _q_pos.numel() > _want:
-                _q_pos = _q_pos[:_want]
             cache = SparsePrefillChunkCache.build(
                 seq_lens=forward_batch.seq_lens.to(torch.int32),
                 extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
-                query_lens=_q_lens,
-                query_pos=_q_pos,
                 req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
                 req_to_token=self.req_to_token,
                 full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
@@ -948,22 +939,37 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
             if compress_ratio == 128:
                 assert core_attn_metadata.c128_page_indices is not None
-                gather = cache.ensure_c128(core_attn_metadata.c128_page_indices)
-                flat_token_ids = gather.flat_token_ids
-                combined_indices = gather.combined_indices
-                combined_lens = gather.combined_lens
+                # Fork API: ensure_c128 populates the cache in place.
+                cache.ensure_c128(core_attn_metadata.c128_page_indices)
+                flat_token_ids = cache.c128_flat_token_ids
+                combined_indices = cache.c128_combined_indices
+                combined_lens = cache.c128_combined_lens
             else:
-                assert core_attn_metadata.c4_sparse_raw_indices is not None, (
-                    "sparse-prefill c4 path requires c4_sparse_raw_indices "
-                    "(allocated in init_flashmla_related when is_prefill=True)"
-                )
-                gather = cache.ensure_compressed(
-                    compress_ratio, core_attn_metadata.page_table, extra_page_size
-                )
-                flat_token_ids = gather.flat_token_ids
-                combined_indices, combined_lens = cache.combine_compressed(
-                    compress_ratio,
-                    core_attn_metadata.c4_sparse_raw_indices[: cache.num_qo_tokens],
+                if moa_v2_merge_mask is not None:
+                    from sglang.srt.internal.layers.attention.dsv4.moa_merge_indices import (
+                        merge_moa_raw_indices,
+                    )
+
+                    raw_indices = merge_moa_raw_indices(
+                        moa_v2_merge_mask, core_attn_metadata, cache.num_qo_tokens
+                    )
+                elif moa_v2_nearest:
+                    raw_indices = core_attn_metadata.c4_nearest_raw_indices
+                    assert raw_indices is not None, (
+                        "sparse-prefill MOA v2 cheap branch requires "
+                        "c4_nearest_raw_indices"
+                    )
+                else:
+                    raw_indices = core_attn_metadata.c4_sparse_raw_indices
+                    assert raw_indices is not None, (
+                        "sparse-prefill c4 path requires c4_sparse_raw_indices "
+                        "(allocated in init_flashmla_related when is_prefill=True)"
+                    )
+                # Fork API: ensure_c4/combine_c4_layer, in place.
+                cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
+                flat_token_ids = cache.c4_flat_token_ids
+                combined_indices, combined_lens = cache.combine_c4_layer(
+                    c4_sparse_raw_indices=raw_indices[: cache.num_qo_tokens],
                 )
             n_compressed = flat_token_ids.shape[0]
             workspace = self.sparse_prefill_workspace.get(

@@ -3,9 +3,22 @@
 # Usage: source examples/dsv4-kunlun/env.sh [conda-env-name]
 __ENV_NAME="${1:-sglang_main}"
 
-export CONDA_ROOT="${CONDA_ROOT:-/root/miniconda3}"
-source "$CONDA_ROOT/etc/profile.d/conda.sh"
-conda activate "$__ENV_NAME"
+# Prefer a conda env when installed; otherwise use the workspace venv ($W/env).
+if [ -f "${CONDA_ROOT:-/root/miniconda3}/etc/profile.d/conda.sh" ]; then
+    export CONDA_ROOT="${CONDA_ROOT:-/root/miniconda3}"
+    source "$CONDA_ROOT/etc/profile.d/conda.sh"
+    conda activate "$__ENV_NAME"
+else
+    _DSV4_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    while [ "$_DSV4_DIR" != / ] && [ ! -x "$_DSV4_DIR/env/bin/python" ]; do
+        _DSV4_DIR=$(dirname "$_DSV4_DIR")
+    done
+    export BINGOO=${BINGOO:-$_DSV4_DIR}
+    unset _DSV4_DIR
+    export VIRTUAL_ENV="$BINGOO/env"
+    export PATH="$VIRTUAL_ENV/bin:$PATH"
+    export LD_LIBRARY_PATH="$VIRTUAL_ENV/klx_stub${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 
 unset PYTHONPATH
 unset XPU_DUMMY_EVENT
@@ -15,8 +28,8 @@ export XPU_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES"
 export CUDA_DEVICE_ORDER=OAM_ID
 
 # Platform plugin
-export SGLANG_PLATFORM=kunlun
-export SGLANG_USE_XPU=1
+# Do not preset SGLANG_PLATFORM: sglang-kunlun-launch imports torch and runs
+# _kunlun_pre_shim() before the platform is resolved.
 export HYDRAX_SKIP_PROTEUS_BOOTSTRAP=1
 export TVM_FFI_DISABLE_TORCH_C_DLPACK=1
 export SGLANG_IS_FLASHINFER_AVAILABLE=False
@@ -63,7 +76,7 @@ export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
 export SGLANG_PREP_IN_CUDA_GRAPH=False
 export SGLANG_OPT_CP_REARRANGE_TRITON=False
 
-export LD_LIBRARY_PATH="$CONDA_PREFIX/lib/python3.10/site-packages/torch/lib:$CONDA_PREFIX/lib/python3.10/site-packages/torch_xmlir:$CONDA_PREFIX/xcudart/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX:-$VIRTUAL_ENV}/lib/python3.10/site-packages/torch/lib:${CONDA_PREFIX:-$VIRTUAL_ENV}/lib/python3.10/site-packages/torch_xmlir:${CONDA_PREFIX:-$VIRTUAL_ENV}/xcudart/lib:${CONDA_PREFIX:-$VIRTUAL_ENV}/lib:${LD_LIBRARY_PATH}"
 export PYTHONUNBUFFERED=1
 
-export MODEL_PATH="${MODEL_PATH:-/root/paddlejob/workspace/xuanyuan/models/DeepSeek-V4-Flash-FP8-W8A8-INT8-Dynamic}"
+export MODEL_PATH="${MODEL_PATH:-${BINGOO:-/root/paddlejob/gpfsspace/bingoo/p800_eb}/models/DeepSeek-V4-Flash-FP8-W8A8-INT8-Dynamic}"

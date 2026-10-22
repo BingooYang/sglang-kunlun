@@ -53,8 +53,9 @@ def _is_kunlun() -> bool:
 def _empty_cache():
     """Release cached device memory back to the allocator (XPU/CUDA)."""
     try:
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
-            torch.xpu.empty_cache()
+        _xpu = getattr(torch, "xpu", None)
+        if _xpu is not None and _xpu.is_available():
+            _xpu.empty_cache()
         elif torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:

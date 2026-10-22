@@ -47,11 +47,10 @@ from sglang.srt.layers.moe.topk import (
     fused_topk_softmax_torch_raw_logits,
     biased_topk_impl,
 )
-from typing import Optional, NamedTuple, Tuple
+from typing import Optional, NamedTuple
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-import kunlun_ops
 
 
 class StandardTopKOutput(NamedTuple):

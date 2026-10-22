@@ -22,18 +22,15 @@ patch the upstream sglang.jit_kernel.dsv4.* symbols at import time.
 """
 from __future__ import annotations
 
-import contextvars
-import functools
 import math
-from typing import Literal, Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import kunlun_ops
 import os
 import torch
-import torch.nn.functional as F
 import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops.*)
 
-from sglang_kunlun.hooks.layers.attention.nsa.triton_kernel import (
+from sglang_kunlun.eb5_adapt.kernels.quant_ops import (
     act_quant_kunlun,
 )
 

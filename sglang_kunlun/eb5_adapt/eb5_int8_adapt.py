@@ -72,7 +72,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import ceil_align, ceil_div, set_weight_attrs
+from sglang.srt.utils import ceil_align, set_weight_attrs
 from sglang.srt.utils.common import log_info_on_rank0
 
 logger = logging.getLogger(__name__)

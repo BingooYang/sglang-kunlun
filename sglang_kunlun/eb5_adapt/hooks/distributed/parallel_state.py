@@ -54,7 +54,7 @@ def prepare_kunlun_profiler_environment(*args, **kwargs):
         local_rank = -1
 
     if "XPU_ENABLE_PROFILER_TRACING" in os.environ and os.environ["XPU_ENABLE_PROFILER_TRACING"] == "1":
-        logger.info(f"enable trace for Kunlun profiler")
+        logger.info("enable trace for Kunlun profiler")
         device_id = local_rank % 8
         os.environ["XPU_CUPTI_ENABLE_DEVICE"] = str(device_id)
         os.environ["OMP_NUM_THREADS"] = "8"

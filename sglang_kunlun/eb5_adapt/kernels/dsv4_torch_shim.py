@@ -840,6 +840,40 @@ def _store_bf16_rows(kvcache, loc, rows_bf16, page_size, valid=None):
     """
     n, d = rows_bf16.shape
     page_bytes = kvcache.shape[1]
+
+    # Fused path: the pool is byte-addressed (page_bytes == page_size * d * 2),
+    # which is exactly the bf16 [npages, page_size * d] layout that the Kunlun
+    # vendor op consumes. env1 stores its SWA K cache the same way and pays one
+    # call instead of ~10 torch ops + a generic scatter kernel per layer.
+    if (
+        page_bytes == page_size * d * 2
+        and rows_bf16.dtype == torch.bfloat16
+        and kvcache.dtype == torch.uint8
+        and hasattr(torch.ops, "xspeedgate_ops")
+        and hasattr(torch.ops.xspeedgate_ops, "set_k_and_s_v4")
+    ):
+        max_loc = kvcache.shape[0] * page_size - 1
+        if valid is None:
+            sel_loc, sel_rows = loc, rows_bf16
+        elif not torch.cuda.is_current_stream_capturing():
+            # Eager (prefill) path: drop the invalid rows instead of routing
+            # them to a scratch slot. Dynamic shapes are fine here; only the
+            # graph-captured verify path needs the static padded buffer.
+            mask = valid.to(torch.bool)
+            sel_loc, sel_rows = loc[mask], rows_bf16[mask]
+            if sel_loc.numel() == 0:
+                return
+        else:
+            sel_loc = None
+        if sel_loc is not None:
+            torch.ops.xspeedgate_ops.set_k_and_s_v4(
+                kvcache.view(torch.bfloat16),
+                sel_loc.to(torch.int64).clamp(min=0, max=max_loc),
+                sel_rows.contiguous(),
+                page_size,
+            )
+            return
+
     # Scatter through an *int8* view. xpytorch's index_put_ kernel only handles
     # signed chars, so a uint8 scatter is lowered to uint8->int8 cast, the
     # scatter, then int8->uint8 cast — two element-wise kernels per layer per

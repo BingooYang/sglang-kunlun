@@ -831,9 +831,9 @@ def _native_compress_forward_v2(
         plan_w.dtype != torch.uint8 or plan_w.dim() != 2 or plan_w.shape[1] != 8
     ):
         return None
-    if int(compress_ratio) == 4 and os.environ.get(
-        "SGLANG_KUNLUN_NATIVE_COMPRESS_C4", "0"
-    ) == "0":
+    if int(compress_ratio) == 4:
+        # c4 needs the spill-row fix-up and the write-plan redirect, which the
+        # shared path below does not implement.
         return None
     if out is None:
         out = kv_score_input.new_empty((plan_c.shape[0], head_dim))

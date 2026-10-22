@@ -10,7 +10,7 @@ examples/eb/
   tool/
     env.sh                 # venv / XPU / KLX 环境
     run_eb5_int8.sh        # 起服务的入口（INT8 包装）
-    run_eb5_kunlun.sh      # 实际 launcher
+    run_eb5_kunlun.sh      # 实际 launcher （bf16权重 OOM，暂不能跑通）
     preflight.sh           # 起服务前的设备/XCCL/算力闸门
     stop_kunlun.sh         # 安全停机（不发 kill -9）
     verify_eb5.sh          # 等 ready + health + 4 并发请求
@@ -19,8 +19,10 @@ examples/eb/
 
 ## 0. 约定
 
+下文用 `$W` 表示工作区根目录（含 `env/bin/python` 的那一层），命令都在 `$W` 下执行：
+
 ```bash
-W=/root/paddlejob/gpfsspace/bingoo/p800_eb
+cd "$W"      # 从本仓库出发：cd ../../../..
 ```
 
 脚本会根据自身位置向上查找含 `env/bin/python` 的目录作为 `$W`，一般不需要手工设 `BINGOO`。

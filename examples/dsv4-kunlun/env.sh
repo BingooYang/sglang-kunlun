@@ -3,18 +3,21 @@
 # Usage: source examples/dsv4-kunlun/env.sh [conda-env-name]
 __ENV_NAME="${1:-sglang_main}"
 
-# Prefer a conda env when installed; otherwise use the workspace venv ($W/env).
+# Workspace root: the nearest parent holding env/bin/python. Found from this script
+# so nothing below has to hard-code an absolute path.
+_DSV4_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+while [ "$_DSV4_DIR" != / ] && [ ! -x "$_DSV4_DIR/env/bin/python" ]; do
+    _DSV4_DIR=$(dirname "$_DSV4_DIR")
+done
+export BINGOO=${BINGOO:-$_DSV4_DIR}
+unset _DSV4_DIR
+
+# Prefer a conda env when installed; otherwise use the workspace venv ($BINGOO/env).
 if [ -f "${CONDA_ROOT:-/root/miniconda3}/etc/profile.d/conda.sh" ]; then
     export CONDA_ROOT="${CONDA_ROOT:-/root/miniconda3}"
     source "$CONDA_ROOT/etc/profile.d/conda.sh"
     conda activate "$__ENV_NAME"
 else
-    _DSV4_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-    while [ "$_DSV4_DIR" != / ] && [ ! -x "$_DSV4_DIR/env/bin/python" ]; do
-        _DSV4_DIR=$(dirname "$_DSV4_DIR")
-    done
-    export BINGOO=${BINGOO:-$_DSV4_DIR}
-    unset _DSV4_DIR
     export VIRTUAL_ENV="$BINGOO/env"
     export PATH="$VIRTUAL_ENV/bin:$PATH"
     export LD_LIBRARY_PATH="$VIRTUAL_ENV/klx_stub${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -79,4 +82,4 @@ export SGLANG_OPT_CP_REARRANGE_TRITON=False
 export LD_LIBRARY_PATH="${CONDA_PREFIX:-$VIRTUAL_ENV}/lib/python3.10/site-packages/torch/lib:${CONDA_PREFIX:-$VIRTUAL_ENV}/lib/python3.10/site-packages/torch_xmlir:${CONDA_PREFIX:-$VIRTUAL_ENV}/xcudart/lib:${CONDA_PREFIX:-$VIRTUAL_ENV}/lib:${LD_LIBRARY_PATH}"
 export PYTHONUNBUFFERED=1
 
-export MODEL_PATH="${MODEL_PATH:-${BINGOO:-/root/paddlejob/gpfsspace/bingoo/p800_eb}/models/DeepSeek-V4-Flash-FP8-W8A8-INT8-Dynamic}"
+export MODEL_PATH="${MODEL_PATH:-$BINGOO/models/DeepSeek-V4-Flash-FP8-W8A8-INT8-Dynamic}"

@@ -1,7 +1,7 @@
 # EB5 整网快速复现（INT8，8 卡）
 
-本目录（`code/xy/sglang-kunlun/examples/eb`）是 `code/xy/sglang-kunlun` 自带的一套独立复现材料，
-不依赖源工作区的 `code/sglang-kunlun/01_eb_adp`。适配层位于 `sglang_kunlun/eb5_adapt/`，由插件
+本目录（`code/xy/sglang-kunlun/examples/eb`）是 `code/xy/sglang-kunlun` 自带的一套独立复现材料。
+适配层位于 `sglang_kunlun/eb5_adapt/`，由插件
 `sglang_kunlun.eb5_adapt.eb5_kunlun_patch` 在服务启动时加载。
 
 ```
@@ -49,13 +49,7 @@ env/bin/pip install -e "$W/code/xy/sglang-kunlun" --no-deps --no-build-isolation
 > 需要切回源工作区时，反向执行：
 > `env/bin/pip install -e "$W/code/sglang-kunlun" --no-deps --no-build-isolation`
 
-### 1.2 fork 需要已打 INT8 补丁
-
-```bash
-grep -c EB5_INT8_ONLINE "$W/code/sglang/python/sglang/srt/internal/environ.py"   # 应为 1
-```
-
-### 1.3 设备干净
+### 1.2 设备干净
 
 ```bash
 source "$W/code/xy/sglang-kunlun/examples/eb/tool/env.sh"

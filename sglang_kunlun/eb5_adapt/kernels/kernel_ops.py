@@ -306,7 +306,18 @@ def _patch_symbol(spec: KernelSpec, replacement: object) -> None:
         break
     if module is None:
         return
-    for target in _sibling_modules(module):
+    # Sweep every already-imported sglang module, not just the relocation
+    # siblings: upstream binds these symbols with ``from x import f`` at import
+    # time (e.g. ``sglang.srt.models.deepseek_v4.fused_q_norm_rope``), and those
+    # copies keep calling the Triton/JIT implementation otherwise.
+    import sys as _sys
+
+    _targets = [
+        m
+        for n, m in list(_sys.modules.items())
+        if m is not None and n.startswith("sglang.") and hasattr(m, spec.kernel_name)
+    ]
+    for target in _targets:
         if not hasattr(target, spec.kernel_name):
             continue
         original = getattr(target, spec.kernel_name)
@@ -368,6 +379,9 @@ def force_plan_class_replacements() -> int:
     return touched
 
 
+_FAILED_PATCHES: list = []
+
+
 def reapply_all() -> None:
     """(Re-)install every registered Kunlun kernel replacement.
 
@@ -376,15 +390,29 @@ def reapply_all() -> None:
     second pass is needed to cover those siblings.
     """
 
+    # Isolate failures per target: without this a single unresolvable module
+    # aborts the whole loop, silently leaving every later kernel on its Triton
+    # implementation (that is how DSV4 lost attn_metadata/norm_rope patches
+    # after the 9c4954d refactor and crashed on ``_CudaTarget.arch``).
     for spec in _TRITON_OPS.values():
         replacement = (
             spec.impl
             if spec.metadata.get("call_style") == "direct"
             else KernelLauncher(spec.kernel_name, spec.impl)
         )
-        _patch_symbol(spec, replacement)
+        try:
+            _patch_symbol(spec, replacement)
+        except Exception as exc:  # noqa: BLE001
+            _FAILED_PATCHES.append(
+                (spec.module_path, spec.kernel_name, repr(exc))
+            )
     for spec in _JIT_OPS.values():
-        _patch_symbol(spec, spec.impl)
+        try:
+            _patch_symbol(spec, spec.impl)
+        except Exception as exc:  # noqa: BLE001
+            _FAILED_PATCHES.append(
+                (spec.module_path, spec.kernel_name, repr(exc))
+            )
 
 
 def install() -> None:
@@ -2171,6 +2199,9 @@ def fp8_paged_mqa_logits_torch(
     )
 
 
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.norm_rope", "fused_q_norm_rope"
+)
 @register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_q_norm_rope")
 def fused_q_norm_rope(
     q_input: torch.Tensor,
@@ -2183,6 +2214,9 @@ def fused_q_norm_rope(
     _fused_q_norm_rope_torch(q_input, q_output, eps, freqs_cis, positions)
 
 
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.norm_rope", "fused_k_norm_rope_flashmla"
+)
 @register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_k_norm_rope_flashmla")
 def fused_k_norm_rope_flashmla(
     kv: torch.Tensor,
@@ -2245,6 +2279,9 @@ def fused_k_norm_rope_flashmla_bf16(
     )
 
 
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.norm_rope", "fused_rope_inplace"
+)
 @register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_rope_inplace")
 def fused_rope_inplace(
     q: torch.Tensor,
@@ -2260,6 +2297,9 @@ def fused_rope_inplace(
     _fused_rope_inplace_kunlun(q, k, freqs_cis, positions, inverse)
 
 
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.norm_rope", "fused_norm_rope_inplace"
+)
 @register_jit_op("sglang.jit_kernel.dsv4.compress_old", "fused_norm_rope_inplace")
 def fused_norm_rope_inplace(
     kv: torch.Tensor,
@@ -2277,6 +2317,10 @@ def fused_norm_rope_inplace(
     _fused_norm_rope_inplace_kunlun(kv, weight, eps, freq_cis, positions)
 
 
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.norm_rope",
+    "fused_q_indexer_rope_hadamard_quant",
+)
 @register_jit_op(
     "sglang.jit_kernel.internal.dsv4.elementwise",
     "fused_q_indexer_rope_hadamard_quant",
@@ -2487,13 +2531,6 @@ def topk_transform_512_v2(
         scores, seq_lens, page_tables, out_page_indices,
         512, None, page_size, True,
     )
-
-
-# ---------------------------------------------------------------------------
-# Community main added a fused "small copy" Triton kernel used by the CUDA
-# graph buffer registry.  Triton cannot compile on Kunlun, and the operation
-# is a plain elementwise copy, so provide a torch implementation.
-# ---------------------------------------------------------------------------
 
 
 @register_jit_op(
@@ -2734,3 +2771,638 @@ def _eb5_patch_outer_dsa_decode_metadata() -> None:
 
 if os.environ.get("EB5_DSA_META_GRAPH_PATCH") == "1":
     _eb5_patch_outer_dsa_decode_metadata()
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.attn_metadata_kernels",
+    "expand_prefill_causally_triton",
+)
+def expand_prefill_causally_kunlun(
+    *,
+    req_pool_indices,
+    seq_lens,
+    extend_seq_lens,
+    num_tokens,
+    padded_num_tokens=None,
+):
+    """Device-side reference for the CUDA-only ``expand_prefill_causally``."""
+    from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
+        ExpandPrefillCausallyResult,
+    )
+
+    device = req_pool_indices.device
+    bs = req_pool_indices.shape[0]
+    total_tokens = (
+        padded_num_tokens
+        if padded_num_tokens is not None and padded_num_tokens > num_tokens
+        else num_tokens
+    )
+    extend = extend_seq_lens.to(torch.int64)
+    starts = torch.cumsum(extend, dim=0) - extend
+    offs = torch.arange(total_tokens, device=device)
+    is_real = offs < num_tokens
+    t = torch.where(is_real, offs, torch.zeros_like(offs))
+    r = torch.searchsorted(starts, t, right=True) - 1
+    r = torch.where(is_real, r, torch.full_like(r, max(bs - 1, 0))).clamp_(0, max(bs - 1, 0))
+    seq_len = seq_lens.to(torch.int64)[r]
+    ext = extend[r]
+    causal = (seq_len - ext + 1) + (t - starts[r])
+    causal = torch.where(is_real, causal, torch.ones_like(causal))
+    seq_lens_casual = causal.to(torch.int32)
+    req_pool_indices_repeated = req_pool_indices[r]
+    return ExpandPrefillCausallyResult(
+        seq_lens_casual=seq_lens_casual,
+        req_pool_indices_repeated=req_pool_indices_repeated,
+    )
+
+
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.attn_metadata_kernels",
+    "build_page_table_positions_triton",
+)
+def build_page_table_positions_kunlun(
+    *, req_to_token, req_pool_indices_repeated, seq_lens_casual,
+    max_seq_len, page_size, swa_window,
+):
+    from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
+        build_page_table_positions,
+    )
+
+    return build_page_table_positions(
+        req_to_token=req_to_token,
+        req_pool_indices_repeated=req_pool_indices_repeated,
+        seq_lens_casual=seq_lens_casual,
+        max_seq_len=max_seq_len,
+        page_size=page_size,
+        swa_window=swa_window,
+    )
+
+
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.attn_metadata_kernels",
+    "build_causal_swa_page_indices_triton",
+)
+def build_causal_swa_page_indices_kunlun(
+    *, req_to_token, full_to_swa_mapping, req_pool_indices_repeated,
+    seq_lens_casual, swa_window, page_index_aligned_size, swa_replay_start=None,
+):
+    from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
+        build_causal_swa_page_indices,
+    )
+
+    return build_causal_swa_page_indices(
+        req_to_token=req_to_token,
+        full_to_swa_mapping=full_to_swa_mapping,
+        req_pool_indices_repeated=req_pool_indices_repeated,
+        seq_lens_casual=seq_lens_casual,
+        swa_window=swa_window,
+        page_index_aligned_size=page_index_aligned_size,
+        swa_replay_start=swa_replay_start,
+    )
+
+
+
+
+@register_jit_op("sglang.kernels.ops.layernorm.mhc", "hc_broadcast")
+def hc_broadcast_kunlun(x, hc_mult):
+    """Triton-free ``[T, H] -> [T, hc_mult, H]`` broadcast."""
+    if x.numel() == 0:
+        return x.new_empty(x.shape[0], hc_mult, x.shape[1])
+    return x.unsqueeze(1).repeat(1, hc_mult, 1)
+
+
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels",
+    "combine_topk_swa_indices",
+)
+def combine_topk_swa_indices_kunlun(
+    topk_indices,
+    query_start_loc,
+    query_pos,
+    seq_lens,
+    gather_lens,
+    compressed_base,
+    swa_base,
+    window_size,
+    compress_ratio,
+    topk,
+    out_indices=None,
+    out_lens=None,
+    swa_indices=None,
+    swa_lengths=None,
+):
+    """Torch implementation of the sparse-prefill top-k + SWA merge."""
+    from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
+        combined_topk_width,
+    )
+
+    device = topk_indices.device
+    num_tokens = topk_indices.shape[0]
+    num_reqs = seq_lens.shape[0]
+    width = combined_topk_width(topk, window_size)
+    combined_indices = (
+        out_indices
+        if out_indices is not None
+        else torch.empty((num_tokens, width), dtype=torch.int32, device=device)
+    )
+    combined_lens = (
+        out_lens
+        if out_lens is not None
+        else torch.empty(num_tokens, dtype=torch.int32, device=device)
+    )
+    if num_tokens == 0:
+        return combined_indices, combined_lens
+
+    tok = torch.arange(num_tokens, device=device)
+    base = query_start_loc[0]
+    qsl = (query_start_loc - base).to(torch.int64)
+    owned = tok < qsl[num_reqs]
+
+    b = (torch.searchsorted(qsl, tok.to(torch.int64), right=True) - 1).clamp(
+        0, max(num_reqs - 1, 0)
+    )
+    gather = lambda t, fill: torch.where(owned, t.to(torch.int64)[b], torch.full_like(b, fill))
+    # ``query_pos`` is per token, while the rest are per request.
+    pos = torch.where(owned, query_pos.to(torch.int64), torch.zeros_like(b))
+    seq_len = gather(seq_lens, 0)
+    gather_len = gather(gather_lens, 0)
+    comp_base = gather(compressed_base, 0)
+    sw_base = gather(swa_base, 0)
+    gather_start = seq_len - gather_len
+
+    topk_len = torch.where(
+        owned,
+        torch.clamp((pos + 1) // compress_ratio, max=topk),
+        torch.zeros_like(pos),
+    )
+    if swa_indices is not None:
+        swa_len = torch.where(owned, swa_lengths.to(torch.int64), torch.zeros_like(pos))
+    else:
+        swa_len = torch.where(
+            owned, torch.clamp(pos + 1, max=window_size), torch.zeros_like(pos)
+        )
+
+    off = torch.arange(width, device=device)[None, :]
+    in_topk = off < topk_len[:, None]
+    k = topk_indices.shape[1]
+    safe_k_off = torch.clamp(off, max=max(k - 1, 0))
+    topk_vals = torch.gather(
+        topk_indices.to(torch.int64),
+        1,
+        safe_k_off.expand(num_tokens, width),
+    )
+    topk_vals = torch.where(in_topk, topk_vals, torch.full_like(topk_vals, -1))
+
+    in_swa = off < (topk_len + swa_len)[:, None]
+    swa_off = off - topk_len[:, None]
+    safe_swa_off = torch.clamp(swa_off, min=0)
+    if swa_indices is not None:
+        w = swa_indices.shape[1]
+        safe_swa_off = torch.clamp(safe_swa_off, max=max(w - 1, 0))
+        swa_vals = torch.gather(
+            swa_indices.to(torch.int64), 1, safe_swa_off
+        )
+        swa_vals = torch.where(swa_vals >= 0, sw_base[:, None] + swa_vals, -1)
+    else:
+        swa_start = sw_base + pos - swa_len + 1 - gather_start
+        swa_vals = swa_start[:, None] + swa_off
+
+    vals = torch.where(
+        in_topk,
+        torch.where(topk_vals >= 0, topk_vals + comp_base[:, None], topk_vals.new_full((), -1)),
+        torch.where(in_swa, swa_vals, swa_vals.new_full((), -1)),
+    )
+    combined_indices.copy_(vals.to(torch.int32))
+    combined_lens.copy_((topk_len + swa_len).to(torch.int32))
+    return combined_indices, combined_lens
+
+
+
+
+@register_jit_op("sglang.kernels.ops.gemm.bf16_fp32", "linear_bf16_fp32")
+def linear_bf16_fp32_kunlun(x, y):
+    """bf16 x (out, in)^T -> fp32 without the ``out_dtype`` mm overload."""
+    return torch.mm(x.to(torch.float32), y.to(torch.float32).t())
+
+
+
+
+@register_jit_op(
+    "sglang.kernels.ops.activation.silu_and_mul_clamp", "silu_and_mul_clamp"
+)
+def silu_and_mul_clamp_kunlun(input, output, swiglu_limit):
+    """SwiGLU with the DSV4 branch clamp (gate: min-clamp, up: both sides)."""
+    import torch.nn.functional as F
+
+    h = input.shape[-1] // 2
+    gate = input[..., :h].clamp(max=float(swiglu_limit))
+    up = input[..., h:].clamp(-float(swiglu_limit), float(swiglu_limit))
+    output.copy_(F.silu(gate) * up)
+
+
+
+
+@register_jit_op("sglang.kernels.ops.moe.dsv4", "hash_topk")
+def hash_topk_kunlun(
+    router_logits,
+    input_ids,
+    tid2eid,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: float = 1.0,
+    scoring_func: str = "sqrtsoftplus",
+):
+    """Pure-torch DSV4 hash routed gate (sqrt-softplus scoring)."""
+    assert scoring_func == "sqrtsoftplus"
+    num_tokens = router_logits.size(0)
+    num_routed_experts = router_logits.size(1)
+    topk_routed = tid2eid.size(1)
+    topk_fused = topk_routed + num_fused_shared_experts
+    topk_weights = torch.empty(
+        (num_tokens, topk_fused), dtype=torch.float32, device=router_logits.device
+    )
+    topk_ids = torch.empty(
+        (num_tokens, topk_fused), dtype=torch.int32, device=router_logits.device
+    )
+    if num_tokens == 0:
+        return topk_weights, topk_ids
+
+    rows = torch.arange(num_tokens, device=router_logits.device)
+    expert_id = tid2eid[input_ids.to(torch.int64)].to(torch.int64)
+    logit = router_logits[rows[:, None], expert_id].to(torch.float32)
+    softplus = torch.clamp(logit, min=0) + torch.log1p(torch.exp(-logit.abs()))
+    weight = torch.sqrt(softplus)
+    routed_sum = weight.sum(dim=1, keepdim=True).clamp_min(1e-20)
+    topk_weights[:, :topk_routed] = weight / routed_sum
+    topk_ids[:, :topk_routed] = expert_id.to(torch.int32)
+    if num_fused_shared_experts:
+        topk_weights[:, topk_routed:] = 1.0 / float(routed_scaling_factor)
+        topk_ids[:, topk_routed:] = (
+            num_routed_experts
+            + torch.arange(num_fused_shared_experts, device=router_logits.device)
+        ).to(torch.int32)
+    return topk_weights, topk_ids
+
+
+
+
+@register_jit_op("sglang.kernels.ops.moe.dsv4", "mask_topk_ids")
+def mask_topk_ids_kunlun(topk_ids, num_token_non_padded):
+    """Rows past the padded token count are marked invalid (-1)."""
+    n = num_token_non_padded.reshape(())
+    rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
+    mask = (rows >= n)[:, None]
+    topk_ids.copy_(torch.where(mask, torch.full_like(topk_ids, -1), topk_ids))
+
+
+
+
+@register_jit_op("sglang.kernels.ops.memory.allocator", "get_and_clear_swa_pages")
+def get_and_clear_swa_pages_kunlun(
+    full_page_representatives, mapping, page_size, check_page_mappings=False
+):
+    """Torch version of the SWA page resolve + clear kernel."""
+    num_pages = full_page_representatives.numel()
+    device = mapping.device
+    if num_pages == 0:
+        empty = torch.empty(0, dtype=mapping.dtype, device=device)
+        return empty, torch.empty(0, dtype=torch.bool, device=device), (
+            torch.empty(0, dtype=torch.bool, device=device)
+            if check_page_mappings
+            else None
+        )
+    reps = full_page_representatives.to(torch.int64)
+    swa_reps = mapping[reps]
+    swa_pages = (swa_reps // page_size).to(mapping.dtype)
+    peers_mapped = swa_reps > 0
+    starts = reps // page_size * page_size
+    offsets = starts[:, None] + torch.arange(page_size, device=device)[None, :]
+    page_valid = None
+    if check_page_mappings:
+        page_mapping = mapping[offsets]
+        same_page = (page_mapping // page_size) == (swa_reps // page_size)[:, None]
+        page_valid = peers_mapped & (
+            ((page_mapping > 0) & ~same_page).sum(dim=1) == 0
+        )
+    mapping[offsets] = 0
+    return swa_pages, peers_mapped, page_valid
+
+
+
+
+@register_jit_op(
+    "sglang.kernels.ops.speculative.tree", "build_tree_kernel_efficient"
+)
+def build_tree_kernel_efficient_kunlun(*args, **kwargs):
+    from sglang_kunlun.kernels.sgl_kernel_kunlun import speculative as _spec
+
+    ret = _spec.build_tree_kernel_efficient(*args, **kwargs)
+    names = (
+        "parent_list", "top_scores_index", "seq_lens", "tree_mask", "positions",
+        "retrive_index", "retrive_next_token", "retrive_next_sibling",
+        "topk", "spec_steps", "num_verify_tokens", "tree_mask_mode",
+    )
+    vals = dict(zip(names, args))
+    vals.update({k: v for k, v in kwargs.items() if k in names})
+    # FULL_MASK == 0 in sglang's TreeMaskMode; other modes (CPU/bitpacking) are
+    # not used on this backend.
+    if int(vals.get("tree_mask_mode", 0)) == 0 and "tree_mask" in vals:
+        nv = int(vals["num_verify_tokens"])
+        bs = int(vals["seq_lens"].numel())
+        _fill_tree_mask_full(
+            vals["tree_mask"], vals["seq_lens"],
+            vals["retrive_next_token"], vals["retrive_next_sibling"], nv, bs,
+        )
+    return ret
+
+
+
+
+@register_jit_op("sglang.kernels.ops.speculative.tree", "verify_tree_greedy")
+def verify_tree_greedy_kunlun(*args, **kwargs):
+    from sglang_kunlun.kernels.sgl_kernel_kunlun import speculative as _spec
+
+    if args and not kwargs:
+        names = (
+            "predicts",
+            "accept_index",
+            "accept_token_num",
+            "candidates",
+            "retrive_index",
+            "retrive_next_token",
+            "retrive_next_sibling",
+            "target_predict",
+        )
+        kwargs = dict(zip(names, args))
+    return _spec.verify_tree_greedy(**kwargs)
+
+
+
+
+@register_jit_op(
+    "sglang.kernels.ops.speculative.eagle", "prepare_verify_commit_outputs"
+)
+def prepare_verify_commit_outputs_kunlun(
+    predict,
+    accept_index,
+    accept_lens,
+    seq_lens,
+    num_draft_tokens=0,
+    mamba_track_interval=0,
+):
+    """Torch version of the EAGLE verify-commit output preparation."""
+    bs = accept_lens.numel()
+    dev = seq_lens.device
+    new_seq_lens = torch.empty(
+        (bs,), device=dev, dtype=torch.promote_types(seq_lens.dtype, accept_lens.dtype)
+    )
+    bonus = torch.empty((bs,), device=predict.device, dtype=torch.int32)
+    last_steps = track_steps = correct = select = ids = None
+    if num_draft_tokens:
+        last_steps = torch.empty((bs,), device=dev, dtype=torch.int64)
+        if mamba_track_interval:
+            track_steps = torch.empty_like(last_steps)
+        correct = torch.empty_like(accept_lens, memory_format=torch.contiguous_format)
+        select = torch.empty_like(last_steps)
+        ids = torch.empty((predict.numel(),), device=predict.device, dtype=torch.int64)
+    if bs == 0:
+        if num_draft_tokens:
+            return new_seq_lens, bonus, (last_steps, track_steps), (correct, select, ids)
+        return new_seq_lens, bonus
+
+    rows = torch.arange(bs, device=dev)
+    accepted = accept_lens[:bs].to(torch.int64)
+    length = seq_lens[:bs].to(torch.int64)
+    idx = accept_index[rows, accepted - 1].to(torch.int64)
+    pred = predict.reshape(-1)
+    idx_norm = torch.where(idx < 0, idx + predict.numel(), idx)
+    new_seq_lens[:bs] = (length + accepted).to(new_seq_lens.dtype)
+    bonus[:bs] = pred[idx_norm].to(torch.int32)
+
+    if num_draft_tokens:
+        last_steps[:bs] = idx - rows * num_draft_tokens
+        correct[:bs] = accepted.to(correct.dtype) - 1
+        select[:bs] = rows * num_draft_tokens + accepted - 1
+        # The kernel fills every row of ``ids`` (PREDICT_SIZE == predict.numel()),
+        # not just the first ``bs`` — draft extend reads them all.
+        _n = predict.numel()
+        ids[:_n] = (
+            predict.reshape(_n, -1)[:, 0].to(torch.int64)
+            if predict.dim() > 1
+            else pred[:_n].to(torch.int64)
+        )
+        if mamba_track_interval:
+            post = length + accepted
+            crossing = (length // mamba_track_interval) != (
+                post // mamba_track_interval
+            )
+            tp = torch.clamp(
+                post // mamba_track_interval * mamba_track_interval - length - 1,
+                min=0,
+            )
+            track = accept_index[rows, tp].to(torch.int64) - rows * num_draft_tokens
+            track_steps[:bs] = torch.where(crossing, track, track.new_full((), -1))
+        return new_seq_lens, bonus, (last_steps, track_steps), (correct, select, ids)
+    return new_seq_lens, bonus
+
+
+
+
+@register_jit_op(
+    "sglang.kernels.ops.kvcache.dsv4_c128_cleanup",
+    "clear_unaccepted_c128_draft_states",
+)
+def clear_unaccepted_c128_draft_states_new(*args, **kwargs):
+    return clear_unaccepted_c128_draft_states_torch(*args, **kwargs)
+
+
+
+
+@register_jit_op(
+    "sglang.kernels.ops.speculative.eagle", "prepare_draft_extend_lengths"
+)
+def prepare_draft_extend_lengths_kunlun(seq_lens, num_draft_tokens, front_offset):
+    bs = seq_lens.numel()
+    dev = seq_lens.device
+    prefix = torch.clamp(seq_lens.to(torch.int64) - front_offset, min=0).to(
+        torch.int32
+    )
+    extend = torch.full(
+        (bs,), int(num_draft_tokens) + int(front_offset), dtype=torch.int32, device=dev
+    )
+    post = (seq_lens.to(torch.int64) + num_draft_tokens).to(seq_lens.dtype)
+    return prefix, extend, post
+
+
+
+
+@register_jit_op(
+    "sglang.kernels.ops.speculative.eagle", "prepare_draft_extend_layout"
+)
+def prepare_draft_extend_layout_kunlun(seq_lens, num_draft_tokens, with_mrope):
+    bs = seq_lens.numel()
+    dev = seq_lens.device
+    W = int(num_draft_tokens)
+    prefix = torch.clamp(seq_lens.to(torch.int64), min=0).to(torch.int32)
+    extend = torch.full((bs,), W, dtype=torch.int32, device=dev)
+    post = (seq_lens.to(torch.int64) + W).to(seq_lens.dtype)
+    positions = torch.empty((bs * W,), dtype=torch.int64, device=dev)
+    starts = torch.empty((bs,), dtype=torch.int32, device=dev)
+    mrope = (
+        torch.empty((3, bs * W), dtype=torch.int64, device=dev) if with_mrope else None
+    )
+    if bs:
+        rows = torch.arange(bs * W, device=dev)
+        req = torch.div(rows, W, rounding_mode="floor")
+        token_base = seq_lens[req].to(torch.int64)
+        prefix_i = torch.clamp(token_base, min=0).to(torch.int32)
+        pos = prefix_i + (rows % W).to(torch.int32)
+        positions.copy_(pos.to(torch.int64))
+        starts[:bs] = (torch.arange(bs, device=dev) * W).to(torch.int32)
+        if mrope is not None:
+            mrope[:, :] = pos.to(torch.int64).unsqueeze(0)
+    return prefix, extend, post, (positions, starts, mrope)
+
+
+
+
+@register_jit_op(
+    "sglang.kernels.ops.speculative.eagle", "prepare_draft_extend_inputs"
+)
+def prepare_draft_extend_inputs_kunlun(accept_lens, predict, num_draft_tokens):
+    """Torch version of the EAGLE draft-extend input preparation."""
+    bs = accept_lens.numel()
+    tokens = predict.numel()
+    dev = accept_lens.device
+    accepted = accept_lens.to(torch.int64)
+    correct = (accepted - 1).to(accept_lens.dtype)
+    select = (
+        torch.arange(bs, device=dev, dtype=torch.int64) * num_draft_tokens
+        + accepted
+        - 1
+    )
+    if predict.dim() == 1:
+        ids = predict[:tokens].to(torch.int64)
+    else:
+        ids = predict.reshape(tokens, -1)[:, 0].to(torch.int64)
+    return correct, select, ids
+
+
+
+
+@register_jit_op("sglang.kernels.ops.speculative.eagle", "build_chain_tree")
+def build_chain_tree_kunlun(
+    bonus_tokens,
+    draft_tokens,
+    seq_lens,
+    tree_mask_buf=None,
+    req_pool_indices=None,
+    req_to_token=None,
+    with_mrope=False,
+):
+    """Torch version of the topk=1 chain tree builder."""
+    bs, depth = draft_tokens.shape
+    width = depth + 1
+    dev = seq_lens.device
+    mask = tree_mask_buf
+    if mask is None:
+        mask = torch.empty((bs * width * width,), dtype=torch.bool, device=dev)
+    positions = torch.empty((bs * width,), dtype=torch.int64, device=dev)
+    retrieve = torch.empty((3, bs, width), dtype=torch.int64, device=dev)
+    tokens = torch.empty(
+        (bs * width,),
+        dtype=torch.promote_types(bonus_tokens.dtype, draft_tokens.dtype),
+        device=dev,
+    )
+    out_cache_loc = torch.empty_like(positions) if req_to_token is not None else None
+    mrope = torch.empty((3, bs * width), dtype=torch.int64, device=dev) if with_mrope else None
+    if bs == 0:
+        return mask, positions, retrieve[0], retrieve[1], retrieve[2], tokens, out_cache_loc, mrope
+
+    rows = torch.arange(bs, device=dev)
+    cols = torch.arange(width, device=dev)
+    length = seq_lens.to(torch.int64).reshape(bs, 1)
+    pos = (length + cols[None, :]).reshape(-1)
+    positions[:] = pos
+    mask[: bs * width * width] = (
+        cols[None, :] <= cols[:, None]
+    ).reshape(-1).repeat(bs)
+    tok = torch.empty((bs, width), dtype=tokens.dtype, device=dev)
+    tok[:, 0] = bonus_tokens.reshape(-1).to(tokens.dtype)
+    tok[:, 1:] = draft_tokens.to(tokens.dtype)
+    tokens[:] = tok.reshape(-1)
+    off = torch.arange(bs * width, device=dev)
+    retrieve[0] = off.reshape(bs, width)
+    next_col = torch.where(
+        cols + 1 < width,
+        cols + 1,
+        torch.full_like(cols, -1),
+    )
+    retrieve[1] = next_col[None, :].expand(bs, width)
+    retrieve[2] = -1
+    if req_to_token is not None:
+        req = req_pool_indices.to(torch.int64)
+        loc = req_to_token[req[:, None], length + cols[None, :]]
+        out_cache_loc[:] = loc.reshape(-1).to(out_cache_loc.dtype)
+    if with_mrope:
+        mrope[:, :] = pos.unsqueeze(0)
+    return mask, positions, retrieve[0], retrieve[1], retrieve[2], tokens, out_cache_loc, mrope
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Community main added a fused "small copy" Triton kernel used by the CUDA
+# graph buffer registry.  Triton cannot compile on Kunlun, and the operation
+# is a plain elementwise copy, so provide a torch implementation.
+# ---------------------------------------------------------------------------
+@register_triton_op(
+    "sglang.srt.mem_cache.allocation", "assign_req_to_token_pool"
+)
+@register_triton_op(
+    "sglang.srt.speculative.triton_ops.cache_locs", "assign_req_to_token_pool"
+)
+@register_triton_op(
+    "sglang.srt.speculative.spec_utils", "assign_req_to_token_pool"
+)
+def assign_req_to_token_pool(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    pool_len: int,
+    bs_upper: int,
+) -> None:
+    """Write this step's cache locations into the request token pool."""
+
+    if out_cache_loc.dtype != req_to_token.dtype:
+        out_cache_loc = out_cache_loc.to(req_to_token.dtype)
+    torch.ops.xspeedgate_ops.assign_req_to_token_pool(
+        req_pool_indices.to(torch.int32),
+        req_to_token,
+        start_offset.to(torch.int32),
+        end_offset.to(torch.int32),
+        out_cache_loc,
+        pool_len,
+        req_pool_indices.shape[0],
+    )
+
+
+@register_jit_op("sglang.kernels.ops.memory.small_copy", "try_small_copy")
+@register_jit_op("sglang.srt.mem_cache.small_copy", "try_small_copy")
+def try_small_copy_kunlun(dsts, srcs):
+    if len(dsts) < 2 or len(dsts) != len(srcs):
+        return False
+    try:
+        for dst, src in zip(dsts, srcs):
+            if dst.shape != src.shape or dst.device != src.device:
+                return False
+            dst.copy_(src)
+        return True
+    except Exception:
+        return False

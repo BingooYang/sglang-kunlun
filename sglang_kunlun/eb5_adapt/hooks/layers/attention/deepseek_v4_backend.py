@@ -892,31 +892,40 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
 
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
-            # Internal fork's ``SparsePrefillChunkCache.build`` takes
-            # ``max_seq_len`` / ``total_swa`` and no longer takes
-            # ``query_lens`` / ``query_pos`` (upstream v0.5.x derived both
-            # internally).  Mirror the internal
-            # ``_build_sparse_prefill_chunk_cache`` computation.
-            seq_lens_cpu_list = forward_batch.seq_lens_cpu.tolist()
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-            total_swa = sum(
-                min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
-                for seq_len, extend_len in zip(
-                    seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
+            # The fork's own builder knows the current ``build`` signature
+            # (``query_lens`` / ``query_pos`` were re-added upstream) and the
+            # request-window / CP layouts, so prefer it and keep the inline
+            # construction only as a fallback for older trees.
+            inherited_builder = getattr(
+                self, "_build_sparse_prefill_chunk_cache", None
+            )
+            if inherited_builder is not None:
+                cache = inherited_builder(
+                    forward_batch,
+                    core_attn_metadata,
+                    num_qo_tokens=q_flat.shape[0],
                 )
-            )
-            cache = SparsePrefillChunkCache.build(
-                seq_lens=forward_batch.seq_lens.to(torch.int32),
-                extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
-                req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
-                req_to_token=self.req_to_token,
-                full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
-                swa_window_size=SWA_WINDOW,
-                swa_page_size=token_to_kv_pool.swa_page_size,
-                num_qo_tokens=q_flat.shape[0],
-                max_seq_len=max(seq_lens_cpu_list),
-                total_swa=total_swa,
-            )
+            else:
+                seq_lens_cpu_list = forward_batch.seq_lens_cpu.tolist()
+                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                total_swa = sum(
+                    min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
+                    for seq_len, extend_len in zip(
+                        seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
+                    )
+                )
+                cache = SparsePrefillChunkCache.build(
+                    seq_lens=forward_batch.seq_lens.to(torch.int32),
+                    extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
+                    req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+                    req_to_token=self.req_to_token,
+                    full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
+                    swa_window_size=SWA_WINDOW,
+                    swa_page_size=token_to_kv_pool.swa_page_size,
+                    num_qo_tokens=q_flat.shape[0],
+                    max_seq_len=max(seq_lens_cpu_list),
+                    total_swa=total_swa,
+                )
             self.forward_metadata.sparse_prefill_cache = cache
         # Resolve the workspace + indices for this ratio, then dequant
         # SWA + compressed regions directly into the workspace (no torch.cat).
@@ -937,40 +946,12 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         else:
             extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
             extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
-            if compress_ratio == 128:
-                assert core_attn_metadata.c128_page_indices is not None
-                # Fork API: ensure_c128 populates the cache in place.
-                cache.ensure_c128(core_attn_metadata.c128_page_indices)
-                flat_token_ids = cache.c128_flat_token_ids
-                combined_indices = cache.c128_combined_indices
-                combined_lens = cache.c128_combined_lens
-            else:
-                if moa_v2_merge_mask is not None:
-                    from sglang.srt.internal.layers.attention.dsv4.moa_merge_indices import (
-                        merge_moa_raw_indices,
-                    )
-
-                    raw_indices = merge_moa_raw_indices(
-                        moa_v2_merge_mask, core_attn_metadata, cache.num_qo_tokens
-                    )
-                elif moa_v2_nearest:
-                    raw_indices = core_attn_metadata.c4_nearest_raw_indices
-                    assert raw_indices is not None, (
-                        "sparse-prefill MOA v2 cheap branch requires "
-                        "c4_nearest_raw_indices"
-                    )
-                else:
-                    raw_indices = core_attn_metadata.c4_sparse_raw_indices
-                    assert raw_indices is not None, (
-                        "sparse-prefill c4 path requires c4_sparse_raw_indices "
-                        "(allocated in init_flashmla_related when is_prefill=True)"
-                    )
-                # Fork API: ensure_c4/combine_c4_layer, in place.
-                cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
-                flat_token_ids = cache.c4_flat_token_ids
-                combined_indices, combined_lens = cache.combine_c4_layer(
-                    c4_sparse_raw_indices=raw_indices[: cache.num_qo_tokens],
-                )
+            # Fork API: ``layer_inputs`` gathers the ratio's slots and combines
+            # them per layer (it replaced the per-ratio ``ensure_c4`` /
+            # ``combine_c4_layer`` helpers).
+            flat_token_ids, combined_indices, combined_lens = cache.layer_inputs(
+                compress_ratio, core_attn_metadata, extra_page_size
+            )
             n_compressed = flat_token_ids.shape[0]
             workspace = self.sparse_prefill_workspace.get(
                 n_compressed + cache.swa_token_ids.shape[0]

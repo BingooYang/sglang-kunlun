@@ -15,6 +15,7 @@ from sglang_kunlun.eb5_adapt.kernels.mhc_torch import (
     _LOG2E,
     _matmul_bf16_by_fp32,
     _sqrsum_bf16_rows,
+    hc_combine as mhc_combine_torch_ref,
     mhc_post as mhc_post_torch_ref,
     mhc_pre as mhc_pre_torch_ref,
 )
@@ -472,6 +473,14 @@ def apply() -> list[str]:
 
     ew0 = "sglang.kernels.ops.attention.dsv4.elementwise"
     _patch(ew0, "fused_q_norm_rope", fused_q_norm_rope)
+    # ``norm_rope.fused_q_norm_rope`` dispatches on a module-level `_is_xpu`;
+    # on this stack torch.xpu is absent, so it fell through to the CUDA JIT
+    # builder (`sgl_kernel_jit_dpsk_v4_main_q_norm_rope_*`) and failed there.
+    _patch(
+        "sglang.kernels.ops.attention.dsv4.norm_rope",
+        "fused_q_norm_rope",
+        fused_q_norm_rope,
+    )
 
     mhc_mod = "sglang.kernels.ops.layernorm.mhc"
     # ① 调用层：EB5 的模型前向统一走与 DSV4 同构的散算子实现（融合分支在真实多 rank
@@ -480,6 +489,10 @@ def apply() -> list[str]:
     #    `patch_everywhere` 会按对象身份把这类旧绑定一并改掉。
     _patch(mhc_mod, "mhc_pre", mhc_pre_torch_ref)
     _patch(mhc_mod, "mhc_post", mhc_post_torch_ref)
+    # ``mhc_combine`` was dropped from the registration set together with the
+    # other mHC kernels; DSV4's boundary path still calls it, and the Triton
+    # version then dies in graph capture (``_CudaTarget.arch``).
+    _patch(mhc_mod, "mhc_combine", mhc_combine_torch_ref)
     # ② kernel 级：昆仑没有 tilelang / deep_gemm，这些融合 kernel 由 torch 散算子
     #    逐个替代（**不能**只在 ① 的调用层绕开 —— 直调 kernel 的代码同样要能跑）。
     _patch(mhc_mod, "mhc_post_tilelang", mhc_post_tilelang)

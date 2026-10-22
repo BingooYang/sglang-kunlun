@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import torch
+from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 try:  # 包内导入
     from .eb5_extra_adapt import _patch_everywhere
@@ -188,3 +189,59 @@ def apply() -> list:
         except Exception as exc:  # noqa: BLE001
             print(f"[eb5-xy-adapt] {hook.__name__} failed: {exc}")
     return patched
+
+
+@plugin_hook(
+    "sglang.srt.model_executor.model_runner.ModelRunner.__init__",
+    type=HookType.AROUND,
+)
+def _reinstall_kernel_ops_around_model_init(original_fn, self, *args, **kwargs):
+    """Re-apply the kernel replacements around ``ModelRunner.__init__``.
+
+    ``ModelRunner.__init__`` imports the model module (binding the upstream
+    ``fused_q_norm_rope`` & co. into its globals) **and** captures the decode
+    CUDA graphs at the end.  The plugin's first ``install()`` therefore ran
+    before those bindings existed, and repairing only afterwards is already
+    too late for the capture.  Re-install on both sides: the sweep rewrites
+    every already-imported alias, and the second pass catches modules imported
+    while the runner was being built.
+    """
+    _reinstall_kernel_ops("before ModelRunner.__init__")
+    ret = original_fn(self, *args, **kwargs)
+    _reinstall_kernel_ops("after ModelRunner.__init__")
+    return ret
+
+
+_MODEL_MODULES = ("sglang.srt.models.deepseek_v4",)
+
+
+def _reinstall_kernel_ops(stage: str) -> None:
+    try:
+        import importlib
+        import sys
+
+        from sglang_kunlun.eb5_adapt.kernels import kernel_ops as _kops
+
+        _kops.install()
+        # The model module binds the upstream ``fused_q_norm_rope`` & co. with
+        # ``from ... import f`` at import time; if it is not imported yet the
+        # sweep above cannot see those aliases, so pull it in and sweep again.
+        newly_imported = []
+        for name in _MODEL_MODULES:
+            if name in sys.modules:
+                continue
+            try:
+                importlib.import_module(name)
+                newly_imported.append(name)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[eb5-xy-adapt] import {name} failed: {exc}")
+        if newly_imported:
+            _kops.install()
+        bad = getattr(_kops, "_FAILED_PATCHES", [])
+        if bad:
+            print(
+                f"[kernel-ops/{stage}] {len(bad)} failed patches: {bad[:5]}",
+                flush=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[eb5-xy-adapt] kernel_ops re-install ({stage}) failed: {exc}")

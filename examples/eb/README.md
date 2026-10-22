@@ -5,7 +5,7 @@
 `sglang_kunlun.eb5_adapt.eb5_kunlun_patch` 在服务启动时加载。
 
 ```
-01_eb/
+examples/eb/
   README.md
   tool/
     env.sh                 # venv / XPU / KLX 环境
@@ -35,7 +35,7 @@ W=/root/paddlejob/gpfsspace/bingoo/p800_eb
 确认当前装的是哪个：
 
 ```bash
-source "$W/code/xy/sglang-kunlun/01_eb/tool/env.sh"
+source "$W/code/xy/sglang-kunlun/examples/eb/tool/env.sh"
 python -c "import sglang_kunlun; print(sglang_kunlun.__file__)"
 # 期望：.../code/xy/sglang-kunlun/sglang_kunlun/__init__.py
 ```
@@ -58,7 +58,7 @@ grep -c EB5_INT8_ONLINE "$W/code/sglang/python/sglang/srt/internal/environ.py"  
 ### 1.3 设备干净
 
 ```bash
-source "$W/code/xy/sglang-kunlun/01_eb/tool/env.sh"
+source "$W/code/xy/sglang-kunlun/examples/eb/tool/env.sh"
 xpu-smi | grep -c '0MiB / 98304MiB'      # 必须是 8
 ```
 
@@ -68,7 +68,7 @@ xpu-smi | grep -c '0MiB / 98304MiB'      # 必须是 8
 cd "$W"
 LAYERS=43 EB5_GPUS=0,1,2,3,4,5,6,7 CONTEXT_LENGTH=32768 MEM_FRACTION=0.88 \
 EXTRA_ARGS="--dsa-topk-backend torch" \
-bash "$W/code/xy/sglang-kunlun/01_eb/tool/run_eb5_int8.sh" \
+bash "$W/code/xy/sglang-kunlun/examples/eb/tool/run_eb5_int8.sh" \
      "$W/models/hf_checkpoint-48800" 30082
 ```
 
@@ -87,7 +87,7 @@ bash "$W/code/xy/sglang-kunlun/01_eb/tool/run_eb5_int8.sh" \
 ## 3. 验证
 
 ```bash
-bash "$W/code/xy/sglang-kunlun/01_eb/tool/verify_eb5.sh" 30082
+bash "$W/code/xy/sglang-kunlun/examples/eb/tool/verify_eb5.sh" 30082
 ```
 
 脚本会：
@@ -117,7 +117,7 @@ done; wait
 ## 4. 停机
 
 ```bash
-bash "$W/code/xy/sglang-kunlun/01_eb/tool/stop_kunlun.sh"
+bash "$W/code/xy/sglang-kunlun/examples/eb/tool/stop_kunlun.sh"
 ```
 
 **不要 `kill -9`**：会留下杀不掉的 XPU kernel，拖坏整个 XPU runtime（详见源仓库
@@ -154,7 +154,7 @@ cd "$W"
 LAYERS=8 EB5_GPUS=0 CONTEXT_LENGTH=8192 MEM_FRACTION=0.85 \
 GRAPH_ARGS="--cuda-graph-backend-decode full --cuda-graph-max-bs-decode 2" \
 EXTRA_ARGS="--quantization blockwise_int8 --moe-a2a-backend none --ep-size 1 --disable-overlap-schedule --deepep-mode low_latency --dsa-topk-backend torch" \
-bash "$W/code/xy/sglang-kunlun/01_eb/tool/run_eb5_int8.sh" \
+bash "$W/code/xy/sglang-kunlun/examples/eb/tool/run_eb5_int8.sh" \
      "$W/models/hf_checkpoint-48800" 30110
 ```
 
@@ -162,7 +162,7 @@ bash "$W/code/xy/sglang-kunlun/01_eb/tool/run_eb5_int8.sh" \
 
 - 日志出现 `Capture target decode CUDA graph begin`
 - 日志 / `server_args` 里 `cuda_graph` 的 decode 不再是 0
-- `bash 01_eb/tool/verify_eb5.sh 30110` 通过 4/4
+- `bash examples/eb/tool/verify_eb5.sh 30110` 通过 4/4
 
 注意：
 

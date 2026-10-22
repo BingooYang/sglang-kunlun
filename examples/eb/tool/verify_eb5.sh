@@ -2,7 +2,7 @@
 # 验证 EB5 服务：等待 ready → health → 4 个不同 prompt 的并发请求。
 #
 # 用法：
-#   bash 01_eb/tool/verify_eb5.sh [PORT]
+#   bash examples/eb/tool/verify_eb5.sh [PORT]
 #   默认 PORT=30082；日志取 $BINGOO/logs 下最新的 eb5_kunlun_*.log。
 set -uo pipefail
 

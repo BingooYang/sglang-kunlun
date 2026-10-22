@@ -2,7 +2,7 @@
 # EB5 / EB-Lite (Ernie Lite) 在昆仑 P800 上起服务。
 #
 # 参考：
-#   * 昆仑侧：`01_eb/tool/env.sh`（本仓库自建 venv 的环境激活脚本）
+#   * 昆仑侧：`examples/eb/tool/env.sh`（本仓库自建 venv 的环境激活脚本）
 #   * EB5 侧：fork 的 `ce/scripts/eb/gpu-b/eb5_mtp_tp4dp4ep4_128k_opt.sh`
 #              + `scripts/internal/launch_demo_scripts/eb5/common_eb5_env.sh`
 #
@@ -30,7 +30,7 @@ unset _BINGOO_DIR
 # 环境：venv + 动态库搜索路径 + 设备可见性 + 昆仑运行时开关 + KLX 集合通信变量。
 # **不要**再单独设 `SGLANG_PLATFORM` / `SGLANG_USE_XPU`：标准 launcher 通过 entry
 # points 发现 kunlun 平台，提前设会让 sitecustomize 过早 bootstrap XPU
-# （见 `01_eb/tool/env.sh` 第 3 段的注释）。
+# （见 `examples/eb/tool/env.sh` 第 3 段的注释）。
 source "$HERE/env.sh"
 
 MODEL_PATH=${1:-$BINGOO/models/hf_checkpoint-48800}
@@ -67,7 +67,7 @@ MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-8}
 # `xspeedgate_ops.set_k_and_s_v4`，与 DSV4 已跑通的那条同类。
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-bfloat16}
 EXTRA_ARGS=${EXTRA_ARGS:-}
-# decode CUDA graph：默认关闭；开启示例见 01_eb/README.md「Decode CUDA graph」。
+# decode CUDA graph：默认关闭；开启示例见 examples/eb/README.md「Decode CUDA graph」。
 # 注意 `--deepep-mode normal` 会被框架强制关图，开图必须 low_latency。
 GRAPH_ARGS=${GRAPH_ARGS:---disable-cuda-graph}
 # EB5 的 DSA decode metadata 外层仍是 Triton `kernel[grid]`；置 1 用 torch 兜底。

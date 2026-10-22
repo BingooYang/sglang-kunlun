@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Kunlun P800 推理环境激活脚本  ——  source 这个文件，不要直接执行。
 #
-#   source code/xy/sglang-kunlun/01_eb/tool/env.sh
+#   source code/xy/sglang-kunlun/examples/eb/tool/env.sh
 #
 # 内容分四段：
 #   1) venv 与动态库搜索路径
@@ -9,16 +9,16 @@
 #   3) 昆仑运行时开关（来自 sglang-kunlun/setup_env.sh）
 #   4) 集合通信 / DeepEP 所需 KLX 变量（BKCL_* / XSHMEM_*）
 #
-# 环境构成见 01_eb/2. 构建环境.md。
+# 环境构成见 examples/eb/构建环境.md。
 #
 # 🔴 起服务 / 跑压测前必读：**不要 `kill -9` 卡在 XPU 调用里的进程**（CPU 100% 空转、
 # GPU 0% util、显存不涨）。强杀会在设备上留下杀不掉的 kernel，拖坏整个 XPU runtime，
 # 并让驱动泄漏 "in use" 引用计数 —— 之后 `xpu-smi -r` 对全部 8 张卡都报
 # "currently in use by another process"（即使没有进程持有 /dev/xpu*），只能节点级重启。
-# 详见 01_eb/3. eb5模型运行.md 的「最重要的一条」。
+# 详见 examples/eb/README.md 的「硬约束」。
 
 # 工作区根目录：从脚本位置向上找含 env/bin/python 的目录（脚本在
-# code/xy/sglang-kunlun/01_eb/tool/ 下，离根有好几层），不依赖当前目录。
+# code/xy/sglang-kunlun/examples/eb/tool/ 下，离根有好几层），不依赖当前目录。
 _BINGOO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 while [ "$_BINGOO_DIR" != / ] && [ ! -x "$_BINGOO_DIR/env/bin/python" ]; do
   _BINGOO_DIR=$(dirname "$_BINGOO_DIR")

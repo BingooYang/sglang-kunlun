@@ -51,7 +51,7 @@ esac
 echo "launch: MODE=$MODE PORT=$PORT CONDA_ENV=$CONDA_ENV TAG=$TAG"
 
 # Clear leftovers safely (never kill -9 a launcher: it leaves stuck XPU kernels).
-STOP="$HERE/../../01_eb/tool/stop_kunlun.sh"
+STOP="$HERE/../eb/tool/stop_kunlun.sh"
 if [ "${SKIP_STOP:-0}" != "1" ] && [ -f "$STOP" ]; then
     bash "$STOP" || { echo "leftover sglang processes; refusing to start"; exit 1; }
 fi

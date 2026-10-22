@@ -1110,6 +1110,28 @@ def _alloc_decode_kernel_impl(
     out_indices.copy_(out.to(out_indices.dtype))
 
 
+def _install_oot_mla_pool_patch() -> list:
+    """把 fork 的 MLA pool hook 同时挂到 out-of-tree 构建入口。
+
+    fork 只给 ``_build_mla_kv_pool`` 注册了 hook，而 Kunlun 走
+    ``is_out_of_tree()`` 分支、实际调的是 ``_build_oot_mla_kv_pool``，EB5 的 MTP
+    draft 会掉到 stock MLA pool 上崩在 ``index_head_dim``。
+    """
+    from sglang.srt.internal.layers.attention.mla_hca.pool_patch import (
+        _patch_build_mla_kv_pool,
+    )
+    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+    target = (
+        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator."
+        "_build_oot_mla_kv_pool"
+    )
+    if any(h is _patch_build_mla_kv_pool for _, h, _ in HookRegistry._hooks[target]):
+        return []
+    HookRegistry.register(target, _patch_build_mla_kv_pool, HookType.AROUND)
+    return [target]
+
+
 def _install_alloc_decode() -> list:
     """把 ``PagedTokenToKVPoolAllocator.alloc_decode`` 整个换成 torch 实现。
 
@@ -1583,6 +1605,7 @@ def apply() -> list:
             print(f"[eb5-extra-adapt] import {module_name} failed: {exc}")
 
     for hook in (
+        _install_oot_mla_pool_patch,
         _install_alloc_decode,
         _install_deep_gemm_extra,
         _install_dsv4_metadata_kernels,

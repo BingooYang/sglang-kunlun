@@ -1,7 +1,7 @@
 # EB5 整网快速复现（INT8，8 卡）
 
-本目录是 `code/xy/sglang-kunlun` 自带的一套独立复现材料，不依赖源工作区的
-`01_eb_adp`。适配层位于 `sglang_kunlun/eb5_adapt/`，由插件
+本目录（`code/xy/sglang-kunlun/examples/eb`）是 `code/xy/sglang-kunlun` 自带的一套独立复现材料，
+不依赖源工作区的 `code/sglang-kunlun/01_eb_adp`。适配层位于 `sglang_kunlun/eb5_adapt/`，由插件
 `sglang_kunlun.eb5_adapt.eb5_kunlun_patch` 在服务启动时加载。
 
 ```

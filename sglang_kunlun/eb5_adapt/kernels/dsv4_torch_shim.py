@@ -837,14 +837,19 @@ def _compress_forward_torch(
 def _store_bf16_rows(kvcache, loc, rows_bf16, page_size, valid=None):
     """Scatter ``[N, D]`` bf16 rows into a byte-addressed paged buffer.
 
-    The internal fork stores the bf16 KV layout in a *uint8* pool
+    The internal fork stores the bf16 KV layout in a byte-addressed pool
     (``bytes_per_token = D * 2``), so the rows go in as raw bf16 bytes at
     ``page*page_bytes + in_page*(D*2)``.
     """
     n, d = rows_bf16.shape
     page_bytes = kvcache.shape[1]
-    u8 = kvcache.contiguous().view(torch.uint8).reshape(-1)
-    src = rows_bf16.contiguous().view(torch.uint8).reshape(n, d * 2)
+    # Scatter through an *int8* view. xpytorch's index_put_ kernel only handles
+    # signed chars, so a uint8 scatter is lowered to uint8->int8 cast, the
+    # scatter, then int8->uint8 cast — two element-wise kernels per layer per
+    # decode step (measured: 69% of decode device time). The bit pattern is
+    # identical, so viewing as int8 skips both conversions.
+    u8 = kvcache.contiguous().view(torch.int8).reshape(-1)
+    src = rows_bf16.contiguous().view(torch.int8).reshape(n, d * 2)
     loc = loc.to(torch.int64).clamp(min=0, max=kvcache.shape[0] * page_size - 1)
     page = torch.div(loc, page_size, rounding_mode="floor")
     in_page = loc % page_size
@@ -856,7 +861,7 @@ def _store_bf16_rows(kvcache, loc, rows_bf16, page_size, valid=None):
         return
     # Rows the plan marked invalid are routed to an appended scratch token that
     # is discarded, so they never corrupt real slots.  The selection is pure
-    # int64 arithmetic: XPU's graph capturer rejects `where` on uint8 data.
+    # int64 arithmetic: XPU's graph capturer rejects `where` on byte data.
     total = u8.numel()
     m = valid.unsqueeze(1).to(torch.int64)
     tgt = base[:, None] * m + total * (1 - m)

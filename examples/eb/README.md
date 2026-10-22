@@ -114,8 +114,8 @@ done; wait
 bash "$W/code/xy/sglang-kunlun/examples/eb/tool/stop_kunlun.sh"
 ```
 
-**不要 `kill -9`**：会留下杀不掉的 XPU kernel，拖坏整个 XPU runtime（详见源仓库
-`01_eb_adp/doc/3` 的「最重要的一条」）。
+**不要 `kill -9`**：会留下杀不掉的 XPU kernel，拖坏整个 XPU runtime（详见
+`examples/eb/tool/env.sh` 头部的「必读」说明）。
 
 ## 5. 硬约束
 

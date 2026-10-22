@@ -173,6 +173,72 @@ def _decode_plan_generate_torch(
     return CompressorDecodePlan(int(compress_ratio), plan_d)
 
 
+def _native_prefill_plan(
+    compress_ratio,
+    req_pool_indices,
+    seq_lens,
+    extend_lens,
+    req_to_token,
+    full_to_state,
+    swa_page_size,
+    ring_size,
+    num_q_tokens,
+):
+    """Build the c4/c128 prefill plans with the vendor op when available.
+
+    ``xspeedgate_ops.plan_compress_prefill_v2`` fills the ``buffer_len`` /
+    ``read_page_0`` / ``read_page_1`` fields that ``dsv4_compress_forward_v2``
+    needs; the torch builder leaves ``buffer_len`` at 0, which makes the
+    compressor clamp out-of-chunk ragged rows instead of masking them. Returns
+    ``(plan_c, plan_w)`` or ``None`` to fall back to the torch builder.
+    """
+    import os
+
+    import torch
+
+    if os.environ.get("SGLANG_KUNLUN_NATIVE_PLAN", "0") == "0":
+        return None
+    if req_to_token is None or full_to_state is None:
+        return None
+    if swa_page_size is None or ring_size is None or num_q_tokens is None:
+        return None
+    if not hasattr(torch.ops, "xspeedgate_ops"):
+        return None
+    op = getattr(torch.ops.xspeedgate_ops, "plan_compress_prefill_v2", None)
+    if op is None:
+        return None
+    cr = int(compress_ratio)
+    nq = int(num_q_tokens)
+    if cr not in (4, 128) or nq <= 0 or nq > 65535:
+        return None
+    sps, rs = int(swa_page_size), int(ring_size)
+    # The kernel only shifts/masks: both must be powers of two and divide.
+    if sps & (sps - 1) or rs & (rs - 1) or sps % rs or rs % cr:
+        return None
+    if seq_lens.device.type != extend_lens.device.type:
+        return None
+    try:
+        plan_c, plan_w = op(
+            req_pool_indices.to(torch.int64),
+            req_to_token.to(torch.int32),
+            full_to_state.to(torch.int64),
+            seq_lens.to(torch.int64),
+            extend_lens.to(torch.int64),
+            None,
+            nq,
+            cr,
+            sps,
+            rs,
+            False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[eb5-compress] native prefill plan failed, using torch: {exc}")
+        return None
+    if plan_c.shape[0] != nq or plan_w.shape[0] != nq:
+        return None
+    return plan_c, plan_w
+
+
 @plugin_hook(
     "sglang.kernels.ops.attention.dsv4.compress.CompressorPrefillPlan.generate",
     type=HookType.REPLACE,
@@ -202,6 +268,20 @@ def _prefill_plan_generate_torch(
         _make_prefill_plan_c4_torch,
         _make_prefill_plan_torch,
     )
+
+    native = _native_prefill_plan(
+        compress_ratio,
+        req_pool_indices,
+        seq_lens,
+        extend_lens,
+        req_to_token,
+        full_to_swa,
+        swa_page_size,
+        ring_size,
+        num_q_tokens,
+    )
+    if native is not None:
+        return CompressorPrefillPlan(int(compress_ratio), native[0], native[1], None)
 
     _mk_pre = (
         _make_prefill_plan_c4_torch

@@ -781,6 +781,77 @@ def _compress_forward_c128_torch(
     return out.to(kv_score_input.dtype)
 
 
+def _native_compress_forward_v2(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    ape: torch.Tensor,
+    plan: object,
+    *,
+    head_dim: int,
+    compress_ratio: int,
+    out: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Run ``xspeedgate_ops.dsv4_compress_forward_v2`` when it is available.
+
+    The op implements exactly the v2 contract used by this fork (plan_c 16 B /
+    plan_w 8 B per row, write-then-compress for decode, compress-then-write for
+    prefill), so it replaces the ~5.4 k torch ops the fallback issues per
+    prefill step. Returns ``None`` when the op or a required layout is missing,
+    letting the caller fall back to the torch decomposition.
+    """
+    if os.environ.get("SGLANG_KUNLUN_NATIVE_COMPRESS", "1") == "0":
+        return None
+    if not hasattr(torch.ops, "xspeedgate_ops"):
+        return None
+    op = getattr(torch.ops.xspeedgate_ops, "dsv4_compress_forward_v2", None)
+    if op is None:
+        return None
+    try:
+        plan_c = plan[1]
+        is_decode = bool(plan.is_decode)
+        plan_w = None if is_decode else plan[2]
+    except Exception:  # noqa: BLE001 - unknown plan object
+        return None
+    if (
+        plan_c.dtype != torch.uint8
+        or plan_c.dim() != 2
+        or plan_c.shape[1] != 16
+        or kv_score_buffer.dim() != 3
+        or int(kv_score_buffer.shape[1]) != int(compress_ratio)
+        or kv_score_buffer.shape[2] != kv_score_input.shape[1]
+        or kv_score_buffer.dtype != kv_score_input.dtype
+        or ape.dtype != kv_score_input.dtype
+        or int(compress_ratio) not in (4, 128)
+    ):
+        return None
+    width = 8 if int(compress_ratio) == 4 else int(compress_ratio)
+    if int(ape.shape[0]) < width or int(ape.shape[1]) != int(head_dim):
+        return None
+    if plan_w is not None and (
+        plan_w.dtype != torch.uint8 or plan_w.dim() != 2 or plan_w.shape[1] != 8
+    ):
+        return None
+    if int(compress_ratio) == 4 and os.environ.get(
+        "SGLANG_KUNLUN_NATIVE_COMPRESS_C4", "0"
+    ) == "0":
+        return None
+    if out is None:
+        out = kv_score_input.new_empty((plan_c.shape[0], head_dim))
+    elif out.dtype != kv_score_input.dtype or out.shape != (plan_c.shape[0], head_dim):
+        return None
+
+    op(
+        kv_score_buffer,
+        kv_score_input,
+        out,
+        ape,
+        plan_c,
+        plan_w,
+        int(compress_ratio),
+    )
+    return out
+
+
 def _compress_forward_torch(
     kv_score_buffer: torch.Tensor,   # [num_pages, cr, head_dim*2] or [num_pages, cr, head_dim*4] for c4
     kv_score_input: torch.Tensor,    # [bs/num_q_tokens, head_dim*2] or head_dim*4
@@ -805,6 +876,18 @@ def _compress_forward_torch(
         if out is None:
             out = kv_score_input.new_zeros(num_tokens, head_dim)
         return out
+
+    native = _native_compress_forward_v2(
+        kv_score_buffer,
+        kv_score_input,
+        ape,
+        plan,
+        head_dim=head_dim,
+        compress_ratio=compress_ratio,
+        out=out,
+    )
+    if native is not None:
+        return native
 
     if int(compress_ratio) == 4:
         return _compress_forward_c4_torch(
@@ -860,9 +943,30 @@ def _store_bf16_rows(kvcache, loc, rows_bf16, page_size, valid=None):
             # them to a scratch slot. Dynamic shapes are fine here; only the
             # graph-captured verify path needs the static padded buffer.
             mask = valid.to(torch.bool)
-            sel_loc, sel_rows = loc[mask], rows_bf16[mask]
-            if sel_loc.numel() == 0:
+            if os.environ.get("SGLANG_KUNLUN_STORE_MASK_INDEXSELECT", "1") == "0":
+                sel_loc, sel_rows = loc[mask], rows_bf16[mask]
+                if sel_loc.numel() == 0:
+                    return
+                sel_loc = sel_loc.to(torch.int64).clamp(min=0, max=max_loc)
+                torch.ops.xspeedgate_ops.set_k_and_s_v4(
+                    kvcache.view(torch.bfloat16),
+                    sel_loc,
+                    sel_rows.contiguous(),
+                    page_size,
+                )
                 return
+            n_valid = int(mask.sum())
+            if n_valid == 0:
+                return
+            if n_valid == mask.numel():
+                sel_loc, sel_rows = loc, rows_bf16
+            else:
+                # ``rows[mask]`` on a 2-D tensor lowers to nonzero+aten::index
+                # (~0.6 ms per call in the extend profile); select the row ids
+                # once and use index_select instead.
+                keep = mask.nonzero(as_tuple=False).squeeze(1)
+                sel_loc = loc.index_select(0, keep)
+                sel_rows = rows_bf16.index_select(0, keep)
         else:
             sel_loc = None
         if sel_loc is not None:

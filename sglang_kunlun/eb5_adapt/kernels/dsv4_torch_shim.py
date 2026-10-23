@@ -812,6 +812,13 @@ def _native_compress_forward_v2(
         plan_w = None if is_decode else plan[2]
     except Exception:  # noqa: BLE001 - unknown plan object
         return None
+    if is_decode and os.environ.get("SGLANG_KUNLUN_NATIVE_COMPRESS_DECODE", "0") == "0":
+        # The prefill path was validated bit-exact (1.2e-7) against the torch
+        # recipe, the decode plan was not, and enabling it degrades long
+        # generations into repetition loops (AIME26: median output hit the
+        # 32k cap on 14/21 samples, vs 1/64 for the torch path). Keep decode
+        # on the reference implementation until the decode plan is validated.
+        return None
     if (
         plan_c.dtype != torch.uint8
         or plan_c.dim() != 2

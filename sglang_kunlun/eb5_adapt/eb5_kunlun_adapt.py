@@ -500,11 +500,80 @@ def _install_kunlun_sampling_renorm() -> list[str]:
     return patched
 
 
+def _install_routed_scaling_fix() -> list[str]:
+    """Apply ``routed_scaling_factor`` that the XPU MoE epilogue drops.
+
+    Activation taps on the same prompt show layer-0 routed-expert output is
+    exactly 1/1.5 of the community build (cosine 0.99999, norm ratio 0.666,
+    shared expert identical): the checkpoint's ``routed_scaling_factor=1.5``
+    never reaches the weights. Routing here keeps ``apply_routed_scaling_
+    factor_on_output`` false, so the value is supposed to be applied by the MoE
+    epilogue; the runner used on this stack does not do it.
+
+    Fold the factor into the top-k weights instead (same place the fused path
+    would put it), skipping it when the routing already applied it.
+    """
+    import inspect
+    import os
+
+    if os.environ.get("SGLANG_KUNLUN_APPLY_ROUTED_SCALE", "1") == "0":
+        return []
+    try:
+        import sglang.srt.layers.moe.topk as _topk
+    except Exception:  # noqa: BLE001
+        return []
+
+    patched = []
+    for name in (
+        "biased_topk_impl",
+        "biased_topk_jit_kernel_impl",
+        "hash_topk",
+    ):
+        fn = getattr(_topk, name, None)
+        if fn is None or getattr(fn, "_kunlun_scaled", False):
+            continue
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            continue
+
+        def make(orig, signature, label):
+            def wrapper(*args, **kwargs):
+                out = orig(*args, **kwargs)
+                try:
+                    bound = signature.bind_partial(*args, **kwargs)
+                    rsf = bound.arguments.get("routed_scaling_factor")
+                    fused = bound.arguments.get(
+                        "apply_routed_scaling_factor_on_output", False
+                    )
+                except Exception:  # noqa: BLE001
+                    rsf, fused = None, True
+                if rsf not in (None, 1.0) and not fused:
+                    weights, ids = out
+                    return weights * float(rsf), ids
+                return out
+
+            wrapper._kunlun_scaled = True
+            wrapper.__name__ = getattr(orig, "__name__", label)
+            return wrapper
+
+        setattr(_topk, name, make(fn, sig, name))
+        patched.append(f"sglang.srt.layers.moe.topk.{name}")
+
+    return patched
+
+
 def apply() -> list[str]:
     """把上面的 torch 拆解实现 patch 到 fork 的调用点上。返回已 patch 的符号列表。"""
     import importlib
 
     patched = []
+    try:
+        patched.extend(_install_routed_scaling_fix())
+    except Exception as _e:  # noqa: BLE001
+        import sys as _sys
+
+        print("[eb5-kunlun-adapt] routed scaling fix failed:", _e, file=_sys.stderr)
     try:
         patched.extend(_install_kunlun_sampling_renorm())
     except Exception as _e:  # noqa: BLE001

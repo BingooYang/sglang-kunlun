@@ -3036,7 +3036,18 @@ def hash_topk_kunlun(
     softplus = torch.clamp(logit, min=0) + torch.log1p(torch.exp(-logit.abs()))
     weight = torch.sqrt(softplus)
     routed_sum = weight.sum(dim=1, keepdim=True).clamp_min(1e-20)
-    topk_weights[:, :topk_routed] = weight / routed_sum
+    # The XPU MoE epilogue never applies ``routed_scaling_factor`` (activation
+    # taps: layer-0 routed output is exactly 1/1.5 of the community build with
+    # cosine 0.99999), so fold it into the weights here -- the reference kernel
+    # leaves the factor to the epilogue, which is what breaks on this stack.
+    import os
+
+    _scale = (
+        1.0
+        if os.environ.get("SGLANG_KUNLUN_APPLY_ROUTED_SCALE", "1") == "0"
+        else float(routed_scaling_factor)
+    )
+    topk_weights[:, :topk_routed] = (weight / routed_sum) * _scale
     topk_ids[:, :topk_routed] = expert_id.to(torch.int32)
     if num_fused_shared_experts:
         topk_weights[:, topk_routed:] = 1.0 / float(routed_scaling_factor)

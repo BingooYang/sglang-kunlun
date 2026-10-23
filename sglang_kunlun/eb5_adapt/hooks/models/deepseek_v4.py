@@ -18,6 +18,7 @@
 """Hooks for DeepseekV4DecoderLayer methods (hc_post, hc_pre)."""
 from __future__ import annotations
 
+import os
 from typing import Literal
 
 import torch
@@ -28,12 +29,111 @@ from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 import kunlun_ops
 
+try:  # the constant lives next to the model
+    from sglang.srt.models.deepseek_v4 import MHC_POST_MULT_VALUE as _MHC_POST_MULT_VALUE
+except Exception:  # noqa: BLE001
+    _MHC_POST_MULT_VALUE = 2.0
+
+
+def _fp32_weight(owner, attr: str, tensor: torch.Tensor) -> torch.Tensor:
+    """Return a contiguous fp32 view of ``tensor``, cached on ``owner``.
+
+    ``hc_pre`` runs per layer per step; converting the 24x(hidden) routing
+    matrix every call would cost more than the fused kernel saves.
+    """
+    cached = getattr(owner, attr, None)
+    if cached is not None and cached[0] is tensor:
+        return cached[1]
+    out = tensor if tensor.dtype == torch.float32 else tensor.float()
+    if not out.is_contiguous():
+        out = out.contiguous()
+    setattr(owner, attr, (tensor, out))
+    return out
+
+
+@plugin_hook(
+    target="sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_pre",
+    type=HookType.AROUND,
+)
+def hc_pre_kunlun(
+    original_fn,
+    self,
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm=None,
+    forward_batch=None,
+):
+    """Kunlun-native hc_pre via ``kunlun_ops.hc_pre_kunlun_impl``.
+
+    The fork only takes the fused mHC path when ``_is_xpu`` is true; on this
+    stack (torch.xpu absent) it falls back to a torch decomposition
+    (``x.float()`` + ``square().mean()`` + ``rsqrt`` + ``F.linear``), which is
+    the single largest remaining per-step dispatch block in extend. The vendor
+    op does fc+mean-square -> sinkhorn -> bmm in one call (n == 4 only) and is
+    what the XPU path uses, so prefer it and keep the original as the fallback.
+
+    Returns ``(y, post, comb, False)``: ``False`` means the caller still has to
+    apply the post-attention norm, exactly like the torch branch.
+    """
+    num_tokens = x.shape[0]
+    hc_mult = int(self.hc_mult)
+    if (
+        os.environ.get("SGLANG_KUNLUN_NATIVE_HC_PRE", "1") == "0"
+        or num_tokens == 0
+        or hc_mult != 4
+        or x.dtype not in (torch.bfloat16, torch.float16)
+        or not hasattr(kunlun_ops, "hc_pre_kunlun_impl")
+    ):
+        return original_fn(
+            self, x, hc_fn, hc_scale, hc_base, norm, forward_batch
+        )
+
+    x_flat = x.flatten(1)
+    if not x_flat.is_contiguous():
+        x_flat = x_flat.contiguous()
+    hidden = x_flat.shape[1] // hc_mult
+
+    fn = _fp32_weight(self, "_kunlun_hc_pre_fn", hc_fn)
+    base = hc_base if hc_base.dtype == torch.float32 else hc_base.float()
+    scale = hc_scale if hc_scale.dtype == torch.float32 else hc_scale.float()
+
+    y = torch.empty((num_tokens, hidden), dtype=x.dtype, device=x.device)
+    post = torch.empty((num_tokens, hc_mult), dtype=x.dtype, device=x.device)
+    comb = torch.empty(
+        (num_tokens, hc_mult * hc_mult), dtype=x.dtype, device=x.device
+    )
+    kunlun_ops.hc_pre_kunlun_impl(
+        x_flat,
+        fn,
+        base.contiguous(),
+        scale.contiguous(),
+        y,
+        post,
+        comb,
+        float(self.rms_norm_eps),
+        float(self.hc_eps),
+        float(self.hc_eps),
+        float(_MHC_POST_MULT_VALUE),
+        int(self.hc_sinkhorn_iters),
+    )
+    # The kernel writes post/comb in the activation dtype; the torch branch
+    # hands them back as fp32 and hc_post assumes that.
+    return (
+        y,
+        post.float(),
+        comb.view(num_tokens, hc_mult, hc_mult).float(),
+        False,
+    )
+
 
 @plugin_hook(
     target="sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_post",
-    type=HookType.REPLACE,
+    type=HookType.AROUND,
 )
 def hc_post_kunlun(
+    original_fn,
     self,
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -45,10 +145,13 @@ def hc_post_kunlun(
     Computes ``out = post * x + comb @ residual`` (fused).
     Only N == 4 (hc_mult) is supported on XPU.
     """
-    if x.shape[0] == 0:
-        return torch.empty(
-            (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
-        )
+    if (
+        x.shape[0] == 0
+        or os.environ.get("SGLANG_KUNLUN_NATIVE_HC_POST", "1") == "0"
+        or int(self.hc_mult) != 4
+        or not hasattr(kunlun_ops, "hc_post_kunlun_impl")
+    ):
+        return original_fn(self, x, residual, post, comb)
 
     batch = x.shape[0]
     N = self.hc_mult

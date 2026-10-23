@@ -590,4 +590,18 @@ def apply() -> list[str]:
 
         print("[eb5-kunlun-adapt] xy adapt failed:", _e, file=_sys.stderr)
 
+    # --- DSV4 模型级算子（hc_pre / hc_post 走 kunlun_ops 融合实现） ---
+    # 这些是 @plugin_hook，注册即生效；模块 import 失败不阻断启动。
+    try:
+        from sglang_kunlun.eb5_adapt.hooks.models import deepseek_v4 as _dsv4_model_hooks
+
+        _ = _dsv4_model_hooks
+        patched.append("models.deepseek_v4(hc_pre,hc_post)")
+    except ImportError:
+        pass
+    except Exception as _e:
+        import sys as _sys
+
+        print("[eb5-kunlun-adapt] model hooks failed:", _e, file=_sys.stderr)
+
     return patched

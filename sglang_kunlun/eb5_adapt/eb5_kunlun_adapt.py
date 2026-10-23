@@ -448,11 +448,69 @@ def _apply_wo_a_bf16_matmul_torch(o, wo_a, is_decode=False, **_ignored):
     return out
 
 
+def _install_kunlun_sampling_renorm() -> list[str]:
+    """Point flashinfer's top-k/top-p renorm at the Kunlun implementations.
+
+    ``eagle_utils.eagle_sample`` binds ``flashinfer.sampling.top_{k,p}_renorm_probs``
+    whenever torch reports CUDA (which it does through xmlir). Those are JIT CUDA
+    modules that need nvcc, so the first sampled request dies with
+    ``Could not find nvcc``. ``sgl_kernel`` ships Kunlun implementations with the
+    same signature -- the community 0.5.14 build calls them directly -- so alias
+    them over the flashinfer entry points.
+    """
+    import importlib
+
+    try:
+        import flashinfer.sampling as _fs
+        import sgl_kernel as _sk
+    except Exception:  # noqa: BLE001
+        return []
+    patched = []
+    # ``*_probs`` (plural) is a NotImplementedError stub in the Kunlun sgl_kernel;
+    # the implemented entry points are the singular ``*_prob`` ones that the
+    # community 0.5.14 build calls.
+    for attr in ("top_p_renorm_probs", "top_k_renorm_probs"):
+        impl = getattr(_sk, attr[:-1], None) or getattr(_sk, attr, None)
+        if impl is not None and hasattr(_fs, attr):
+            setattr(_fs, attr, impl)
+            patched.append(f"flashinfer.sampling.{attr}")
+
+    # ``eagle_sample`` also resolves the tree-sampling kernel per call. On this
+    # stack ``torch.cuda`` is available (xmlir), so it picks the CUDA JIT module
+    # from ``sglang.kernels.ops.speculative.sampling`` and dies building
+    # ``sgl_kernel_jit_speculative_sampling_*`` (no nvcc). Point both possible
+    # import sites at the kunlun_ops wrapper this package ships.
+    try:
+        from sglang_kunlun.kernels.sgl_kernel_kunlun import sampling as _ksamp
+
+        impl = _ksamp.tree_speculative_sampling_target_only
+        for mod_name in (
+            "sglang.kernels.ops.speculative.sampling",
+            "sgl_kernel",
+        ):
+            try:
+                mod = importlib.import_module(mod_name)
+            except Exception:  # noqa: BLE001
+                continue
+            if hasattr(mod, "tree_speculative_sampling_target_only"):
+                setattr(mod, "tree_speculative_sampling_target_only", impl)
+                patched.append(f"{mod_name}.tree_speculative_sampling_target_only")
+    except Exception:  # noqa: BLE001
+        pass
+    return patched
+
+
 def apply() -> list[str]:
     """把上面的 torch 拆解实现 patch 到 fork 的调用点上。返回已 patch 的符号列表。"""
     import importlib
 
     patched = []
+    try:
+        patched.extend(_install_kunlun_sampling_renorm())
+    except Exception as _e:  # noqa: BLE001
+        import sys as _sys
+
+        print("[eb5-kunlun-adapt] sampling renorm patch failed:", _e, file=_sys.stderr)
 
     def _patch(module_name, attr, impl):
         # 用 MLA 模块里的通用注入器：它会把**改名/多处 import 的旧绑定**一并修掉

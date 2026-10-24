@@ -221,9 +221,19 @@ class KunlunPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 bs,
             )
         else:
+            # ``alloc_decode_kernel`` requires an int32 ``last_loc_ptr``.  The
+            # community loader hands it int32; this fork's
+            # ``translate_loc_from_full_to_swa`` gathers through an int64
+            # mapping, so the first decode step of a batch that crosses a page
+            # boundary died with "last_loc_ptr must be int32".
+            last_loc_kernel = (
+                last_loc
+                if last_loc.dtype == torch.int32
+                else last_loc.to(torch.int32)
+            )
             torch.ops.xspeedgate_ops.alloc_decode_kernel(
                 seq_lens,
-                last_loc.contiguous(),
+                last_loc_kernel.contiguous(),
                 self.free_pages,
                 out_indices.contiguous(),
                 bs_upper,

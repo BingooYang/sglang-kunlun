@@ -563,11 +563,49 @@ def _install_routed_scaling_fix() -> list[str]:
     return patched
 
 
+def _install_dense_prefill_default() -> list[str]:
+    """Default DeepSeek-V4 prefill to the dense path on Kunlun XPU.
+
+    ``SGLANG_OPT_FLASHMLA_SPARSE_PREFILL`` is on by default in this fork; on
+    Kunlun the sparse prefill kernel is emulated by the plugin
+    (``_forward_prefill_sparse`` gathers SWA + compressed pages and runs a torch
+    sparse MLA). Layer-by-layer comparison against community v0.5.14 with the
+    same weights shows the emulation is *not* numerically equivalent: the layer2
+    attention output differs by 70% relative L2 and the error compounds to 37%
+    at the final norm, while the dense path (``_kunlun_compressed_attention``,
+    which is also what v0.5.14 runs) lands at 1.4% / 6.6%. The v0.5.14-era
+    plugin never exercised the sparse path, so it was never validated here.
+
+    Mirrors ``apply_deepseek_v4_defaults``' ROCm branch, which disables the same
+    flag for the same reason. An explicit ``SGLANG_OPT_FLASHMLA_SPARSE_PREFILL``
+    still wins so the path stays debuggable.
+    """
+    from sglang.srt.environ import envs
+
+    flag = envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL
+    if flag.is_set() and flag.get():
+        print(
+            "[eb5-kunlun-adapt] keeping SGLANG_OPT_FLASHMLA_SPARSE_PREFILL=1 "
+            "(explicitly requested; the torch sparse-prefill emulation is not "
+            "numerically aligned with the dense path yet)",
+            flush=True,
+        )
+        return []
+    flag.set(False)
+    return ["envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL=False"]
+
+
 def apply() -> list[str]:
     """把上面的 torch 拆解实现 patch 到 fork 的调用点上。返回已 patch 的符号列表。"""
     import importlib
 
     patched = []
+    try:
+        patched.extend(_install_dense_prefill_default())
+    except Exception as _e:  # noqa: BLE001
+        import sys as _sys
+
+        print("[eb5-kunlun-adapt] dense prefill default failed:", _e, file=_sys.stderr)
     try:
         patched.extend(_install_routed_scaling_fix())
     except Exception as _e:  # noqa: BLE001

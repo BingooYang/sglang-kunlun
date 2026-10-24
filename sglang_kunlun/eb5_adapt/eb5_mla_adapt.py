@@ -1058,7 +1058,11 @@ def flash_mla_sparse_fwd(
     scores = scores.masked_fill(invalid.unsqueeze(1), float("-inf"))
 
     if attn_sink is not None:
-        sink = attn_sink.float().reshape(-1)[:h_q].reshape(1, h_q)
+        # attn_sink is a natural-log bias; scores above are in the log2 domain.
+        sink = (
+            attn_sink.float().reshape(-1)[:h_q].reshape(1, h_q)
+            * math.log2(math.e)
+        )
         m = torch.maximum(scores.max(dim=-1).values, sink)
         p = torch.exp2(scores - m[..., None])
         denom = p.sum(dim=-1) + torch.exp2(sink - m)

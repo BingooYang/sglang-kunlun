@@ -26,6 +26,7 @@ import sys
 import torch
 
 _ENV = "SGLANG_EB5_HCA_NATIVE_SPARSE_PREFILL"
+_ACTIVE_LOGGED = False
 
 
 def _enabled() -> bool:
@@ -41,6 +42,11 @@ def _native_sparse_prefill(q, kv, indices, sm_scale, d_v, attn_sink):
     ``exp(lse) / (exp(lse) + exp(sink))``.
     """
     import kunlun_ops
+
+    global _ACTIVE_LOGGED
+    if not _ACTIVE_LOGGED:
+        print("[eb5-native-prefill] native sparse_prefill_fwd_opt_v2 active", flush=True)
+        _ACTIVE_LOGGED = True
 
     s_q, h_q, _ = q.shape
     d_v = int(d_v or 512)
@@ -101,13 +107,18 @@ def _wrap(torch_impl):
 
 
 def install() -> list:
-    """Wrap the installed torch ``flash_mla_sparse_fwd``; idempotent."""
+    """Wrap the installed torch ``flash_mla_sparse_fwd``; idempotent.
+
+    ``sgl_kernel`` is a ``_StubModule`` whose ``__getattr__`` fabricates a
+    child module for *any* missing name, so ``getattr(mod, "x", False)`` is
+    always truthy.  Every presence check here must go through ``__dict__``.
+    """
     mod = sys.modules.get("sgl_kernel.flash_mla")
     if mod is None:
         return []
-    if getattr(mod, "_eb5_native_sparse_prefill", False):
+    if mod.__dict__.get("_eb5_native_sparse_prefill"):
         return []
-    impl = getattr(mod, "flash_mla_sparse_fwd", None)
+    impl = mod.__dict__.get("flash_mla_sparse_fwd")
     if impl is None:
         return []
 

@@ -403,16 +403,19 @@ def _rope_interleaved(x_rope: torch.Tensor, freqs_real: torch.Tensor, positions:
 
 
 def fused_q_norm_rope(q_input, q_output, eps, freqs_cis, positions):
-    """RMSNorm(no weight) + 末尾 rope_dim 的交错 RoPE。"""
-    x = q_input.float()
-    normed = x / torch.sqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    rope_dim = freqs_real.shape[-1]
-    nope = q_input.shape[-1] - rope_dim
-    out = normed.clone()
-    if rope_dim > 0:
-        out[..., nope:] = _rope_interleaved(normed[..., nope:], freqs_real, positions)
-    q_output.copy_(out.to(q_output.dtype))
+    """RMSNorm(no weight) + 末尾 rope_dim 的 RoPE。
+
+    走 ``dsv4_torch_shim._fused_q_norm_rope_torch``，即 community 0.5.14 插件用的
+    同一条路径（vendor ``kunlun_ops.dpsk_v4_norm_rope_gptj``，异常才回落 torch），
+    让两边的逐算子对比只反映真正的语义差异，而不是 "一边融合算子、一边 torch 拆解"。
+    注意：本改动对数值**没有**影响 —— 实测 layer0 的 rope 差异（0.47%）来自
+    ``freqs_cis`` 本身（fork 只给压缩层加 YaRN，见下），换实现后仍为 0.470%。
+    """
+    from sglang_kunlun.eb5_adapt.kernels.dsv4_torch_shim import (
+        _fused_q_norm_rope_torch,
+    )
+
+    _fused_q_norm_rope_torch(q_input, q_output, eps, freqs_cis, positions)
     return None
 
 

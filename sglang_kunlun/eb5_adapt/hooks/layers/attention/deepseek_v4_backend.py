@@ -702,11 +702,18 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         """
         is_extend = logical_mode.is_extend_without_speculative()
         if is_extend:
-            from sglang.srt.layers.attention.dsa.utils import (
-                is_dsa_prefill_cp_round_robin_split,
-            )
+            try:
+                from sglang.srt.layers.attention.dsa.utils import (
+                    is_dsa_prefill_cp_round_robin_split as _cp_round_robin_split,
+                )
+            except ImportError:
+                # Community main renamed the split mode: ``round-robin-split``
+                # became ``cp_strategy == "interleave"``.
+                from sglang.srt.layers.attention.dsa.utils import (
+                    is_dsa_prefill_cp_interleave as _cp_round_robin_split,
+                )
 
-            is_causal = not is_dsa_prefill_cp_round_robin_split()
+            is_causal = not _cp_round_robin_split()
         else:
             is_causal = True
         # CUDA graph replays only the recorded kernels, so any Python scalar

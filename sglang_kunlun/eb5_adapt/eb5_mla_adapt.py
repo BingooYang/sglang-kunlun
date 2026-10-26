@@ -943,6 +943,11 @@ def _sentinel_valid(indices, k_cache, bs, heads, device):
 
 def _mla_gather_kv(k_cache: torch.Tensor, indices: torch.Tensor, is_fp8: bool):
     """按 indices 收集 paged KV 并转成 bf16（fp8 布局反量化，bf16 布局直接 gather）。"""
+    # 曾在此处放过 ``EB5_KV_READ_SYNC``（读 KV 前同步当前流 / 设备级同步），用于
+    # 验证"KV 写入与注意力读取之间缺少同步"这个假设。两种模式**都实测无效**，
+    # 该假设已被证伪（真因是压缩器状态池的 ``-inf`` 哨兵，见
+    # ``hooks/mem_cache/deepseek_v4_compress_state.py``），故整段删除，避免留下
+    # 一个会在热路径上做全设备同步的误导性开关。
     b, _, topk = indices.shape
     idx = indices.reshape(b, topk).to(torch.int64).clamp(min=0)
     if is_fp8:
@@ -1060,7 +1065,115 @@ def flash_mla_with_kvcache(
     probs = p / torch.where(denom > 0, denom, torch.ones_like(denom))[..., None]
     out = torch.einsum("bht,btd->bhd", probs, kv[..., :dv].float())
     lse = m + torch.log(denom.clamp(min=1e-20))
+    _probe_decode_kv(
+        kv, valid, indices, extra_indices_in_kvcache, scores, out, extra_k_cache
+    )
     return out.to(q.dtype).unsqueeze(1), lse
+
+
+_DEC_KV_SEEN = {"hits": 0}
+
+
+def _probe_decode_kv(
+    kv, valid, indices, extra_indices, scores, out, extra_k_cache=None
+) -> None:
+    """``EB5_DEC_KV_NAN=1``：decode 这一侧的"NaN 是读进来的还是算出来的"。
+
+    已确认 NaN 在 HCA layer 40 的注意力分支内部诞生（入参 q/k 干净、出参全
+    NaN），且把 decode 换成纯 torch 散算子后故障**一模一样**（两题都第 42 步、
+    30% pad），所以责任不在昆仑原生 ``compressed_attention``，而在两条路共用的
+    输入：gather 回来的 KV 或索引元数据。
+
+    这里按"窗口段 / c128 压缩段"分别报告 **valid 位置上**的 NaN 数，并给出出事
+    的槽位 id —— 槽位是不是本步新写的最大槽位，能区分"槽位从没被写过"（分配 /
+    索引 bug）和"写进去的值本身是 NaN"（上游数值 bug）。
+    """
+    import os
+
+    if os.environ.get("EB5_DEC_KV_NAN", "0") != "1":
+        return
+    st = _DEC_KV_SEEN
+    if st["hits"] >= 8:
+        return
+    try:
+        v_any = valid.any(dim=1)  # [bs, T]
+        kv_bad = (~torch.isfinite(kv)).any(dim=-1) & v_any  # [bs, T]
+        n_kv_bad = int(kv_bad.sum().item())
+        n_out_bad = int((~torch.isfinite(out)).sum().item())
+        if not n_kv_bad and not n_out_bad:
+            return
+        st["hits"] += 1
+        w = int(indices.reshape(indices.shape[0], -1).shape[1])
+        win_bad = int(kv_bad[:, :w].sum().item())
+        com_bad = int(kv_bad[:, w:].sum().item())
+        flat = torch.cat(
+            [
+                indices.reshape(indices.shape[0], -1),
+                (
+                    extra_indices.reshape(indices.shape[0], -1)
+                    if extra_indices is not None
+                    else indices.new_zeros((indices.shape[0], 0))
+                ),
+            ],
+            dim=-1,
+        )
+        slots = sorted(set(int(s) for s in flat[kv_bad].reshape(-1).tolist()))[:12]
+        live = flat[v_any]
+        print(
+            f"[dec-kv] kv_nan_at_valid={n_kv_bad} (win={win_bad} c128={com_bad}) "
+            f"out_nan={n_out_bad}/{out.numel()} "
+            f"scores_nan={int((~torch.isfinite(scores)).sum().item())} "
+            f"win_width={w} total_cols={kv.shape[1]} bad_slots={slots} "
+            f"live_slot_range=[{int(live.min().item()) if live.numel() else -1},"
+            f"{int(live.max().item()) if live.numel() else -1}]",
+            flush=True,
+        )
+        _probe_c128_buffer(extra_k_cache)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[dec-kv] failed: {exc!r}", flush=True)
+
+
+def _probe_c128_buffer(extra_k_cache) -> None:
+    """整块 c128 压缩缓冲的"有没有被写过"画像。
+
+    在池子的 ``set_extra_key_buffer`` / ``set_extra_key_buffer_fused`` 两个写入口
+    埋的探针**一条都没打印**，所以要么写入走了别的 API，要么这块缓冲在本配置下
+    **从没被写过**。与其继续猜写入者（这类推断已被证伪八次），不如直接在**已证实
+    会执行**的读取点给整块缓冲画像：
+
+    * 全 0 行占绝大多数 → 缓冲是初始化后就没动过（分配/写入路径根本没接上）；
+    * 非有限行零星分布 → 写过，但写进去的值有问题；
+    * 只有槽位 2 坏 → 单点写坏。
+    """
+    import os
+
+    if extra_k_cache is None or os.environ.get("EB5_DEC_KV_NAN", "0") != "1":
+        return
+    try:
+        buf = extra_k_cache.reshape(-1, extra_k_cache.shape[-1])
+        f = buf.float()
+        rows = buf.shape[0]
+        nonfinite = (~torch.isfinite(f)).any(dim=-1)
+        allzero = (f == 0).all(dim=-1)
+        head = [
+            (
+                "nan"
+                if bool(nonfinite[i])
+                else ("zero" if bool(allzero[i]) else "data")
+            )
+            for i in range(min(8, rows))
+        ]
+        print(
+            f"[c128-buf] t={__import__('time').perf_counter():.6f} "
+            f"pid={os.getpid()} ptr={extra_k_cache.data_ptr()} "
+            f"rows={rows} dim={buf.shape[-1]} dtype={buf.dtype} "
+            f"nonfinite_rows={int(nonfinite.sum().item())} "
+            f"allzero_rows={int(allzero.sum().item())} "
+            f"slots0_7={head}",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[c128-buf] failed: {exc!r}", flush=True)
 
 
 def flash_mla_sparse_fwd(
@@ -1114,6 +1227,23 @@ def flash_mla_sparse_fwd(
     # 同样大小的张量，decode 的 [s_q, topk, d] 在 topk=2048 时足以把 scheduler
     # 顶到被 OOM killer 杀掉（实测 exit -9）。
     gathered[invalid] = 0.0
+    # 把"尚未写入"的槽位也当成无效列。
+    #
+    # 实测：写侧 `set_mla_kv_buffer_triton` 的 loc 从 256 起（请求确实拿的是
+    # page 1），读侧窗口是 `[256, 256+valid_cols-1]`，而 `valid_cols` 比真实序列
+    # 长度大（step 42 时序列约 102 token，valid_cols 已是 128）。也就是说索引把
+    # **超出序列末尾、还没被写过**的槽位标成了 live；它们不是 `-1` 哨兵，所以
+    # `_sentinel_valid` 抓不到。full-MLA 路径上 `dsa_full` 对 extend 传
+    # `topk_length=None`，decode 也只在 `range_index` 为真时才传，于是没有长度
+    # 裁剪，固定宽度的索引缓冲被照面值采信。
+    #
+    # 引擎在这一层无法区分"未写入"和"合法"，但未写入的槽位必然不是有限值，
+    # 所以按非有限值把它们排除出 softmax —— 这正好切断
+    # NaN -> logits 全 NaN -> argmax=0 -> PAD -> 不停机 这条链。
+    _unwritten = ~torch.isfinite(gathered).all(dim=-1)
+    if bool(_unwritten.any().item()):
+        invalid = invalid | _unwritten
+        gathered[_unwritten] = 0.0
     _probe_kv_nan(gathered, idx, invalid, kvs)
 
     scores = torch.einsum("shd,std->sht", q.float(), gathered) * sm_scale
@@ -1434,6 +1564,15 @@ def _install_triton_mla_backend() -> list:
     return patched
 
 
+
+# 曾在此处放过 c128 槽位监视点（``EB5_C128_WATCH`` + ``_OpsWatchProxy`` +
+# ``c128_arm`` / ``c128_check`` + ``_install_c128_watch``，约 150 行）：武装后每个
+# kunlun_ops / xspeedgate_ops 调用结束都回读被监视的槽位，想点名"谁把它写成
+# NaN"。实测 ``armed=0`` —— 监视点从未武装，``c128_check`` 每次立即返回，唯一
+# 的作用是副作用：给 407 个算子各加一层 Python wrapper 后塌缩消失。那是**时序
+# 掩盖**而非修复，真因已查明并修掉。整套删除，以免后人误以为这里有一个可用的
+# 算子级监视点。结论见 ``doc/13. EB5 XPU 精度问题总表.md``。
+
 # --------------------------------------------------------------------------- #
 # 注入
 # --------------------------------------------------------------------------- #
@@ -1570,6 +1709,15 @@ def _install_kunlun_ops_tracer() -> list:
 
         return traced
 
+    # ``EB5_KOPS_WRAP=a,b,c``：只包装这几个算子（为了二分定位）。
+    #
+    # 事实：包装**全部** 407 个 kunlun_ops 可调用对象后，NaN 与 id-0 塌缩完全消失
+    # （kv-nan 0 vs 42、id0 0/60 vs 18/60）。但显式同步（当前流、设备级都试过）
+    # **都无效**，所以起作用的不是"同步"，而是包装本身改变了某个算子的行为——
+    # 最可能是裸闭包丢掉了原对象的属性，让某处 `getattr(fn, ...)` 走了别的分支。
+    # 用白名单二分，就能把"包装谁能治好"收敛到单个算子，那个算子就是根因所在。
+    only = os.environ.get("EB5_KOPS_WRAP", "").strip()
+    only_set = {x for x in only.split(",") if x} if only else None
     watch = {"set_mla_kv_buffer_triton", "set_k_and_s_triton"}
     seen_w: set = set()
 
@@ -1585,16 +1733,21 @@ def _install_kunlun_ops_tracer() -> list:
                         and a.numel()
                         and a.numel() < 1 << 20
                     ):
+                        # 直接打 loc 区间：五个按调用点下的探针全部打空
+                        # （torch 版 set_mla_kv_buffer、池子类方法、两个
+                        # allocator、SWA 包装层），说明靠读代码猜调用点不可行。
+                        # 包在 kunlun_ops 这一层能抓到**所有**调用点。
                         f = a.reshape(-1)
-                        for target in (383, 384):
-                            if (name, target) in seen_w:
-                                continue
-                            if bool((f == target).any().item()):
-                                seen_w.add((name, target))
-                                print(
-                                    f"[kv-write-native] {name} writes slot {target}",
-                                    flush=True,
-                                )
+                        lo, hi = int(f.min().item()), int(f.max().item())
+                        key = (name, hi // 64)
+                        if key in seen_w or len(seen_w) >= 14:
+                            continue
+                        seen_w.add(key)
+                        print(
+                            f"[kv-write-native] {name} loc=[{lo},{hi}] "
+                            f"n={f.numel()}",
+                            flush=True,
+                        )
             except Exception:  # noqa: BLE001
                 pass
             return fn(*args, **kwargs)
@@ -1604,6 +1757,8 @@ def _install_kunlun_ops_tracer() -> list:
     n = 0
     for name in dir(kunlun_ops):
         if name.startswith("_"):
+            continue
+        if only_set is not None and name not in only_set:
             continue
         fn = getattr(kunlun_ops, name, None)
         if callable(fn) and not isinstance(fn, type):

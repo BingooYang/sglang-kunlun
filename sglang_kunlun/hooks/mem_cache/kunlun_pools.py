@@ -241,6 +241,7 @@ class KunlunMLATokenToKVPool(MLATokenToKVPool):
             cache_k_nope.contiguous().view(cache_k_nope.shape[0], cache_k_nope.shape[-1]),
             cache_k_rope.contiguous().view(cache_k_rope.shape[0], cache_k_rope.shape[-1]),
         )
+        _eb5_kvw_probe(layer_id, loc, cache_k_nope, cache_k_rope, self.kv_buffer[layer_id])
 
     def get_mla_kv_buffer(
         self,
@@ -274,3 +275,52 @@ class KunlunMLATokenToKVPool(MLATokenToKVPool):
 class KunlunNSATokenToKVPool(DSATokenToKVPool):
     """Kunlun DSA/NSA KV pool with int8 index buffer dtype."""
     index_k_with_scale_buffer_dtype = torch.int8
+
+
+_EB5_KVW = {"hits": 0, "seen": set()}
+
+
+def _eb5_kvw_probe(layer_id, loc, nope, rope, buf) -> None:
+    """Account for the KV write that the reader says never happened.
+
+    Gated by ``EB5_KVW=1``. The reader (``_mla_gather_kv``) finds slots 256..382
+    populated and every slot from 383 on permanently NaN while attention treats
+    them as live. ``set_mla_kv_buffer`` (the torch stand-in) is never called, so
+    this is the real writer. Log which slots it is handed, whether the source is
+    finite, and whether the buffer actually holds finite values right after the
+    write -- which separates "never written", "written with NaN" and "written but
+    not visible".
+    """
+    import os
+
+    if os.environ.get("EB5_KVW", "0") != "1":
+        return
+    st = _EB5_KVW
+    if st["hits"] >= 14:
+        return
+    try:
+        import torch
+
+        fl = loc.reshape(-1)
+        lo, hi = int(fl.min().item()), int(fl.max().item())
+        # 之前这里有 `if hi < 380: return`，而写侧的 loc 很可能本来就只在 0..200
+        # 区间（序列只有 ~130 token），于是把答案自己过滤掉了。读侧要的槽位是
+        # 恰好 `[page_size, page_size+len-1]` 的连续段（128 -> [256,383]，
+        # 133 -> [256,388]），疑似整体偏移了一个 page。所以这里不再按值过滤。
+        key = (int(layer_id), hi // 32)
+        if key in st["seen"]:
+            return
+        st["seen"].add(key)
+        st["hits"] += 1
+        src_bad = int((~torch.isfinite(nope.float())).sum().item()) + int(
+            (~torch.isfinite(rope.float())).sum().item()
+        )
+        row = buf.reshape(buf.shape[0], -1)[hi]
+        post_bad = int((~torch.isfinite(row.float())).sum().item())
+        print(
+            f"[kvw] layer={layer_id} loc=[{lo},{hi}] n={fl.numel()} "
+            f"src_nonfinite={src_bad} buf_slot{hi}_nonfinite={post_bad}/{row.numel()}",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[kvw] failed: {exc!r}", flush=True)

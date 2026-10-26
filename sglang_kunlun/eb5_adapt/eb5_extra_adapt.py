@@ -446,6 +446,7 @@ def compress_norm_rope_store(
         plan_rows = plan[1].contiguous().view(torch.int32)[:n]
         seq_d = plan_rows[:, 0].to(torch.int64)
         sel = torch.nonzero((seq_d % cr) == 0, as_tuple=False).flatten()
+        _probe_compress_sel(seq_d, sel, cr, out_loc)
         if sel.numel() == 0:
             return
         rows = kv.index_select(0, sel).float()
@@ -1675,3 +1676,37 @@ def apply() -> list:
             print(f"[eb5-extra-adapt] {hook.__name__} failed: {exc}")
 
     return patched
+
+
+_CSEL = {"calls": 0, "written": 0, "hits": 0}
+
+
+def _probe_compress_sel(seq_d, sel, cr, out_loc) -> None:
+    """Check that the compression-boundary filter actually fires.
+
+    Gated by ``EB5_CSEL=1``. The collapse trigger is periodic with period 128 =
+    ``compress_ratio`` (absolute positions cluster at X and X+128), which pins it
+    to the compressed-KV creation path. If ``sel`` is empty on every call then
+    ``plan_rows[:, 0]`` is not the ``seq_len`` the reference kernel tests and the
+    boundary filter is selecting the wrong rows.
+    """
+    import os
+
+    if os.environ.get("EB5_CSEL", "0") != "1":
+        return
+    st = _CSEL
+    st["calls"] += 1
+    st["written"] += int(sel.numel())
+    if st["hits"] < 8 and sel.numel() > 0:
+        st["hits"] += 1
+        print(
+            f"[csel] WRITE n_sel={sel.numel()} seq_vals={seq_d[:4].tolist()} "
+            f"cr={cr} locs={out_loc.reshape(-1)[:4].tolist()}",
+            flush=True,
+        )
+    if st["calls"] % 200 == 0:
+        print(
+            f"[csel] calls={st['calls']} rows_written={st['written']} "
+            f"seq_sample={seq_d[:4].tolist()}",
+            flush=True,
+        )

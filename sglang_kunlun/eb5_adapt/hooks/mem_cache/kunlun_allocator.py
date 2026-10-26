@@ -202,6 +202,7 @@ class KunlunPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
         if num_new_pages == 0:
             out_indices.copy_(last_loc + 1)
+            _probe_alloc(seq_lens, last_loc, out_indices, "same_page")
             return out_indices
 
         # The kernel indexes free_pages over the padded range [0, bs_upper), so it
@@ -231,6 +232,7 @@ class KunlunPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 if last_loc.dtype == torch.int32
                 else last_loc.to(torch.int32)
             )
+            _probe_alloc(seq_lens, last_loc_kernel, out_indices, "new_page")
             torch.ops.xspeedgate_ops.alloc_decode_kernel(
                 seq_lens,
                 last_loc_kernel.contiguous(),
@@ -254,3 +256,38 @@ class KunlunPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
+
+
+_ALLOC_PROBE = {"hits": 0}
+
+
+def _probe_alloc(seq_lens, last_loc, out_indices, where="?") -> None:
+    """Log what decode allocation hands back once the sequence crosses a page.
+
+    Gated by ``EB5_ALLOC_PROBE=1``. The reader side shows a sliding 128-slot
+    window ``[256, 383]`` in which the NEWEST slot is always NaN, i.e. page 1 is
+    indexed but never populated. If the slots this allocator returns do not match
+    the window the attention later reads, the write/read mismatch is here.
+    """
+    import os
+
+    if os.environ.get("EB5_ALLOC_PROBE", "0") != "1":
+        return
+    st = _ALLOC_PROBE
+    if st["hits"] >= 10:
+        return
+    try:
+        sl = seq_lens.reshape(-1)
+        if not bool((sl >= 250).any().item()):
+            return
+        st["hits"] += 1
+        oi = out_indices.reshape(-1)
+        print(
+            f"[alloc:{where}] seq_lens={sl[:4].tolist()} "
+            f"last_loc={last_loc.reshape(-1)[:4].tolist()} "
+            f"out_indices[:8]={oi[:8].tolist()} "
+            f"out_range=[{int(oi.min().item())},{int(oi.max().item())}]",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[alloc] failed: {exc!r}", flush=True)

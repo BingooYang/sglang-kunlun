@@ -892,15 +892,108 @@ def _compress_forward_torch(
             out = kv_score_input.new_zeros(num_tokens, head_dim)
         return out
 
-    native = _native_compress_forward_v2(
-        kv_score_buffer,
-        kv_score_input,
-        ape,
-        plan,
-        head_dim=head_dim,
-        compress_ratio=compress_ratio,
-        out=out,
-    )
+    # 曾在此处放过 ``EB5_ZERO_STATE``（首次见到状态池就整块清零）用于验证修法。
+    # 正式修复已落在 ``hooks/mem_cache/deepseek_v4_compress_state.py`` 的
+    # ``compress_state_init_no_neg_inf_sentinel``（``CompressStatePool.__init__``
+    # 的 AROUND hook），此处的实验版重复且会掩盖该 hook 失效，故删除。
+
+    # ``EB5_COMP_IN=1``：compress_forward 的**入参**非有限计数。
+    #
+    # 上一轮已定位到这一段：它的输出 kv 已有 389~425/512 个非有限值，而
+    # rmsnorm 权重干净、pos_max=0，所以 NaN 产生在聚合这一步而不是 norm/rope。
+    # 聚合读的是 state_pool 里本压缩块的 128 个 token 状态，所以这里分别报
+    # kv_score_buffer（整块）、plan 选中的那些行、kv_score_input、ape。
+    # 若只有"plan 选中的行"是 NaN，就是该块首次成形时状态缓冲有行从没写过
+    # —— 这同时解释"为什么偏偏是跨过 128 的那一步"和"为什么改时序就好"。
+    if os.environ.get("EB5_COMP_IN", "0") == "1":
+        try:
+            _stp = globals().setdefault("_EB5_CF_N", [0])
+            _bb = int((~torch.isfinite(kv_score_buffer.float())).sum().item())
+            _bi = int((~torch.isfinite(kv_score_input.float())).sum().item())
+            _ba = int((~torch.isfinite(ape.float())).sum().item())
+            # 上一轮打出来的全是 seq_lens=[0,..] / read_page0=[-1,..] 的**空批**：
+            # 探针按"有非有限值就打印"触发，而坏行一旦留在状态池里，连 idle 批都
+            # 会命中，于是真正的边界步被挤掉。只在**真实的压缩边界步**打印：
+            # seq_len>0 且存在 seq_len % 128 == 0 的行。
+            _pr0 = plan[1].view(torch.int32)
+            _sl0 = _pr0[:, 0].to(torch.int64)
+            _is_boundary = bool(
+                ((_sl0 > 0) & (_sl0 % int(compress_ratio) == 0)).any().item()
+            )
+            if (_bb or _bi or _ba) and _is_boundary and _stp[0] < 20:
+                _stp[0] += 1
+                _rows = int(kv_score_buffer.shape[0])
+                _badrows = int(
+                    (~torch.isfinite(kv_score_buffer.float()))
+                    .reshape(_rows, -1)
+                    .any(dim=-1)
+                    .sum()
+                    .item()
+                )
+                # 实测：buf=(4,128,1024)，恰好 512 个非有限值、集中在 4 个块中的
+                # 1 个。1024 = 2*head_dim，512 正好是**某个 token 状态行的一半**，
+                # 典型的"该行只被写了一半/从没写过"。若坏的 token 下标正是块内
+                # 最后一个（127），就说明压缩块在**最后一个 token 的状态写入之前**
+                # 就被聚合了 —— 一个真实的顺序 bug，且天然对时序敏感，正好解释
+                # "加一层 Python 开销就不复现"。
+                _m3 = (~torch.isfinite(kv_score_buffer.float()))
+                _blk = torch.nonzero(_m3.any(dim=-1).any(dim=-1)).reshape(-1)
+                _tok = torch.nonzero(_m3.any(dim=-1).any(dim=0)).reshape(-1)
+                _half = _m3.reshape(_rows, _m3.shape[1], 2, -1).any(dim=-1)
+                _h0 = int(_half[..., 0].sum().item())
+                _h1 = int(_half[..., 1].sum().item())
+                # 坏行已精确到 block 3 / token 127 / **score 半边**（half1）。
+                # Step 1 的 decode 写入是整行 1024 宽（kv_score_input[:P]），所以
+                # 不是"只写了一半"，而是**这一行从没被写过**：Step 2 读的是
+                # read_page_0 整页 128 行，而 Step 1 写的是 plan_raw[:,1] 指定的
+                # 槽位。若当前步的 write_loc 不等于 read_page_0*128+127，这一行
+                # 就永远轮不到被写 —— 即读写槽位差一格。这里把两者并排打出来。
+                _pr = plan[1].view(torch.int32)
+                _wl = _pr[:, 1].long()
+                _rp = _pr[:, 2].long()
+                _nts = int(kv_score_buffer.shape[0] * kv_score_buffer.shape[1])
+                _want = (_rp * int(kv_score_buffer.shape[1]) + 127).tolist()[:8]
+                print(
+                    f"[comp-fwd] write_locs={_wl.tolist()[:8]} "
+                    f"read_page0={_rp.tolist()[:8]} "
+                    f"slot_of_tok127={_want} num_total_slots={_nts} "
+                    f"seq_lens={_pr[:, 0].tolist()[:8]} ",
+                    flush=True,
+                )
+                print(
+                    f"[comp-fwd] pid={os.getpid()} cr={int(compress_ratio)} "
+                    f"buf={tuple(kv_score_buffer.shape)} buf_nonfinite={_bb} "
+                    f"buf_bad_rows={_badrows}/{_rows} "
+                    f"bad_blocks={_blk.tolist()[:4]} "
+                    f"bad_tokens={_tok.tolist()[:8]} n_bad_tokens={_tok.numel()} "
+                    f"half0_bad={_h0} half1_bad={_h1} "
+                    f"input={tuple(kv_score_input.shape)} input_nonfinite={_bi} "
+                    f"ape_nonfinite={_ba}",
+                    flush=True,
+                )
+        except Exception as _e:  # noqa: BLE001
+            print(f"[comp-fwd] failed: {_e!r}", flush=True)
+
+    # ``EB5_COMP_FWD_TORCH=1``：跳过原生聚合算子，强制走纯 torch 散算子实现。
+    #
+    # 边界步实测：seq_lens=[128] 时 write_locs=[1]、read_page0=[1]（即读页 1 =
+    # 槽位 128~255），而状态池里唯一的坏行在 **block 3 / token 127 = 槽位 511**，
+    # 根本不在被读的那一页里。纯 torch 实现 ``_compress_forward_c128_torch`` 只
+    # 读 ``kv_score_buffer[read_page_0]``，因此它不可能把槽位 511 的 NaN 读进来
+    # —— 但 compress_forward 的输出确实是 NaN（389~425/512）。唯一自洽的解释是
+    # 跑的是原生 ``_native_compress_forward_v2``，且它读到了 plan 指定页之外的
+    # 内存（撞上从未写过的最后一个槽位）。这个开关就是用来判定它的。
+    native = None
+    if os.environ.get("EB5_COMP_FWD_TORCH", "0") != "1":
+        native = _native_compress_forward_v2(
+            kv_score_buffer,
+            kv_score_input,
+            ape,
+            plan,
+            head_dim=head_dim,
+            compress_ratio=compress_ratio,
+            out=out,
+        )
     if native is not None:
         return native
 
@@ -1109,6 +1202,8 @@ def _store_compress_kv_int8(kvcache, out_locs, kv_out, page_size=None, valid=Non
     num_pages = kvcache.shape[0]
     page_elems = kvcache.numel() // num_pages
     loc = out_locs.to(torch.int64)
+    _probe_compress_store(kvcache, loc, kv_out, page_size, valid, head_dim,
+                          num_pages, page_elems)
 
     if valid is not None:
         valid = valid.to(torch.bool)
@@ -1144,6 +1239,64 @@ def _store_compress_kv_int8(kvcache, out_locs, kv_out, page_size=None, valid=Non
         _store_bf16_rows(
             kvcache, loc, kv_out.to(torch.bfloat16), page_size, valid=valid
         )
+        # ``EB5_COMP_STORE=1``: write then read the same slot back.
+        #
+        # Measured contradiction: the compressor DOES issue writes to c128 slot
+        # 2 with finite source data (loc=[2] valid=None src_nonfinite=0), yet
+        # reading the whole buffer back gives allzero_rows=23147 /
+        # nonfinite_rows=1 -- slot 2 does not hold that data, and that one bad
+        # row is what HCA layer 40 reads and turns into an all-NaN output.
+        # Only one of the two can be true, so compare instead of inferring.
+        #
+        # Prime suspect is ``_store_bf16_rows``'s non-fused branch:
+        # ``u8 = kvcache.contiguous().view(torch.int8).reshape(-1)`` -- if
+        # ``kvcache`` (a ``get_extra_key_buffer(layer).view(uint8)``) is not
+        # contiguous, ``.contiguous()`` returns a COPY, the scatter writes the
+        # copy and the real buffer is untouched. A read-back is valid for both
+        # branches, so it needs no prior knowledge of which one ran.
+        #
+        # Kept inline on purpose: a module-level helper added here was silently
+        # dropped by an external rewrite of this file and crashed every rank
+        # with NameError, costing a full run.
+        if os.environ.get("EB5_COMP_STORE", "0") == "1":
+            try:
+                # 按 ptr 去重、**不设次数上限**：每个 rank 最多 ~37 个 HCA 层
+                # 缓冲，集合天然有界。之前设 12 次上限，结果只采到 12 个指针，
+                # 无法判断 layer 40 读的那块到底"没被写过"还是"还没轮到打印"
+                # —— 与今天两次假阴性同一类错误（探针容量盖不住目标事件）。
+                _vs = globals().setdefault("_EB5_VERIFY_PTRS", set())
+                _lc = loc.reshape(-1).to(torch.int64)
+                _src = kv_out
+                if valid is not None:
+                    _k = valid.to(torch.bool)
+                    _lc, _src = _lc[_k], kv_out[_k]
+                _sel = _lc != 0
+                _ptr = kvcache.data_ptr()
+                # 不再按 ptr 去重：已确认"写在读之前 3.7ms、写回读验证逐位相同"，
+                # 而 3.7ms 后同一槽位变成 NaN。要找的是**最后一次写**，所以每次
+                # 非零槽位写入都要打印，并带写入行自身的 nonfinite 数。
+                if _lc.numel() and bool(_sel.any().item()) and len(_vs) < 400:
+                    _vs.add(len(_vs))
+                    _i = int(torch.nonzero(_sel)[0].item())
+                    _slot = int(_lc[_i].item())
+                    _v = kvcache.view(torch.bfloat16).reshape(
+                        -1, page_size, head_dim
+                    )
+                    _got = _v[_slot // page_size, _slot % page_size].float()
+                    _want = _src[_i].float()
+                    print(
+                        f"[store-verify] t={__import__('time').perf_counter():.6f} "
+                        f"pid={os.getpid()} slot={_slot} "
+                        f"ptr={kvcache.data_ptr()} "
+                        f"contiguous={kvcache.is_contiguous()} "
+                        f"max_abs_diff={float((_got - _want).abs().max().item()):.6g} "
+                        f"got_allzero={bool((_got == 0).all().item())} "
+                        f"got_nonfinite={int((~torch.isfinite(_got)).sum().item())} "
+                        f"want_absmax={float(_want.abs().max().item()):.6g}",
+                        flush=True,
+                    )
+            except Exception as _exc:  # noqa: BLE001
+                print(f"[store-verify] failed: {_exc!r}", flush=True)
         return
 
     # FlashMLA fp8 latent layout: 576 B/token + 8 B scales, page stride
@@ -1199,6 +1352,73 @@ def _store_compress_kv_int8(kvcache, out_locs, kv_out, page_size=None, valid=Non
         flat_f32 = kvcache.reshape(-1).view(torch.float32)
         s_idx = page * (page_bytes // 4) + (block * head_dim) // 4 + off
         flat_f32[s_idx] = scale.reshape(-1)
+
+
+_COMP_STORE_PROBE = {"n": 0, "stacked": False}
+
+
+def _probe_compress_store(kvcache, loc, kv_out, page_size, valid, head_dim,
+                          num_pages, page_elems) -> None:
+    """``EB5_COMP_STORE=1``：压缩 KV 的**唯一写入点**，报告它选了哪种页布局。
+
+    读取侧（``eb5_mla_adapt._mla_gather_kv`` 的 bf16 分支）按 token 跨距 =
+    head_dim 个 bf16 元素直读；而这里的布局是**按 page_bytes 猜**的：bf16 行、
+    FlashMLA fp8 584B、int8+fp32 scale 三者靠字节数区分，且 ``bf16_store`` 这个
+    入参被接收后**从未使用**。如果写进去的是 int8 或 fp8 布局而读出来按 bf16
+    解释，整段压缩 KV 就是垃圾 —— 这与"c128 槽位 2 是 NaN、窗口段正常"的实测
+    一致（窗口段由另一条 ``set_mla_kv_buffer`` 路径写）。
+
+    所以这里把三种布局的期望字节数和实际 page_bytes 一起打出来，由实测决定。
+    """
+    import os
+
+    if os.environ.get("EB5_COMP_STORE", "0") != "1":
+        return
+    st = _COMP_STORE_PROBE
+    try:
+        locs = loc.reshape(-1).tolist()
+        nonzero = any(int(v) != 0 for v in locs)
+        st["n"] += 1
+        # 上一轮把上限设成 40，而 8 个 rank 合计刚好 320 行 —— 探针在**第 42 步
+        # 之前就打满了**，于是边界步（seq_len 跨过 128、out_loc 变成非 0）那一次
+        # 写入根本没被观测到，我却据此说"所有写入都落在槽位 0"。这是同一类错误：
+        # 探针的容量必须能覆盖目标事件。改成：非 0 槽位**无条件打印**（这正是要
+        # 找的事件，次数极少），其余只打前 10 次和每 100 次一次。
+        if not nonzero and st["n"] > 10 and st["n"] % 100 != 0:
+            return
+        page_bytes = page_elems * kvcache.element_size()
+        want_bf16 = (page_size or 0) * head_dim * 2
+        want_fp8 = ((584 * (page_size or 0) + 575) // 576) * 576
+        if kvcache.dtype in (torch.bfloat16, torch.float16, torch.float32):
+            branch = "elem-typed"
+        elif page_size and page_bytes == want_bf16:
+            branch = "bf16-rows"
+        elif page_size and page_bytes == want_fp8:
+            branch = "flashmla-fp8"
+        else:
+            branch = "int8+scale"
+        bad = int((~torch.isfinite(kv_out.float())).sum().item())
+        print(
+            f"[comp-store] branch={branch} dtype={kvcache.dtype} "
+            f"page_size={page_size} head_dim={head_dim} num_pages={num_pages} "
+            f"page_bytes={page_bytes} want_bf16={want_bf16} want_fp8={want_fp8} "
+            f"rows={tuple(kv_out.shape)} src_nonfinite={bad} "
+            f"n_loc={len(locs)} loc={locs[:10]} "
+            f"valid={'None' if valid is None else int(valid.sum().item())}",
+            flush=True,
+        )
+        if not st["stacked"]:
+            st["stacked"] = True
+            import traceback
+
+            fr = traceback.extract_stack()[-10:-1]
+            print(
+                "[comp-store] stack "
+                + " <- ".join(f"{f.filename.split('/')[-1]}:{f.lineno}" for f in fr),
+                flush=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[comp-store] probe failed: {exc!r}", flush=True)
 
 
 def _compress_norm_rope_store_torch(
@@ -1265,16 +1485,9 @@ def _compress_norm_rope_store_torch(
     if kv_out.shape[0] == 0:
         return
 
-    # Use the HIP-style quant+pack path if available, otherwise raw copy
-    try:
-        from sglang.srt.layers.attention.dsv4.quant_k_cache import (
-            quant_to_nope_fp8_rope_bf16_pack_triton,
-        )
-        pack = quant_to_nope_fp8_rope_bf16_pack_triton(kv_out.bfloat16())
-    except Exception:
-        # Fallback: just use bfloat16 representation
-        pack = kv_out.bfloat16()
-
+    # 这里曾经先算一遍 ``quant_to_nope_fp8_rope_bf16_pack_triton(kv_out)``，但结果
+    # ``pack`` **从未被使用** —— 下面存的是 ``kv_out``，布局由
+    # ``_store_compress_kv_int8`` 自己按 page 字节数判定。白跑一次量化，已删除。
     _store_compress_kv_int8(kvcache, out_locs, kv_out, page_size=page_size)
 
 
@@ -1330,6 +1543,38 @@ def _compress_norm_rope_store_kunlun(
 
     kv_out = torch.cat([kv_nope, kv_rope_rot], dim=-1)  # [N, head_dim]
 
+    # ``EB5_COMP_IN=1``：压缩器三段式的逐段非有限计数。
+    #
+    # 已实测：在 seq_len 跨过 128 的那一步，压缩器**本身**往 c128 槽位 2 写入了
+    # 一整行全 NaN（store-verify 的 got_nonfinite=512 / want_absmax=nan），而
+    # layer 40 的注意力随后读到它、输出全 NaN。所以 NaN 不是 KV 缓冲被别人踩坏，
+    # 而是压缩器算出来的。``branch_in_q/k`` 干净说明该层输入 x 是好的，所以 NaN
+    # 产生在压缩器内部。这里分三段定位：
+    #   kv      -> compress_forward 的输出（聚合 128 个 token 状态）
+    #   normed  -> rmsnorm 之后
+    #   out     -> rope 之后、写入之前
+    # 第一个变非有限的那一段就是元凶段。
+    if os.environ.get("EB5_COMP_IN", "0") == "1":
+        try:
+            _b_in = int((~torch.isfinite(kv.float())).sum().item())
+            _b_nm = int((~torch.isfinite(kv_normed.float())).sum().item())
+            _b_out = int((~torch.isfinite(kv_out.float())).sum().item())
+            if _b_in or _b_nm or _b_out:
+                _st = globals().setdefault("_EB5_COMP_IN_N", [0])
+                if _st[0] < 20:
+                    _st[0] += 1
+                    print(
+                        f"[comp-in] pid={os.getpid()} rows={tuple(kv.shape)} "
+                        f"is_decode={getattr(plan, 'is_decode', None)} "
+                        f"kv_nonfinite={_b_in} normed_nonfinite={_b_nm} "
+                        f"out_nonfinite={_b_out} "
+                        f"w_nonfinite={int((~torch.isfinite(norm_weight.float())).sum().item())} "
+                        f"pos_max={int(positions.max().item())}",
+                        flush=True,
+                    )
+        except Exception as _e:  # noqa: BLE001
+            print(f"[comp-in] failed: {_e!r}", flush=True)
+
     # --- Step 3: Store to paged cache (same as torch version) ---
     valid_rows = None
     if plan.is_decode:
@@ -1345,14 +1590,7 @@ def _compress_norm_rope_store_kunlun(
     if kv_out.shape[0] == 0:
         return
 
-    try:
-        from sglang.srt.layers.attention.dsv4.quant_k_cache import (
-            quant_to_nope_fp8_rope_bf16_pack_triton,
-        )
-        pack = quant_to_nope_fp8_rope_bf16_pack_triton(kv_out.bfloat16())
-    except Exception:
-        pack = kv_out.bfloat16()
-
+    # 同上：``pack`` 算完从未使用，存的是 ``kv_out``。已删除这次无效量化。
     _store_compress_kv_int8(
         kvcache, out_locs, kv_out, page_size=page_size, valid=valid_rows
     )

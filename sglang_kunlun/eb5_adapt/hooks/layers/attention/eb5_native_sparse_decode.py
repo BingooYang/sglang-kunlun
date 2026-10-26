@@ -179,24 +179,54 @@ def _native_compressed_decode(
     # The op asserts max_window_size == win_indices.size(1).
     win_size = win_indices.shape[1]
 
-    return (
-        _qfused(
-            q,
-            win_cache,
-            win_indices,
-            com_cache,
-            com_indices,
-            seq_lens,
-            scale,
-            win_size,
-            com_ratio,
-            com_topk,
-            attn_sink,
-            h_q,
-            d_v,
-        ),
-        None,
+    out = _qfused(
+        q,
+        win_cache,
+        win_indices,
+        com_cache,
+        com_indices,
+        seq_lens,
+        scale,
+        win_size,
+        com_ratio,
+        com_topk,
+        attn_sink,
+        h_q,
+        d_v,
     )
+    _probe(out, q, win_indices, com_indices, seq_lens, com_topk, win_size)
+    return out, None
+
+
+_NAT_PROBE = {"n": 0}
+
+
+def _probe(out, q, win_indices, com_indices, seq_lens, com_topk, win_size) -> None:
+    """``EB5_NAT_PROBE=1``：把原生 compressed_attention 的入参与出参对齐打印。
+
+    这条路径是 decode 的唯一出口，而它**丢弃了 ``extra_topk_length``**，改用
+    ``seq_lens.max() // com_ratio`` 现算 ``com_topk``；同时 ``kvseqlen`` 传的是
+    完整序列长度而不是窗口内有效长度。要判断 NaN 是算子算出来的还是入参喂错
+    的，必须同时看到"这一步的 seq_len / 有效索引个数 / out 是否 NaN"。
+    """
+    import os
+
+    if os.environ.get("EB5_NAT_PROBE", "0") != "1":
+        return
+    st = _NAT_PROBE
+    if st["n"] >= 200:
+        return
+    bad = int((~torch.isfinite(out)).sum().item())
+    # 只打印状态变化点与前若干步，避免把日志刷爆。
+    st["n"] += 1
+    if bad or st["n"] <= 6 or st["n"] % 20 == 0:
+        print(
+            f"[nat] step#{st['n']} seq_lens={seq_lens.tolist()} "
+            f"win_size={win_size} win_valid={(win_indices >= 0).sum(-1).tolist()} "
+            f"com_topk={com_topk} com_valid={(com_indices >= 0).sum(-1).tolist()} "
+            f"out_bad={bad}/{out.numel()}",
+            flush=True,
+        )
 
 
 def _native_sparse_decode(

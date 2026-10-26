@@ -107,6 +107,8 @@ def _wrap(torch_impl):
 
 
 def install() -> list:
+    if os.environ.get("SGLANG_EB5_DISABLE_NATIVE_HOOKS") == "1":
+        return []
     """Wrap the installed torch ``flash_mla_sparse_fwd``; idempotent.
 
     ``sgl_kernel`` is a ``_StubModule`` whose ``__getattr__`` fabricates a

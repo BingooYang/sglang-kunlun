@@ -280,3 +280,33 @@ def get_device_name_kunlun(device_id: int = 0) -> str:
     """Stable identifier used for cache keys & logs."""
     return "Kunlun-XPU"
 
+
+@plugin_hook(
+    "sglang.srt.utils.common.init_cublas",
+    type=HookType.AROUND,
+)
+def init_cublas_kunlun(original_fn):
+    """Optionally skip the cuBLAS warm-up: there is no cuBLAS handle on XPU.
+
+    Upstream runs a 16x16 fp16 ``a @ b`` from ``build_attention_backends`` so
+    the first real GEMM does not pay cuBLAS handle creation. The device string
+    is ``cuda`` on Kunlun (see ``get_device_kunlun``), so that branch is taken.
+    It normally succeeds, but under ``--enable-deterministic-inference`` the
+    matmul raises ``TypeError: unsupported operand type(s) for @: 'Tensor' and
+    'Tensor'`` and kills every scheduler during init (observed 2026-10-25, exit
+    code -3 on all 8 DP ranks).
+
+    Off by default so the stock path is unchanged; set
+    ``SGLANG_KUNLUN_SKIP_CUBLAS_WARMUP=1`` when that crash is in the way. Note
+    that deterministic inference then fails one step later anyway, inside
+    ``batch_invariant_ops.mean_dim`` (Triton kernels XPU does not have).
+    """
+    if os.environ.get("SGLANG_KUNLUN_SKIP_CUBLAS_WARMUP", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return None
+    return original_fn()
+

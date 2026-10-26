@@ -28,6 +28,11 @@ from typing import Optional, Tuple
 import kunlun_ops
 import os
 import torch
+
+from sglang.srt.internal.train_infer_consistent_ops.inspect_util import (
+    get_current_layer,
+    inspect_tensor,
+)
 import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops.*)
 
 from sglang_kunlun.eb5_adapt.kernels.quant_ops import (
@@ -278,8 +283,11 @@ def _fused_k_norm_rope_flashmla_kunlun(
 
 
     # --- Step 3: store to paged cache ---
+    kv_out = torch.cat([kv_nope, kv_rope_rot], dim=-1)
+    kv_out = inspect_tensor("attn_k_after_rope", get_current_layer(), kv_out)
+
     if kvcache.dtype in (torch.bfloat16, torch.float16):
-        kv_out = torch.cat([kv_nope, kv_rope_rot], dim=-1).to(kvcache.dtype).contiguous()
+        kv_out = kv_out.to(kvcache.dtype).contiguous()
         _np = kvcache.shape[0]
         _mx = _np * page_size - 1
         _loc = out_loc.to(torch.int64).clamp(min=0, max=_mx)
@@ -288,7 +296,7 @@ def _fused_k_norm_rope_flashmla_kunlun(
 
     # Byte-addressed bf16 layout (internal fork: uint8 pool, 2 bytes/element).
     if kvcache.dtype == torch.uint8 and kvcache.shape[1] == page_size * head_dim * 2:
-        kv_out = torch.cat([kv_nope, kv_rope_rot], dim=-1).to(torch.bfloat16)
+        kv_out = kv_out.to(torch.bfloat16)
         _store_bf16_rows(kvcache, out_loc, kv_out, page_size)
         return
 
@@ -1038,7 +1046,7 @@ def _store_compress_kv_flashmla_fp8(kvcache, loc, kv_out, page_size, valid=None)
     amax = nope.abs().amax(dim=-1).clamp(min=1e-4)
     scale_raw = amax / 448.0
     scale_u8 = (
-        (torch.floor(torch.log2(scale_raw)) + 127.0).clamp(0, 254).to(torch.uint8)
+        (torch.ceil(torch.log2(scale_raw)) + 127.0).clamp(0, 254).to(torch.uint8)
     )
     inv = 2.0 ** (127.0 - scale_u8.float())
     q_u8 = _e4m3_to_uint8((nope * inv.unsqueeze(-1)).clamp(-448.0, 448.0)).reshape(-1)

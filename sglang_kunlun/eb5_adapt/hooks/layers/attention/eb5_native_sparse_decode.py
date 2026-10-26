@@ -380,6 +380,8 @@ def _install_context_hook() -> list:
 
 
 def install() -> list:
+    if os.environ.get("SGLANG_EB5_DISABLE_NATIVE_HOOKS") == "1":
+        return []
     """Wrap the installed torch ``flash_mla_with_kvcache``; idempotent.
 
     ``sgl_kernel`` is a ``_StubModule`` whose ``__getattr__`` fabricates a

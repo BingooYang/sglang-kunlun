@@ -433,13 +433,24 @@ def compress_norm_rope_store(
     is_decode = bool(getattr(plan, "is_decode", False))
     if is_decode:
         # decode：每请求一行，写位直接由 out_loc 给出。
+        #
+        # kernel 的 CompressDecode 分支只写**压缩边界**上的行
+        # （fused_norm_rope_v2.cuh:439-441: `if (plan.seq_len %
+        # params.compress_ratio != 0) return;`）。非边界步上 `kv` 根本没被填过
+        # ——kernel 提前 return，所以调用方不保证它有效——里面是上一轮的残留或
+        # 未初始化显存；原来这里每步都写，于是把 NaN 顺着 RMSNorm 写进了压缩
+        # KV 槽位。实测 slot 383/384/385（384 = 3*128，正好压缩边界附近）整条
+        # 576 维全是 NaN，被索引当成 live 读出来后毁掉整个 token 的注意力。
+        # `position = seq_len - cr` 也只在边界上才有意义。
         n = min(kv.shape[0], out_loc.numel())
-        sel = torch.arange(n, device=kv.device)
-        rows = kv[:n].float()
-        positions = (kv.new_zeros(n, dtype=torch.int64) + cr).clamp(min=0)
         plan_rows = plan[1].contiguous().view(torch.int32)[:n]
-        positions = (plan_rows[:, 0].to(torch.int64) - cr).clamp(min=0)
-        locs = out_loc.to(torch.int64)[:n]
+        seq_d = plan_rows[:, 0].to(torch.int64)
+        sel = torch.nonzero((seq_d % cr) == 0, as_tuple=False).flatten()
+        if sel.numel() == 0:
+            return
+        rows = kv.index_select(0, sel).float()
+        positions = (seq_d - cr).clamp(min=0).index_select(0, sel)
+        locs = out_loc.to(torch.int64)[:n].index_select(0, sel)
     else:
         pc = plan[1].contiguous().view(torch.int32)  # CompressPlan [N, 4]
         seq_raw = pc[:, 0]
@@ -458,21 +469,29 @@ def compress_norm_rope_store(
     rows = rows * torch.rsqrt(rows.pow(2).mean(-1, keepdim=True) + norm_eps)
     rows = rows * norm_weight.float()
 
-    # Step 2: RoPE（neox，作用在末尾 rope_dim 维）
+    # Step 2: RoPE（**交错对/GPT-J**，作用在末尾 rope_dim 维）
+    #
+    # kernel 旋转的是**相邻元素对**，并按同样的交错下标读 freq 表
+    # （fused_norm_rope_v2.cuh:504-512，每 lane 一个 (real, imag) 对）。本仓
+    # 同语义的参考实现见 kernels/dsv4_torch_shim.py:162-170。
+    # 旧写法有两个独立错误叠在一起：
+    #   (a) `view_as_real(freq_cis).flatten(-2)` 的布局是 [c0,s0,c1,s1,...]，
+    #       所以 `cs[:, :32]` 不是"所有 cos"，而是前 16 个 (cos,sin) 对；
+    #   (b) 配对方式 (i, i+32) 是 NeoX 风格，不是 kernel 用的交错风格。
+    # 结果是每个压缩 KV 条目的 64 个 RoPE 维全是垃圾。
     head_dim = rows.shape[-1]
     rope_dim = 64
     nope_dim = head_dim - rope_dim
-    half = rope_dim // 2
-    fr = torch.view_as_real(freq_cis).flatten(-2).float()
-    cs = fr.index_select(0, positions)
-    cos, sin = cs[:, :half], cs[:, half:rope_dim]
+    f = freq_cis.index_select(0, positions.long().reshape(-1))
+    f_r = f.real.float()
+    f_i = f.imag.float()
     nope = rows[:, :nope_dim]
-    rope = rows[:, nope_dim:]
-    rope_rot = torch.cat(
-        [rope[:, :half] * cos - rope[:, half:] * sin,
-         rope[:, half:] * cos + rope[:, :half] * sin],
+    rp = rows[:, nope_dim:].reshape(-1, rope_dim // 2, 2)
+    rope_rot = torch.stack(
+        [rp[..., 0] * f_r - rp[..., 1] * f_i,
+         rp[..., 0] * f_i + rp[..., 1] * f_r],
         dim=-1,
-    )
+    ).reshape(-1, rope_dim)
     kv_out = torch.cat([nope, rope_rot], dim=-1)  # [M, head_dim]
 
     # Step 3: 写回 paged cache
@@ -488,7 +507,7 @@ def compress_norm_rope_store(
     tiles = 7
     nf = kv_out[:, :nope_dim].float().reshape(-1, tiles, 64)
     amax = nf.abs().amax(dim=-1).clamp(min=1e-4)
-    exp = (torch.floor(torch.log2(amax / _FP8_MAX)) + 127.0).clamp(0, 254)
+    exp = (torch.ceil(torch.log2(amax / _FP8_MAX)) + 127.0).clamp(0, 254)
     inv = torch.exp2(127.0 - exp)
     q_u8 = (
         _to_fp8(nf * inv.unsqueeze(-1))
@@ -597,7 +616,7 @@ def postmix_quant(
     scale_groups = D // 128
     mf = mixed.reshape(T, G, scale_groups, 128)
     amax = mf.abs().amax(dim=-1).clamp(min=1e-4)
-    exp = (torch.floor(torch.log2(amax / _FP8_MAX)) + 127.0).clamp(0, 254)
+    exp = (torch.ceil(torch.log2(amax / _FP8_MAX)) + 127.0).clamp(0, 254)
     inv = torch.exp2(127.0 - exp)
     codes = _to_fp8(mf * inv.unsqueeze(-1)).reshape(T, G, D)
 
@@ -657,6 +676,12 @@ def fused_split_feature_topk(
 
     score = score(chunk0) + score(chunk1)（sigmoid/softmax），加 correction bias 后取
     TopK，renormalize 后按 per-expert scale / routed scaling factor 缩放。
+
+    注意：correction bias 只参与**选择**，权重取的是**不含 bias** 的 score
+    （fork 的 triton kernel ``_eb5_router_topk_kernel`` 同样如此：选 id 用
+    ``scores + bias``，权重重新按原始 score 表达式算一遍）。早先这里直接用
+    ``torch.topk`` 的 values 当权重，等于把 bias 混进权重再归一化，权重动态范围
+    被压平（实测 GPU 0.086~0.96 → XPU 0.29~0.44），MoE 输出随之整体跑偏。
     """
     T = fused_logits.shape[0]
     halves = fused_logits.float().view(T, 2, -1)
@@ -669,7 +694,9 @@ def fused_split_feature_topk(
 
     router_logits = scores
     if correction_bias is not None:
-        scores = scores + correction_bias.float()
+        choice_scores = scores + correction_bias.float()
+    else:
+        choice_scores = scores
     if T == 0:
         return (
             torch.empty((0, topk), dtype=torch.float32, device=fused_logits.device),
@@ -677,9 +704,15 @@ def fused_split_feature_topk(
             router_logits,
         )
 
-    topk_weights, topk_ids = torch.topk(scores, topk, dim=-1)
+    topk_ids = torch.topk(choice_scores, topk, dim=-1).indices
+    # bias 只影响选择；权重取 bias-free score。
+    topk_weights = torch.gather(router_logits, 1, topk_ids)
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        denominator = topk_weights.sum(dim=-1, keepdim=True)
+        denominator = torch.where(
+            denominator != 0, denominator, torch.ones_like(denominator)
+        )
+        topk_weights = topk_weights / denominator
     if per_expert_scale is not None and per_expert_scale.numel() > 0:
         # 就地展开 fork 的 apply_per_expert_scale（它的 triton kernel 在昆仑跑不了）：
         # 按 logical id 取 scale，shared / padded id（越界）取 1。
@@ -1320,9 +1353,13 @@ def moe_align_block_size(
 
     order = torch.argsort(bucket, stable=True)
     exp_of = bucket[order]
-    pos = starts[exp_of] + (
-        torch.arange(numel, device=device) - starts[exp_of]
-    )
+    # 桶内名次要用**未 padding** 的前缀和去减：`argsort` 的结果是密排的，而写入位置
+    # 要落在 padding 后的边界上。原来写的是 `starts[exp_of] + (arange - starts[exp_of])`,
+    # 两项代数抵消成 `arange`，于是 token 密排、没有任何 per-expert 空隙，而
+    # `expert_ids` 又是按 padded 计数生成的 —— 只要有专家的 token 数不是 block_size
+    # 的整数倍，块 b 里的 token 就不属于 `expert_ids[b]`，GEMM 会用错专家的权重。
+    cum = torch.cumsum(counts, 0) - counts
+    pos = starts[exp_of] + (torch.arange(numel, device=device) - cum[exp_of])
     keep = pos < max_padded
     sorted_ids[pos[keep]] = order[keep].to(torch.int32)
 

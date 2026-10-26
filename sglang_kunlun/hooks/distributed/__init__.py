@@ -18,4 +18,5 @@
 """distributed"""
 
 from sglang_kunlun.eb5_adapt.hooks.distributed import parallel_state  # noqa: F401
+from . import communication_op  # noqa: F401
 from . import device_communicators  # noqa: F401

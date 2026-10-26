@@ -286,6 +286,7 @@ def bf16_mqa_logits(
     ``out[t, v] = sum_h weights[t,h] * relu(q[t,h]·kv[v])``，`[ks[t], ke[t])`
     之外按 ``clean_logits`` 置 ``-inf``。
     """
+    _attn_trace("bf16_mqa_logits")
     scores = torch.einsum("thd,vd->thv", q.float(), kv.float())
     out = (weights.float().unsqueeze(-1) * torch.relu(scores)).sum(1)
     if ks is not None and ke is not None:
@@ -486,7 +487,15 @@ def fused_k_indexer_norm_rope_store(
             + (off * per_tok)[:, None]
             + torch.arange(per_tok, device=cache.device)[None, :]
         )
-        flat_u8[dst.reshape(-1)] = q[:n].to(torch.bfloat16).view(torch.uint8).reshape(-1)
+        # The bf16 page layout stores the RAW LN+RoPE+Hadamard key (256 B/token,
+        # no scale region) -- see indexer_k.cuh's kUseBF16 branch. Writing the
+        # fp8-descaled ``q`` here scaled every key by its own 448/absmax factor,
+        # which re-ranks the indexer top-k by token magnitude instead of
+        # relevance (and ``.to(bfloat16)`` on fp8 is the unimplemented Kunlun
+        # cast this module exists to avoid).
+        flat_u8[dst.reshape(-1)] = (
+            x[:n].to(torch.bfloat16).contiguous().view(torch.uint8).reshape(-1)
+        )
         return
 
     dst = (
@@ -527,6 +536,7 @@ def set_mla_kv_buffer(
     nope = cache_k_nope.view(n_loc, -1) if cache_k_nope.dim() != 2 else cache_k_nope
     rope = cache_k_rope.view(n_loc, -1) if cache_k_rope.dim() != 2 else cache_k_rope
     src = torch.cat([nope, rope], dim=-1)
+    _probe_kv_write(loc, src)
     if reserved_skip_index is not None and reserved_skip_index >= 0:
         keep = loc.reshape(-1) != reserved_skip_index
         buf[loc.reshape(-1)[keep]] = src[keep]
@@ -541,8 +551,14 @@ def _quantize_k_cache_impl(
     n, dim_nope = k_nope.shape
     num_tiles = dim_nope // tile_size
     nt = k_nope.float().reshape(n, num_tiles, tile_size)
-    scale = nt.abs().amax(dim=-1) / _FP8_MAX
+    # clamp 是必须的：全零 tile 会让 amax=0 -> scale=0 -> `nt / 0` 产生 NaN，
+    # NaN 写进 KV cache 后会污染之后每一个读到它的 query，最终 logits 退化、
+    # argmax 按 tie-break 永久返回 0（= pad_token_id），解码成空串又不触发 eos。
+    # 同文件 213/429/465 行以及 kernels/dsv4_torch_shim.py:1046 都有这个 clamp，
+    # 只有这里漏了。
+    scale = nt.abs().amax(dim=-1).clamp(min=1e-4) / _FP8_MAX
     q = _to_fp8(nt / scale.unsqueeze(-1)).reshape(n, dim_nope)
+    _warn_nonfinite("quantize_k_cache.q", q)
 
     nope_u8 = torch.empty(
         (n, dim_nope + num_tiles * 4), dtype=torch.uint8, device=k_nope.device
@@ -907,6 +923,24 @@ def get_mla_metadata(*args, **kwargs):
     return metadata, num_splits
 
 
+def _sentinel_valid(indices, k_cache, bs, heads, device):
+    """``[bs, heads, topk]`` mask of entries that point at a real KV slot.
+
+    The kernel contract (``sgl_kernel/flash_mla.py``: "Invalid indices should be
+    set to -1 or numbers >= total_seq_len_kv") makes the ``-1`` sentinel the
+    *primary* padding signal, and callers rely on it alone: ``dsa_full.py``
+    passes ``topk_length=None`` ("rely on the -1 sentinels alone"), as does
+    ``eb5_backend.py`` on the fp8 SWA path. ``_mla_gather_kv`` clamps those
+    ``-1`` to 0, so without this mask every padded column becomes a fully
+    weighted duplicate of KV slot 0 and the softmax is swamped by it.
+    """
+    _, page_size, _, _ = _kv_raw_bytes(k_cache)
+    num_slots = int(k_cache.shape[0]) * int(page_size)
+    raw = indices.reshape(bs, -1).to(torch.int64)
+    ok = (raw >= 0) & (raw < num_slots)
+    return ok[:, None, :].expand(bs, heads, raw.shape[1])
+
+
 def _mla_gather_kv(k_cache: torch.Tensor, indices: torch.Tensor, is_fp8: bool):
     """按 indices 收集 paged KV 并转成 bf16（fp8 布局反量化，bf16 布局直接 gather）。"""
     b, _, topk = indices.shape
@@ -955,6 +989,7 @@ def flash_mla_with_kvcache(
     sink 作为 V=0 的虚拟 key 只进分母（与 fork 的 sink-aware 参考写法一致）。
     返回 ``(o, lse)``，形状/dtype 与真实 API 对齐。
     """
+    _attn_trace("flash_mla_with_kvcache")
     bs, _, heads, q_dim = q.shape
     dv = head_dim_v if head_dim_v is not None else 512
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q_dim)
@@ -962,24 +997,38 @@ def flash_mla_with_kvcache(
 
     kv = _mla_gather_kv(k_cache, indices, is_fp8_kvcache)
     kd = kv.shape[-1]
-    valid = None
+    # The -1 sentinel is the contract's primary padding signal and several
+    # callers pass no topk_length at all, so it must be masked unconditionally.
+    valid = _sentinel_valid(indices, k_cache, bs, heads, device)
     if topk_length is not None:
         tl_ = _rows_length(topk_length, bs, heads, device)
-        valid = torch.arange(kv.shape[1], device=device)[None, None, :] < tl_.unsqueeze(-1)
+        valid = valid & (
+            torch.arange(kv.shape[1], device=device)[None, None, :]
+            < tl_.unsqueeze(-1)
+        )
     if extra_k_cache is not None and extra_indices_in_kvcache is not None:
         kv2 = _mla_gather_kv(extra_k_cache, extra_indices_in_kvcache, is_fp8_kvcache)
-        el = _rows_length(extra_topk_length, bs, heads, device)
-        if el is None:
-            el = torch.full(
-                (bs, heads), kv2.shape[1], dtype=torch.int64, device=device
-            )
-        v2 = (
-            torch.arange(kv2.shape[1], device=device)[None, None, :]
-            < el.unsqueeze(-1)
+        v2 = _sentinel_valid(
+            extra_indices_in_kvcache, extra_k_cache, bs, heads, device
         )
+        el = _rows_length(extra_topk_length, bs, heads, device)
+        if el is not None:
+            v2 = v2 & (
+                torch.arange(kv2.shape[1], device=device)[None, None, :]
+                < el.unsqueeze(-1)
+            )
         kv = torch.cat([kv, kv2], dim=1)
         kd = kv.shape[-1]
-        valid = v2 if valid is None else torch.cat([valid, v2], dim=-1)
+        # Concatenate both segments' masks: dropping the first one left the
+        # mask narrower than ``scores`` and masked the wrong half.
+        valid = torch.cat([valid, v2], dim=-1)
+
+    # 同 flash_mla_sparse_fwd：`probs @ kv` 里 0 * NaN = NaN，所以被掩掉的
+    # kv 行必须清零，不能只靠 scores 的 -inf。``valid`` 是 [bs, heads, T]，
+    # kv 没有 head 维，所以按"对所有 head 都无效"来清。
+    _kv_bad = ~valid.any(dim=1)  # [bs, T]
+    if bool(_kv_bad.any().item()):
+        kv[_kv_bad] = 0
 
     q3 = q.squeeze(1)  # [B, H, q_dim]
     d = min(q_dim, kd)
@@ -989,10 +1038,12 @@ def flash_mla_with_kvcache(
 
     if valid is not None:
         scores = scores.masked_fill(~valid, float("-inf"))
-    if causal and cache_seqlens is not None:
-        sl = cache_seqlens.reshape(bs, 1, 1).to(torch.int64)
-        pos = torch.arange(kd, device=device)[None, None, :]
-        scores = scores.masked_fill(pos >= sl, float("-inf"))
+    # The real kernel asserts ``causal == False`` whenever sparse indices are
+    # used (sgl_kernel/flash_mla.py), and every EB5 caller passes causal=False.
+    # The old branch built the mask with ``arange(kv.shape[-1])`` -- a feature
+    # dim, not the key count -- and ignored that a key's position is
+    # ``indices[b, t]``, not ``t``.
+    assert not causal, "sparse flash_mla_with_kvcache has no causal mask"
 
     if attn_sink is not None:
         sink = attn_sink.float().reshape(-1)[:heads].reshape(1, heads)
@@ -1000,11 +1051,13 @@ def flash_mla_with_kvcache(
         p = torch.exp(scores - m[..., None])
         denom = p.sum(dim=-1) + torch.exp(sink - m)
     else:
+        # 同 flash_mla_sparse_fwd：整行被掩掉时 m = -inf，exp(-inf - -inf) = NaN。
         m = scores.max(dim=-1).values
+        m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
         p = torch.exp(scores - m[..., None])
         denom = p.sum(dim=-1)
 
-    probs = p / denom[..., None]
+    probs = p / torch.where(denom > 0, denom, torch.ones_like(denom))[..., None]
     out = torch.einsum("bht,btd->bhd", probs, kv[..., :dv].float())
     lse = m + torch.log(denom.clamp(min=1e-20))
     return out.to(q.dtype).unsqueeze(1), lse
@@ -1032,6 +1085,7 @@ def flash_mla_sparse_fwd(
     Returns:
         ``(output [s_q,h_q,d_v], max_logits [s_q,h_q], lse [s_q,h_q])``（lse 为 2 底）
     """
+    _attn_trace("flash_mla_sparse_fwd")
     kvs = kv[:, 0, :] if kv.dim() == 3 else kv
     # 不要在这里整体升 fp32：``kv`` 是整块 full latent KV cache（8L 单 rank
     # 也有 ~22 GB bf16；整网更大）。``.float()`` 会再要一份等大的 fp32，
@@ -1052,6 +1106,15 @@ def flash_mla_sparse_fwd(
     gathered = kvs[idx.masked_fill(invalid, 0).reshape(-1)].reshape(
         s_q, topk, d_qk
     ).float()
+    # 只把 scores 掩成 -inf 是不够的：那样 p=0，但 `out = p @ gathered` 里
+    # **0 * NaN = NaN**。无效索引被 clamp 到槽位 0 之后仍然会被 gather 出来，
+    # 而未初始化的 KV 槽位里 0x7F/0xFF 这类字节经 fp8 e4m3 查表就是 NaN，
+    # 于是整个 token 的注意力输出全毁。必须把无效行本身清零。
+    # 原地清零：`torch.where(..., zeros_like(gathered), ...)` 会再分配一整块
+    # 同样大小的张量，decode 的 [s_q, topk, d] 在 topk=2048 时足以把 scheduler
+    # 顶到被 OOM killer 杀掉（实测 exit -9）。
+    gathered[invalid] = 0.0
+    _probe_kv_nan(gathered, idx, invalid, kvs)
 
     scores = torch.einsum("shd,std->sht", q.float(), gathered) * sm_scale
     scores = scores * math.log2(math.e)
@@ -1070,12 +1133,52 @@ def flash_mla_sparse_fwd(
         lse = torch.log2(denom.clamp(min=1e-30)) + m
         max_logits = m
     else:
-        lse = torch.logsumexp(scores * math.log(2), dim=-1) * math.log2(math.e)
-        p = torch.exp2(scores - lse[..., None])
-        out = torch.einsum("sht,std->shd", p, gathered[..., :d_v])
-        max_logits = scores.max(dim=-1).values
+        # 整行被掩掉（所有候选都是 -1 / 越界 / 超出 topk_length）时，
+        # `logsumexp` 返回 -inf，`exp2(-inf - (-inf))` = exp2(nan) = NaN，
+        # 于是该 token 的**整条**注意力输出变 NaN。sink 分支不会有这个问题
+        # （m = max(-inf, sink) = sink 有限、denom = exp2(0) = 1 -> out = 0），
+        # 所以这里显式对齐成同样的"空行输出 0"语义。
+        m = scores.max(dim=-1).values
+        m_safe = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
+        p = torch.exp2(scores - m_safe[..., None])
+        denom = p.sum(dim=-1)
+        out = torch.einsum("sht,std->shd", p, gathered[..., :d_v]) / torch.where(
+            denom > 0, denom, torch.ones_like(denom)
+        )[..., None]
+        lse = torch.where(
+            denom > 0, torch.log2(denom.clamp(min=1e-30)) + m_safe, m_safe
+        )
+        max_logits = m
 
+    _dump_attn_internals(q, indices, topk_length, max_logits, lse, sm_scale)
     return out.to(q.dtype), max_logits, lse
+
+
+def _dump_attn_internals(q, indices, topk_length, max_logits, lse, sm_scale):
+    """Dump sparse-prefill internals under the current inspect layer id.
+
+    Gated by ``EB5_DUMP_ATTN_INTERNALS=1``. The point is to separate an
+    attention *bug* from an ill-conditioned attention: when
+    ``exp2(max_logits - lse)`` is near 1 the softmax is effectively an argmax,
+    so a 1-ULP score difference flips the winner and the output moves by O(1)
+    with no bug anywhere. ``kv`` is deliberately not dumped -- it is the whole
+    latent cache (tens of GB).
+    """
+    import os
+
+    if os.environ.get("EB5_DUMP_ATTN_INTERNALS", "0") != "1":
+        return
+    from sglang.srt.internal.train_infer_consistent_ops.inspect_util import (
+        get_current_layer,
+        inspect_tensor,
+    )
+
+    lid = get_current_layer()
+    inspect_tensor("attn_max_logits", lid, max_logits)
+    inspect_tensor("attn_lse", lid, lse)
+    if topk_length is not None:
+        inspect_tensor("attn_topk_length", lid, topk_length)
+    inspect_tensor("attn_sm_scale", lid, torch.tensor([float(sm_scale)]))
 
 
 def _install_flash_mla() -> list:
@@ -1199,6 +1302,7 @@ def decode_attention_fwd(
     ``v_buffer [total_slots, kv_head, Lv]``、``kv_indices`` 是 slot id、``kv_indptr`` 是
     CSR 前缀和。逐 token 取 KV → 打分 → softmax（含 ``logit_cap`` / ``sinks``）→ 加权和。
     """
+    _attn_trace("decode_attention_fwd")
     T, H, Lk = q.shape
     kv_head_num = int(k_buffer.shape[-2])
     Lv = int(v_buffer.shape[-1])
@@ -1397,6 +1501,7 @@ def apply() -> list:
         _install_sigmoid_gate_mul,
         _install_flash_mla,
         _install_triton_mla_backend,
+        _install_kunlun_ops_tracer,
     ):
         try:
             patched.extend(hook())
@@ -1404,3 +1509,224 @@ def apply() -> list:
             print(f"[eb5-mla-adapt] {hook.__name__} failed: {exc}")
 
     return patched
+
+
+_ATTN_TRACE_SEEN: set = set()
+
+
+def _attn_trace(where: str) -> None:
+    """One-shot per (op, layer) trace of which attention op serves which layer.
+
+    Gated by ``EB5_ATTN_TRACE=1``. Layer 7 of the 8L override is a dense
+    full-MLA layer and provably does NOT go through ``flash_mla_sparse_fwd``
+    (its internals never appear in the dumps), so this pins down which op does.
+    """
+    import os
+
+    if os.environ.get("EB5_ATTN_TRACE", "0") != "1":
+        return
+    from sglang.srt.internal.train_infer_consistent_ops.inspect_util import (
+        get_current_layer,
+    )
+
+    key = (where, get_current_layer())
+    if key in _ATTN_TRACE_SEEN:
+        return
+    _ATTN_TRACE_SEEN.add(key)
+    print(f"[attn-trace] op={where} layer={get_current_layer()}", flush=True)
+
+
+def _install_kunlun_ops_tracer() -> list:
+    """One-shot trace of every ``kunlun_ops`` call, tagged with the inspect layer.
+
+    Gated by ``EB5_KUNLUN_OPS_TRACE=1``. Layer 7 of the 8L override provably
+    uses none of the patched torch stand-ins, so the op serving it must be a
+    native ``kunlun_ops`` call reached straight from fork code. Wrapping the
+    module is the only way to see its name without guessing.
+    """
+    import os
+
+    if os.environ.get("EB5_KUNLUN_OPS_TRACE", "0") != "1":
+        return []
+    try:
+        import kunlun_ops
+    except Exception:  # noqa: BLE001
+        return []
+    if getattr(kunlun_ops, "_eb5_traced", False):
+        return []
+    from sglang.srt.internal.train_infer_consistent_ops.inspect_util import (
+        get_current_layer,
+    )
+
+    seen: set = set()
+
+    def wrap(name, fn):
+        def traced(*args, **kwargs):
+            key = (name, get_current_layer())
+            if key not in seen:
+                seen.add(key)
+                print(f"[kops-trace] {name} layer={get_current_layer()}", flush=True)
+            return fn(*args, **kwargs)
+
+        return traced
+
+    watch = {"set_mla_kv_buffer_triton", "set_k_and_s_triton"}
+    seen_w: set = set()
+
+    def wrap_write(name, fn):
+        def traced(*args, **kwargs):
+            # 盯住 loc 里是否出现过出 NaN 的那几个槽位：原生写入绕过 torch 版
+            # `set_mla_kv_buffer`，所以只能在这里看。
+            try:
+                for a in list(args) + list(kwargs.values()):
+                    if (
+                        isinstance(a, torch.Tensor)
+                        and a.dtype in (torch.int32, torch.int64)
+                        and a.numel()
+                        and a.numel() < 1 << 20
+                    ):
+                        f = a.reshape(-1)
+                        for target in (383, 384):
+                            if (name, target) in seen_w:
+                                continue
+                            if bool((f == target).any().item()):
+                                seen_w.add((name, target))
+                                print(
+                                    f"[kv-write-native] {name} writes slot {target}",
+                                    flush=True,
+                                )
+            except Exception:  # noqa: BLE001
+                pass
+            return fn(*args, **kwargs)
+
+        return traced
+
+    n = 0
+    for name in dir(kunlun_ops):
+        if name.startswith("_"):
+            continue
+        fn = getattr(kunlun_ops, name, None)
+        if callable(fn) and not isinstance(fn, type):
+            try:
+                setattr(
+                    kunlun_ops,
+                    name,
+                    wrap_write(name, fn) if name in watch else wrap(name, fn),
+                )
+                n += 1
+            except Exception:  # noqa: BLE001
+                pass
+    kunlun_ops._eb5_traced = True
+    print(f"[kops-trace] wrapped {n} kunlun_ops callables", flush=True)
+    return [f"kunlun_ops(traced x{n})"]
+
+
+_NONFINITE_SEEN: set = set()
+
+
+def _warn_nonfinite(where: str, t: torch.Tensor) -> None:
+    """One-shot non-finite detector, gated by ``EB5_NANCHECK=1``.
+
+    The 43L INT8 AIME failure is a permanent collapse of the greedy argmax to
+    token id 0 (= ``pad_token_id``) after ~80 healthy tokens. argmax returning
+    index 0 is the classic signature of degenerate logits (all-NaN / all-equal),
+    so the question is where the first non-finite value enters.
+    """
+    import os
+
+    if os.environ.get("EB5_NANCHECK", "0") != "1":
+        return
+    if where in _NONFINITE_SEEN:
+        return
+    try:
+        bad = int((~torch.isfinite(t)).sum().item())
+    except Exception:  # noqa: BLE001
+        return
+    if bad:
+        _NONFINITE_SEEN.add(where)
+        print(f"[nancheck] NON-FINITE at {where}: {bad}/{t.numel()}", flush=True)
+
+
+_KV_NAN_SEEN = {"hits": 0}
+
+
+def _probe_kv_nan(gathered, idx, invalid, kvs) -> None:
+    """Report NaN that survives the invalid-row zeroing, i.e. NaN at VALID slots.
+
+    Gated by ``EB5_KV_NAN=1``. Zeroing the ``-1``-sentinel rows did not remove
+    the NaN at ``attn_core_out``, so the KV cache must hold NaN at slots the
+    index considers live. Printing the offending slot ids separates "the slot
+    was never written" (an indexing/allocation bug) from "a NaN was written
+    into it" (a numeric bug upstream).
+    """
+    import os
+
+    if os.environ.get("EB5_KV_NAN", "0") != "1":
+        return
+    st = _KV_NAN_SEEN
+    if st["hits"] >= 6:
+        return
+    try:
+        bad = ~torch.isfinite(gathered)
+        if not bool(bad.any().item()):
+            return
+        st["hits"] += 1
+        rows = bad.any(dim=-1)  # [s_q, topk]
+        n_bad_cols = int(rows.sum().item())
+        n_valid = int((~invalid).sum().item())
+        slots = idx[rows][:8].tolist()
+        # 这些槽位在整块 cache 里本身是不是 NaN
+        uniq = sorted(set(int(v) for v in idx[rows].reshape(-1).tolist()))[:8]
+        raw_nan = [
+            int((~torch.isfinite(kvs[v].float())).sum().item()) for v in uniq
+        ]
+        vslots = idx[~invalid]
+        vmax = int(vslots.max().item()) if vslots.numel() else -1
+        vmin = int(vslots.min().item()) if vslots.numel() else -1
+        is_newest = [v == vmax for v in uniq]
+        print(
+            f"[kv-nan] NaN at VALID slots: bad_cols={n_bad_cols} "
+            f"valid_cols={n_valid} total={gathered.shape[0]}x{gathered.shape[1]} "
+            f"slot_ids={slots} uniq_slots={uniq} nan_per_slot_in_cache={raw_nan} "
+            f"valid_slot_range=[{vmin},{vmax}] nan_is_newest={is_newest} "
+            f"cache_rows={kvs.shape[0]}",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[kv-nan] failed: {exc!r}", flush=True)
+
+
+_KV_WRITE_SEEN = {"hits": 0, "slots": set()}
+
+
+def _probe_kv_write(loc, src) -> None:
+    """Record whether the NaN-carrying KV slot is ever written, and with what.
+
+    Gated by ``EB5_KV_WRITE=1``. The reader side proved slot 383 of the 576-wide
+    latent KV cache is entirely NaN while the index treats it as live. Two very
+    different causes: the slot is never written (an allocation / index bug), or
+    it is written with NaN (an upstream numeric bug). This answers which.
+    """
+    import os
+
+    if os.environ.get("EB5_KV_WRITE", "0") != "1":
+        return
+    st = _KV_WRITE_SEEN
+    try:
+        flat = loc.reshape(-1)
+        hit = (flat == 383)
+        if not bool(hit.any().item()):
+            return
+        if st["hits"] >= 6:
+            return
+        st["hits"] += 1
+        rows = src[hit.nonzero().flatten()]
+        bad = int((~torch.isfinite(rows.float())).sum().item())
+        print(
+            f"[kv-write] slot 383 WRITTEN: n_rows={rows.shape[0]} "
+            f"nonfinite_in_src={bad}/{rows.numel()} "
+            f"absmax={rows.float().abs().max().item():.6g}",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[kv-write] failed: {exc!r}", flush=True)

@@ -284,6 +284,21 @@ def _sibling_modules(module):
     return siblings
 
 
+def _signature_matches(a: object, b: object) -> bool:
+    """True when two callables accept the same parameter names.
+
+    Used to avoid replacing a same-named but differently shaped function (see
+    :func:`_patch_symbol`).  Builtins without introspectable signatures are
+    treated as matching so the previous behaviour is preserved.
+    """
+    try:
+        pa = list(inspect.signature(a).parameters)
+        pb = list(inspect.signature(b).parameters)
+    except (TypeError, ValueError):
+        return True
+    return pa == pb
+
+
 def _patch_symbol(spec: KernelSpec, replacement: object) -> None:
     """Replace one upstream module symbol with its Kunlun implementation."""
 
@@ -317,15 +332,32 @@ def _patch_symbol(spec: KernelSpec, replacement: object) -> None:
         for n, m in list(_sys.modules.items())
         if m is not None and n.startswith("sglang.") and hasattr(m, spec.kernel_name)
     ]
+    canonical = getattr(module, spec.kernel_name)
+    skipped_same_name = []
     for target in _targets:
         if not hasattr(target, spec.kernel_name):
             continue
         original = getattr(target, spec.kernel_name)
         if original is replacement:
             continue
+        # A *different* callable that merely shares the name must not be
+        # clobbered: e.g. ``eagle_utils.build_tree_kernel_efficient`` is the
+        # chain/tree wrapper (bonus_tokens, ..., fill_prefix_mask) around the
+        # kernel-level symbol we replace here.  Duplicated module copies expose
+        # the same signature, so comparing parameters keeps those patched while
+        # leaving same-named wrappers alone.
+        if original is not canonical and not _signature_matches(original, canonical):
+            skipped_same_name.append(target.__name__)
+            continue
         _ORIGINALS.setdefault((target.__name__, spec.kernel_name), original)
         _replace_imported_bindings(original, replacement)
         setattr(target, spec.kernel_name, replacement)
+    if skipped_same_name:
+        logger.warning(
+            "kernel_ops: left same-named (different signature) %s alone in %s",
+            spec.kernel_name,
+            ", ".join(sorted(skipped_same_name)),
+        )
     logger.warning("kernel_ops: patched %s.%s", module.__name__, spec.kernel_name)
 
 
@@ -3135,7 +3167,6 @@ def build_tree_kernel_efficient_kunlun(*args, **kwargs):
 @register_jit_op("sglang.kernels.ops.speculative.tree", "verify_tree_greedy")
 def verify_tree_greedy_kunlun(*args, **kwargs):
     from sglang_kunlun.kernels.sgl_kernel_kunlun import speculative as _spec
-
     if args and not kwargs:
         names = (
             "predicts",

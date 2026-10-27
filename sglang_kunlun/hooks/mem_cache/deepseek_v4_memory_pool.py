@@ -72,6 +72,31 @@ def get_bytes_per_token_kunlun(original_fn, self):
 
 
 @plugin_hook(
+    "sglang.srt.mem_cache.deepseek_v4_memory_pool."
+    "DeepSeekV4TokenToKVPool.get_swa_key_bytes_per_token",
+    type=HookType.AROUND,
+)
+def get_swa_key_bytes_per_token_kunlun(original_fn, self):
+    """Report the bf16-512 last dim the attention kernels actually see.
+
+    Upstream answers ``kv_layout.bytes_per_token`` (584 for V4) because the SWA
+    buffer is a uint8 byte buffer in the fp8 layout. Under group 1 above the
+    buffer is a bf16 tensor of 512 elements per token, so the stock value makes
+    ``_forward_attention``'s ``(pages, page_size, 1, dim)`` view fail
+    ("shape is invalid for input of size ..."). The sub-pool already carries the
+    right number, and ``get_extra_key_bytes_per_token`` reads it the same way.
+    """
+    swa_pool = getattr(self, "swa_kv_pool", None)
+    if swa_pool is not None and _is_bf16(swa_pool):
+        # create_buffer_kunlun sets kv_cache_total_dim, but it only runs for pool
+        # variants that go through create_buffer; fall through if it is absent.
+        total_dim = getattr(swa_pool, "kv_cache_total_dim", None)
+        if total_dim is not None:
+            return total_dim
+    return original_fn(self)
+
+
+@plugin_hook(
     "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4SingleKVPool.create_buffer",
     type=HookType.AROUND,
 )

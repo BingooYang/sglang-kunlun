@@ -137,6 +137,47 @@ def install_deep_gemm() -> bool:
     return True
 
 
+def install_flash_mla() -> bool:
+    """Install a permissive ``flash_mla`` stub when the wheel is absent.
+
+    The open-source tree moved FlashMLA out of ``sgl_kernel`` into the
+    ``sgl-flash-mla`` wheel and imports it from ``DeepseekV4AttnBackend.__init__``
+    under ``if is_cuda():`` -- which is True on Kunlun because torch_xmlir
+    advertises itself as CUDA. The wheel is CUDA-only (its own docstring says
+    HIP and XPU keep their sgl-kernel ops) and the Kunlun backend replaces the
+    forwards that would call it, so an import-time placeholder is enough.
+    """
+    if "flash_mla" in sys.modules:
+        return False
+    try:
+        import importlib.util
+
+        if importlib.util.find_spec("flash_mla") is not None:
+            return False  # real wheel present -- leave it alone
+    except (ImportError, ValueError):
+        pass
+
+    root = _make_stub_module("flash_mla")
+    sys.modules["flash_mla"] = root
+    # ``from flash_mla.flash_mla_interface import FlashMLASchedMeta``
+    sub = _make_stub_module("flash_mla.flash_mla_interface")
+    sys.modules["flash_mla.flash_mla_interface"] = sub
+    root.flash_mla_interface = sub
+
+    # The DSV4 backend really calls ``flash_mla.get_mla_metadata()`` while
+    # building its metadata, so bind the plugin's pure-torch shim (the same one
+    # ``sgl_kernel.flash_mla`` gets) instead of leaving a permissive placeholder.
+    try:
+        from sglang_kunlun.kernels import flash_mla_shim
+    except Exception:  # noqa: BLE001 - the stub alone still unblocks the import
+        return True
+    for mod in (root, sub):
+        mod.FlashMLASchedMeta = flash_mla_shim.FlashMLASchedMeta
+        mod.get_mla_metadata = flash_mla_shim.get_mla_metadata
+    return True
+
+
 def install_all() -> None:
     install()
     install_deep_gemm()
+    install_flash_mla()

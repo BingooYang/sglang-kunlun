@@ -205,9 +205,12 @@ def select_experts_kunlun(
                 scoring_func=scoring_func,
             )
     else:
-        assert (
-            num_token_non_padded is None
-        ), "num_token_non_padded is not yet supported in custom_routing_function"
+        # ``custom_routing_function`` is padding-unaware, so its output on rows
+        # >= num_token_non_padded is garbage -- which is fine: the
+        # ``_post_process_topk_ids`` call below masks exactly those rows (it
+        # takes num_token_non_padded for that). ERNIE 5.5 Flash routes through
+        # this branch (two-router gate) under DP attention, so refusing the
+        # argument here would reject the model outright.
         assert expert_location_dispatch_info is None
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = custom_routing_function(

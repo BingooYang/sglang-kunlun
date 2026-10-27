@@ -73,7 +73,7 @@ def transform_index_page_table_decode_fast(
 
     assert page_size == 1
     assert page_table.shape[0] == topk_indices.shape[0]
-    assert topk_indices.shape[1] == 2048
+    assert topk_indices.shape[1] > 0
     qo_len = topk_indices.shape[0]
     if result is None:
         result = torch.empty_like(topk_indices, dtype=torch.int32)
@@ -109,7 +109,7 @@ def transform_index_page_table_prefill_fast(
     )
 
     assert page_size == 1
-    assert topk_indices.shape[1] == 2048
+    assert topk_indices.shape[1] > 0
     real_num_tokens = sum(extend_lens_cpu)
     result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     if real_num_tokens == 0:
@@ -173,6 +173,18 @@ _TARGETS = (
     (
         "sglang.kernels.ops.attention.dsa.transform_index",
         "transform_index_page_table_prefill_fast",
+        transform_index_page_table_prefill_fast,
+    ),
+    # The open-source tree dropped the ``_fast`` suffix: there the plain names
+    # are the triton entry points the DSA backend calls directly.
+    (
+        "sglang.kernels.ops.attention.dsa.transform_index",
+        "transform_index_page_table_decode",
+        transform_index_page_table_decode_fast,
+    ),
+    (
+        "sglang.kernels.ops.attention.dsa.transform_index",
+        "transform_index_page_table_prefill",
         transform_index_page_table_prefill_fast,
     ),
 )

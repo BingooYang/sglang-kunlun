@@ -664,6 +664,15 @@ class DeepEPMoE(FusedMoE):
 
         gateup_output = moe_buffer.gateup_output
         if forward_int8:
+            _dump_grouped_gemm_inputs(
+                "gateup",
+                (recv_x_all_int8, input_scale),
+                (self.w13_weight, self.w13_weight_scale),
+                gateup_output.view(num_all_tokens, self.w13_weight.shape[1]),
+                m_indices,
+                num_all_tokens=num_all_tokens,
+                num_tokens=num_tokens,
+            )
             m_grouped_gemm_I8_I8_bf16_nt_contiguous_v3(
                 (recv_x_all_int8, input_scale),
                 (self.w13_weight, self.w13_weight_scale),
@@ -1446,3 +1455,70 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         return DeepEPMoE
 
     return FusedMoE
+
+
+_GROUPED_GEMM_DUMP_DONE = set()
+
+
+def _dump_grouped_gemm_inputs(tag, lhs, rhs, out, m_indices, **extra):
+    """One-shot shape/dtype dump for the Kunlun grouped GEMM (EB5_MOE_GEMM_DUMP=1).
+
+    ``moe_fc_v3`` only reports "return non-zero in file: moe_fc_v3_block.cc",
+    so the inputs have to be compared against a known-good run by hand.
+    """
+    import os
+
+    if (
+        os.environ.get("EB5_MOE_GEMM_DUMP", "0") != "1"
+        or tag in _GROUPED_GEMM_DUMP_DONE
+    ):
+        return
+    _GROUPED_GEMM_DUMP_DONE.add(tag)
+
+    def d(name, t):
+        if not isinstance(t, torch.Tensor):
+            return f"{name}={t!r}"
+        head = (
+            f"{name}: shape={tuple(t.shape)} dtype={t.dtype} "
+            f"contig={t.is_contiguous()} stride={t.stride()}"
+        )
+        if t.numel() == 0:
+            return head + " empty"
+        if name in ("w", "w_scale"):
+            try:
+                storage_nbytes = t.untyped_storage().nbytes()
+            except Exception:  # noqa: BLE001 - torch version differences
+                storage_nbytes = -1
+            head += (
+                f" ptr={t.data_ptr():#x} ptr%2M={t.data_ptr() % (2 << 20)}"
+                f" storage_off={t.storage_offset()}"
+                f" storage_nbytes={storage_nbytes}"
+                f" tensor_nbytes={t.numel() * t.element_size()}"
+            )
+        if t.is_floating_point():
+            f = t.float()
+            return (
+                head + f" finite={bool(torch.isfinite(f).all())}"
+                f" min={float(f.min()):.4g} max={float(f.max()):.4g}"
+                f" zeros={int((f == 0).sum())}"
+            )
+        return head + f" min={int(t.min())} max={int(t.max())}"
+
+    mi = m_indices
+    print(
+        f"[eb5-moe-gemm-dump:{tag}] "
+        + " | ".join(
+            [
+                d("x", lhs[0]),
+                d("x_scale", lhs[1]),
+                d("w", rhs[0]),
+                d("w_scale", rhs[1]),
+                d("out", out),
+                d("m_indices", mi),
+                f"m_indices.sum={int(mi.sum())} numel={mi.numel()} "
+                f"min={int(mi.min())} max={int(mi.max())}",
+                " ".join(f"{k}={v}" for k, v in extra.items()),
+            ]
+        ),
+        flush=True,
+    )

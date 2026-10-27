@@ -309,6 +309,75 @@ _ALWAYS_BF16_SUBSTRINGS = [
 ]
 
 
+def _alloc_weight_buffer(shape, dtype, device) -> torch.Tensor:
+    """2MB-aligned weight buffer, falling back to ``torch.empty`` off Kunlun."""
+    try:
+        from sglang_kunlun.hooks.mem_cache._align import alloc_2m_aligned
+
+        return alloc_2m_aligned(shape, dtype, device)
+    except Exception:  # noqa: BLE001 - alignment is an optimisation off Kunlun
+        return torch.empty(shape, dtype=dtype, device=device)
+
+
+def _current_device() -> torch.device:
+    """The device this rank serves on, or CPU when there is no device at all."""
+    try:
+        return torch.device("cuda", torch.cuda.current_device())
+    except Exception:  # noqa: BLE001 - unit tests run without a device
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _layer_device(layer: torch.nn.Module) -> torch.device:
+    """The device this MoE layer lives on, read off one of its own tensors.
+
+    ``create_weights`` only forces CPU for the *weights* (``EB5_INT8_MOE_CPU_STAGING``);
+    the scales are allocated on the default device, so they are a reliable
+    reference. Asking the runtime instead is not: measured 2026-10-27, three of
+    four ranks had ``torch.cuda.current_device()`` unavailable while the MoE
+    post-load hook ran, which left their experts quantized on the host.
+    """
+    for name in ("w13_weight_scale", "w2_weight_scale", "w13_weight", "w2_weight"):
+        param = getattr(layer, name, None)
+        tensor = getattr(param, "data", param)
+        if isinstance(tensor, torch.Tensor) and tensor.device.type != "cpu":
+            return tensor.device
+    return _current_device()
+
+
+def ensure_moe_weights_on_device(layer: torch.nn.Module) -> None:
+    """Move quantized expert weights/scales onto the device, 2MB-aligned.
+
+    ``moe_fc_v3`` needs both: a host buffer or an unaligned start address makes
+    it return non-zero with no further detail.
+
+    Transient peak is one extra buffer: the replacement is allocated before the
+    original is dropped, but the caller walks one layer at a time, so the
+    overshoot is a single expert tensor rather than the whole MoE stack.
+    """
+    dev = _layer_device(layer)
+    if dev.type == "cpu":
+        return
+    for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+        param = getattr(layer, name, None)
+        if param is None:
+            continue
+        src = param.data if hasattr(param, "data") else param
+        if not isinstance(src, torch.Tensor):
+            continue
+        aligned = src.device.type != "cpu" and src.data_ptr() % (2 << 20) == 0
+        if aligned:
+            continue
+        buf = _alloc_weight_buffer(src.shape, src.dtype, dev)
+        buf.copy_(src)
+        if hasattr(param, "data"):
+            param.data = buf
+        else:
+            setattr(layer, name, buf)
+    if getattr(layer, "w13_weight_scale", None) is not None:
+        layer.w13_weight_scale_inv = layer.w13_weight_scale
+        layer.w2_weight_scale_inv = layer.w2_weight_scale
+
+
 class InternalBlockwiseInt8Config(QuantizationConfig):
     """Online INT8 for BF16/FP16 checkpoints (per-token A / per-channel W)."""
 
@@ -656,16 +725,23 @@ class Int8MoEMethod(FusedMoEMethodBase):
         global _MOE_LOG_DONE
         w13_src = layer.w13_weight.data
         if w13_src.dtype == torch.int8:
+            # Already quantized (e.g. this hook ran twice). Still make sure the
+            # result sits on the device: the grouped GEMM silently rejects a
+            # host buffer with "moe_fc_v3_block.cc: return non-zero".
+            ensure_moe_weights_on_device(layer)
             return
         src_dtype = w13_src.dtype
         w2_src = layer.w2_weight.data
         on_cpu = w13_src.device.type == "cpu"
-        # ``cuda`` is the device the XPU runtime masquerades as.  Falls back to
-        # CPU only when there is no device at all (unit tests), where quantizing
-        # on the host is exact and the result is never used for a forward.
+        # ``cuda`` is the device the XPU runtime masquerades as. CPU-staged
+        # weights must come back to it; ``torch.cuda.is_available()`` alone is
+        # not a reliable gate here (measured 2026-10-27: some MoE layers were
+        # quantized while it still answered False, leaving int8 weights on the
+        # host and failing the GEMM), so ask the runtime for its current device
+        # and only fall back to CPU when there is genuinely no device.
         gpu = w13_src.device
         if on_cpu:
-            gpu = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            gpu = _layer_device(layer)
         num_experts = w13_src.shape[0]
 
         w13_q_all = w13_s_all = w2_q_all = w2_s_all = None
@@ -678,10 +754,16 @@ class Int8MoEMethod(FusedMoEMethodBase):
             q13, s13 = quantize_weight_perchannel_int8(w13)
             q2, s2 = quantize_weight_perchannel_int8(w2)
             if w13_q_all is None:
-                w13_q_all = torch.empty(
-                    w13_src.shape, dtype=torch.int8, device=q13.device
+                # The expert weights must start on a 2MB boundary: the Kunlun
+                # grouped GEMM (``moe_fc_v3``) rejects an unaligned weight
+                # buffer with a bare "return non-zero in moe_fc_v3_block.cc".
+                # Measured 2026-10-27 on the same (128, 4096, 2048) int8
+                # weights: fork tree ptr=0x41b0800000 (ptr%2M=0) works, a plain
+                # ``torch.empty`` ptr=0x7f7e79fff040 (ptr%2M=2093120) fails.
+                w13_q_all = _alloc_weight_buffer(
+                    w13_src.shape, torch.int8, q13.device
                 )
-                w2_q_all = torch.empty(w2_src.shape, dtype=torch.int8, device=q2.device)
+                w2_q_all = _alloc_weight_buffer(w2_src.shape, torch.int8, q2.device)
                 w13_s_all = torch.empty(
                     (num_experts, *s13.shape), dtype=torch.float32, device=s13.device
                 )
@@ -709,18 +791,7 @@ class Int8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale_inv = layer.w2_weight_scale
         layer.w13_input_scale = None
         layer.w2_input_scale = None
-
-        if not _MOE_LOG_DONE:
-            _MOE_LOG_DONE = True
-            log_info_on_rank0(
-                logger,
-                "blockwise_int8: online MoE quantization executed "
-                f"({num_experts} experts, {src_dtype} -> int8, "
-                f"w13_scale={tuple(w13_s_all.shape)}, "
-                f"w2_scale={tuple(w2_s_all.shape)}).",
-            )
-
-    # -- dense (non-DeepEP) path -------------------------------------------
+        ensure_moe_weights_on_device(layer)
 
     def apply(self, layer: torch.nn.Module, dispatch_output) -> Any:
         """Standard-dispatch W8A8 INT8 MoE (no all-to-all).
@@ -751,6 +822,20 @@ class Int8MoEMethod(FusedMoEMethodBase):
             (x_exp.shape[0], layer.w13_weight.shape[1]),
             dtype=torch.bfloat16,
             device=x.device,
+        )
+        from sglang_kunlun.eb5_adapt.hooks.layers.moe.ep_moe.layer import (
+            _dump_grouped_gemm_inputs,
+        )
+
+        _dump_grouped_gemm_inputs(
+            "dense-gateup",
+            (x_q, x_s),
+            (layer.w13_weight, layer.w13_weight_scale),
+            gateup,
+            counts,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            rows=x_exp.shape[0],
         )
         kunlun_ops.m_grouped_gemm_I8_I8_bf16_nt_contiguous_v3(
             (x_q, x_s), (layer.w13_weight, layer.w13_weight_scale), gateup, counts

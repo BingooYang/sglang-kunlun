@@ -1602,6 +1602,99 @@ def _install_moe_align() -> list:
     )
 
 
+
+def append_window_to_topk_torch(
+    topk_slots,
+    seq_lens,
+    page_table,
+    *,
+    window: int,
+    page_size: int,
+    alignment: int,
+    page_rows=None,
+    ragged_offsets=None,
+):
+    """torch 版 ``dsa/append_window_to_topk.append_window_to_topk``。
+
+    ERNIE 5.5 Flash 的 MLA 层把 indexer 的 top-k 与最后 ``window`` 个 token 并成
+    一次 softmax，这个 kernel 负责拼出 ``[top-k 前缀 | window]`` 的 slot 行并补
+    ``-1`` 到 ``alignment`` 的整数倍。上游只有 triton 实现，XPU 上 triton 被
+    noop 掉（``'function' object is not subscriptable``），这里照 kernel 的语义
+    逐条复现：
+
+    * ``topk_len = min(max(seq_len - window, 0), topk)``、
+      ``window_len = min(seq_len, window)``；
+    * ``out[r, :topk_len]`` 取 top-k，``out[r, topk_len : topk_len + window]``
+      取窗口 slot（越界/超出 ``window_len`` 写 -1），其余列 -1；
+    * ``out_lengths[r] = topk_len + window_len``，padding 行（``r >= seq_lens``
+      的行数）整行 -1、长度 0。
+    """
+    num_rows, topk = topk_slots.shape
+    device = topk_slots.device
+    live_rows = seq_lens.numel()
+    out_width = -(-(topk + window) // alignment) * alignment
+    out = torch.full((num_rows, out_width), -1, dtype=torch.int32, device=device)
+    out_lengths = torch.zeros(num_rows, dtype=torch.int32, device=device)
+    if num_rows == 0:
+        return out, out_lengths
+
+    seq = torch.zeros(num_rows, dtype=torch.int64, device=device)
+    if live_rows:
+        seq[:live_rows] = seq_lens.to(device=device, dtype=torch.int64).clamp(min=0)
+    topk_len = (seq - window).clamp(min=0).clamp(max=topk)
+    window_len = seq.clamp(max=window)
+    out_lengths.copy_((topk_len + window_len).to(torch.int32))
+
+    # --- top-k prefix ---
+    cols = torch.arange(out_width, device=device)
+    src = torch.full((num_rows, out_width), -1, dtype=torch.int32, device=device)
+    src[:, :topk] = topk_slots.to(torch.int32)
+    out = torch.where(cols.unsqueeze(0) < topk_len.unsqueeze(1), src, out)
+
+    if window <= 0:
+        return out, out_lengths
+
+    # --- trailing window ---
+    offs = torch.arange(window, device=device)
+    position = (seq - window_len).unsqueeze(1) + offs.unsqueeze(0)
+    valid = offs.unsqueeze(0) < window_len.unsqueeze(1)
+    valid &= (torch.arange(num_rows, device=device) < live_rows).unsqueeze(1)
+
+    if ragged_offsets is not None:
+        base = torch.zeros(num_rows, dtype=torch.int64, device=device)
+        take = min(num_rows, ragged_offsets.numel())
+        base[:take] = ragged_offsets.to(device=device, dtype=torch.int64)[:take]
+        slots = base.unsqueeze(1) + position
+    else:
+        if page_rows is not None:
+            page_row = torch.zeros(num_rows, dtype=torch.int64, device=device)
+            take = min(num_rows, page_rows.numel())
+            page_row[:take] = page_rows.to(device=device, dtype=torch.int64)[:take]
+        else:
+            page_row = torch.arange(num_rows, device=device, dtype=torch.int64)
+        pt_rows, pt_cols = page_table.shape
+        page_id = position // page_size
+        valid &= (page_row.unsqueeze(1) < pt_rows) & (page_id < pt_cols)
+        flat = page_table.reshape(-1)
+        if flat.numel() == 0:
+            # The triton kernel masks the load, so an empty table simply yields no
+            # valid window entries; gathering from it here would raise IndexError.
+            slots = torch.zeros((num_rows, window), dtype=torch.int64, device=device)
+            valid = torch.zeros_like(valid)
+        else:
+            idx = page_row.clamp(max=max(pt_rows - 1, 0)).unsqueeze(1) * pt_cols + page_id.clamp(
+                min=0, max=max(pt_cols - 1, 0)
+            )
+            page = flat[idx.reshape(-1)].view(num_rows, window).to(torch.int64)
+            slots = page * page_size + position % page_size
+
+    win_vals = torch.where(
+        valid, slots.to(torch.int32), torch.full((), -1, dtype=torch.int32, device=device)
+    )
+    col_idx = (topk_len.unsqueeze(1) + offs.unsqueeze(0)).clamp(max=out_width - 1)
+    out.scatter_(1, col_idx, win_vals)
+    return out, out_lengths
+
 _TARGETS = (
     ("sglang.kernels.ops.attention.position", "compute_position_triton", compute_position_triton),
     ("sglang.kernels.ops.attention.dsv4_attn_metadata_kernels", "expand_prefill_causally_triton", expand_prefill_causally_triton),
@@ -1629,6 +1722,33 @@ _TARGETS = (
     ("sglang.kernels.ops.moe.moe_fused_gate", "moe_fused_gate", moe_fused_gate),
     ("sglang.srt.internal.kernels.deepseek_v4.mhc_head_opt", "fused_hc_head_opt", fused_hc_head_opt),
     ("sglang.srt.internal.models.eb5.multimax", "fused_multimax_selu", fused_multimax_selu),
+    # --- open-source tree: same kernels, new module paths -------------------
+    # The internal fork and the public tree lay sglang.kernels out differently;
+    # patch both so one plugin serves either (_patch_everywhere just logs the
+    # paths that are absent).
+    (
+        "sglang.kernels.ops.attention.dsv4.attn_metadata_kernels",
+        "expand_prefill_causally_triton",
+        expand_prefill_causally_triton,
+    ),
+    (
+        "sglang.kernels.ops.attention.dsv4.attn_metadata_kernels",
+        "build_causal_swa_page_indices_triton",
+        build_causal_swa_page_indices_triton,
+    ),
+    ("sglang.kernels.ops.moe.dsv4", "mega_moe_pre_dispatch", mega_moe_pre_dispatch),
+    ("sglang.kernels.ops.gemm.bf16_fp32", "linear_bf16_fp32", linear_bf16_fp32),
+    (
+        "sglang.kernels.ops.attention.kv_indices",
+        "create_flashinfer_kv_indices_triton",
+        _GridKernel(create_flashinfer_kv_indices_triton),
+    ),
+    ("sglang.kernels.ops.activation.kimi_k3_situ_and_mul", "situ_and_mul", situ_and_mul),
+    (
+        "sglang.kernels.ops.attention.dsa.append_window_to_topk",
+        "append_window_to_topk",
+        append_window_to_topk_torch,
+    ),
 )
 
 

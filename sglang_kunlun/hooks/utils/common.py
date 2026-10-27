@@ -170,15 +170,16 @@ def _get_numa_cores(node: int) -> List[int]:
     "sglang.srt.utils.common.set_gpu_proc_affinity",
     type=HookType.REPLACE,
 )
-def set_gpu_proc_affinity_kunlun(
-    pp_size: int,
-    tp_size: int,
-    nnodes: int,
-    gpu_id: int,
-):
-    """Pin worker process to its XPU's NUMA-local core slice."""
+def set_gpu_proc_affinity_kunlun(*args: int):
+    """Pin worker process to its XPU's NUMA-local core slice.
+
+    Upstream's signature changed from ``(pp_size, tp_size, nnodes, gpu_id)`` to
+    ``(gpu_id)`` (the parallel sizes now come from ``get_parallel()``); only the
+    last positional is used here, so accept both shapes.
+    """
     import psutil
 
+    gpu_id = args[-1]
     pid = os.getpid()
     p = psutil.Process(pid)
 

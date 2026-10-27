@@ -72,6 +72,13 @@ def _get_s_triton(
     target="sglang.srt.layers.attention.dsa.index_buf_accessor.SetKAndS.triton",
     type=HookType.REPLACE,
 )
+@plugin_hook(
+    # The open-source tree moved the indexer-K accessor here; its stock wrapper
+    # asserts ``index_k.dtype == float8_e4m3fn`` while the Kunlun indexer stores
+    # int8 + fp32 scale, so the replacement has to cover both module paths.
+    target="sglang.kernels.ops.kvcache.dsa_index_k_cache.SetKAndS.triton",
+    type=HookType.REPLACE,
+)
 def set_k_and_s_triton(cls, pool, buf, loc, index_k, index_k_scale) -> None:
     """Set NSA K and S index buffers with Kunlun kernels."""
     import kunlun_ops
@@ -81,5 +88,5 @@ def set_k_and_s_triton(cls, pool, buf, loc, index_k, index_k_scale) -> None:
         loc=loc.to(torch.int64).contiguous(),
         index_k=index_k.contiguous(),
         index_k_scale=index_k_scale.contiguous(),
-        page_size=pool.page_size,
+        page_size=getattr(pool, "index_page_size", None) or pool.page_size,
     )

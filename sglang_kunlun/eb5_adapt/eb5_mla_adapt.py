@@ -778,7 +778,12 @@ def _get_k_and_s_triton(
 
 
 def _install_get_k_and_s() -> list:
-    from sglang.kernels.ops.attention.dsa.index_buf_accessor import GetKAndS
+    try:
+        from sglang.kernels.ops.attention.dsa.index_buf_accessor import GetKAndS
+    except ImportError:
+        # The open-source tree moved the indexer-K accessor to
+        # ``kernels/ops/kvcache/dsa_index_k_cache``.
+        from sglang.kernels.ops.kvcache.dsa_index_k_cache import GetKAndS
 
     GetKAndS.triton = classmethod(
         lambda cls, pool, buf, page_indices, seq_len_tensor, seq_len_sum, max_seq_len: (
@@ -950,6 +955,12 @@ def _mla_gather_kv(k_cache: torch.Tensor, indices: torch.Tensor, is_fp8: bool):
     # 一个会在热路径上做全设备同步的误导性开关。
     b, _, topk = indices.shape
     idx = indices.reshape(b, topk).to(torch.int64).clamp(min=0)
+    # Trust the cache dtype over the caller's flag: the open-source DSV4 backend
+    # hardcodes ``is_fp8_kvcache=True`` on its sparse-decode call, but under
+    # ``--kv-cache-dtype bfloat16`` the Kunlun pool holds the bf16-512 layout,
+    # which has no fp8 scales to dequantize.
+    if is_fp8 and k_cache.dtype in (torch.bfloat16, torch.float16):
+        is_fp8 = False
     if is_fp8:
         return _mla_dequant_kv(k_cache, indices)
     raw, page_size, page_stride, token_stride = _kv_raw_bytes(k_cache)
@@ -1184,6 +1195,10 @@ def flash_mla_sparse_fwd(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
+    *,
+    use_legacy: bool = True,
+    return_log2_lse: Optional[bool] = None,
+    **kwargs,
 ):
     """torch 拆解：FlashMLA **稀疏 prefill** 注意力（对应 `sparse_prefill_fwd`）。
 
@@ -1198,6 +1213,13 @@ def flash_mla_sparse_fwd(
     Returns:
         ``(output [s_q,h_q,d_v], max_logits [s_q,h_q], lse [s_q,h_q])``（lse 为 2 底）
     """
+    # 本实现回的是 log2 域的 max_logits / lse（与 legacy kernel 一致）。
+    # 开源树的 wrapper 会显式传 ``use_legacy`` / ``return_log2_lse``；非 legacy
+    # 约定是自然对数，这里不支持，宁可报错也不要静默给错的统计量。
+    assert use_legacy, "the torch sparse-prefill returns base-2 stats (legacy only)"
+    assert return_log2_lse in (None, True), (
+        f"return_log2_lse={return_log2_lse} contradicts the base-2 stats"
+    )
     _attn_trace("flash_mla_sparse_fwd")
     kvs = kv[:, 0, :] if kv.dim() == 3 else kv
     # 不要在这里整体升 fp32：``kv`` 是整块 full latent KV cache（8L 单 rank
@@ -1332,9 +1354,34 @@ def _install_flash_mla() -> list:
     root = sys.modules.get("sgl_kernel")
     if root is not None:
         root.flash_mla = mod
-        # 后端在 XPU 分支上从 sgl_kernel 根包直接 import
-        root.flash_mla_sparse_fwd = flash_mla_sparse_fwd
-        patched.append("sgl_kernel.flash_mla_sparse_fwd")
+        # 后端在 XPU 分支上从 sgl_kernel 根包直接 import。根包是permissive 桩，
+        # 不绑的话 `from sgl_kernel import flash_mla_with_kvcache` 会拿到
+        # `_StubAny`（调用返回的也是 `_StubAny`，报 "not subscriptable"）。
+        for name, impl in (
+            ("get_mla_metadata", get_mla_metadata),
+            ("flash_mla_with_kvcache", flash_mla_with_kvcache),
+            ("flash_mla_sparse_fwd", flash_mla_sparse_fwd),
+        ):
+            setattr(root, name, impl)
+            patched.append(f"sgl_kernel.{name}")
+
+    # 开源树把 FlashMLA 挪进了独立的 ``flash_mla`` wheel，并经
+    # ``sglang.kernels.ops.attention.flash_mla_interface`` 调用（签名与
+    # ``sgl_kernel.flash_mla`` 对齐）。XPU 上 wheel 装不了，桩由
+    # ``optional_kernel_stubs.install_flash_mla`` 建好，这里补上真正的实现。
+    for mod_name in ("flash_mla", "flash_mla.flash_mla_interface"):
+        wheel = sys.modules.get(mod_name)
+        if wheel is None:
+            continue
+        # ``get_mla_metadata`` stays the shim's: it returns the
+        # ``FlashMLASchedMeta`` the wheel's wrapper type-checks, while the
+        # sgl_kernel-era one returns the legacy (metadata, num_splits) tensors.
+        for name, impl in (
+            ("flash_mla_with_kvcache", flash_mla_with_kvcache),
+            ("flash_mla_sparse_fwd", flash_mla_sparse_fwd),
+        ):
+            setattr(wheel, name, impl)
+            patched.append(f"{mod_name}.{name}")
     return patched
 
 

@@ -39,6 +39,89 @@ def sigmoid_gate_mul_broadcast_torch(x, gate, *, round_sigmoid: bool = False):
     return (x.to(torch.float32) * s).to(x.dtype)
 
 
+def fused_sigmoid_mul_torch(
+    attn_output,
+    gate,
+    inplace: bool = False,
+    quant: bool = False,
+    round_sigmoid: bool = False,
+):
+    """``sglang.kernels.ops.elementwise.elementwise.fused_sigmoid_mul`` 的 torch 版。
+
+    开源树把 EB5 的 attention 输出门控换成了这个带 ``inplace`` / ``quant`` /
+    3D strided gate 的融合 triton kernel；triton 在 XPU 上被 noop 掉，
+    ``_fused_sigmoid_mul_kernel[grid]`` 直接报 "function object is not
+    subscriptable"。语义照抄 kernel：
+    ``out = x * round?(sigmoid(gate))``，``quant`` 时返回按行 amax/448 的
+    fp8_e4m3 与 ``[T, 1]`` scale。
+    """
+    g = gate
+    if g.ndim == 3 and attn_output.ndim == 2:
+        g = g.reshape(g.shape[0], -1) if g.is_contiguous() else g.flatten(1)
+    elif g.shape != attn_output.shape:
+        g = g.reshape(attn_output.shape)
+
+    s = torch.sigmoid(g.to(torch.float32))
+    if round_sigmoid:
+        s = s.to(g.dtype).to(torch.float32)
+    result = attn_output.to(torch.float32) * s
+
+    if quant:
+        num_tokens = attn_output.numel() // attn_output.shape[-1]
+        flat = result.reshape(num_tokens, -1)
+        scale = flat.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10) / 448.0
+        q = (flat / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        return q.reshape(attn_output.shape), scale
+
+    out = result.to(attn_output.dtype)
+    if inplace:
+        attn_output.copy_(out)
+        return attn_output
+    return out
+
+
+def multi_router_topk_torch(
+    logits,
+    correction_bias,
+    per_expert_scale,
+    topk: int,
+    renormalize: bool,
+    *,
+    num_routers: int,
+):
+    """``sglang.kernels.ops.moe.multi_router.multi_router_topk`` 的 torch 版。
+
+    照抄 ``_multi_router_topk_kernel``：R 个 router 对同一批 expert 打分、
+    sigmoid 相加；``scores + bias`` 取 TopK（greedy argmax，并列取小 id）；
+    权重取**不含 bias** 的 scores，renormalize 后乘 per-expert scale。
+    """
+    tokens, width = logits.shape
+    num_experts = width // num_routers
+    scores = torch.sigmoid(logits.float().view(tokens, num_routers, num_experts)).sum(1)
+    biased = scores + correction_bias.float()
+    ids = torch.topk(biased, topk, dim=-1).indices
+    weights = scores.gather(1, ids)
+    if renormalize:
+        denom = weights.sum(-1, keepdim=True)
+        weights = weights / torch.where(denom != 0, denom, torch.ones_like(denom))
+    weights = weights * per_expert_scale.float()[ids]
+    return weights.contiguous(), ids.to(torch.int32).contiguous()
+
+
+def postmix_fp8_wo_a_quant_torch(x, mix):
+    """``postmix_fp8_wo_a.postmix_fp8_wo_a_quant`` 的 torch 版。
+
+    与适配层已有的 ``postmix_quant`` 同一实现，只是开源树的入口不再传
+    ``num_heads``（从 ``mix`` 的行数推）。
+    """
+    try:
+        from sglang_kunlun.eb5_adapt.eb5_extra_adapt import postmix_quant
+    except ImportError:  # EB5_KUNLUN_ADAPT_DIR 平铺目录
+        from eb5_extra_adapt import postmix_quant
+
+    return postmix_quant(x, mix, mix.shape[0])
+
+
 def multimax_torch(x, ranges, ts):
     """ERNIE 5.5 Flash multimax：中间量按 bf16 舍入（与 kernel 逐位一致）。"""
 
@@ -79,6 +162,21 @@ def _install_ernie5_ops() -> list:
             sigmoid_gate_mul_broadcast_torch,
         ),
         ("sglang.kernels.ops.activation.multimax", "multimax", multimax_torch),
+        (
+            "sglang.kernels.ops.elementwise.elementwise",
+            "fused_sigmoid_mul",
+            fused_sigmoid_mul_torch,
+        ),
+        (
+            "sglang.kernels.ops.moe.multi_router",
+            "multi_router_topk",
+            multi_router_topk_torch,
+        ),
+        (
+            "sglang.kernels.ops.attention.dsv4.postmix_fp8_wo_a",
+            "postmix_fp8_wo_a_quant",
+            postmix_fp8_wo_a_quant_torch,
+        ),
     ):
         try:
             patched.extend(_patch_everywhere(module_name, attr, impl))

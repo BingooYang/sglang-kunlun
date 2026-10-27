@@ -814,9 +814,15 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        runner_backend=None,
     ):
         super().__init__()
 
+        # Newer sglang threads the MoE runner backend down to the dispatcher so
+        # the CUDA impls can emit the layout that runner reads. The Kunlun impls
+        # below have exactly one output layout (the one `eb5_int8_adapt`'s
+        # DeepEPMoE consumes), so this is recorded but not dispatched on.
+        self.runner_backend = runner_backend
         self.deepep_mode = deepep_mode
 
         common_kwargs = dict(

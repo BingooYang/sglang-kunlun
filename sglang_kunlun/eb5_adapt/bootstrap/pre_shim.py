@@ -225,8 +225,39 @@ def _disable_xgrammar_import() -> None:
         setattr(module, _name, _unavailable_fn)
 
 
+def _default_dsa_fuse_topk_from_argv() -> None:
+    """``--dsa-topk-backend torch`` implies ``SGLANG_DSA_FUSE_TOPK=0``.
+
+    The fused DSA indexer top-k only has sgl-kernel / flashinfer
+    implementations; with the torch backend the DSA attention raises
+    "Unsupported self.dsa_topk_backend = DSATopKBackend.TORCH for
+    SGLANG_DSA_FUSE_TOPK". On Kunlun the torch backend is the only usable one,
+    so default the fusion off. Done here, before sglang is imported, because
+    the flag is read while the attention backend is built and the value is an
+    enum by the time ServerArgs is post-processed.
+    """
+    import os
+    import sys
+
+    if "SGLANG_DSA_FUSE_TOPK" in os.environ:
+        return  # operator override wins
+    argv = sys.argv
+    wants_torch = False
+    # Last occurrence wins, matching argparse: a later --dsa-topk-backend
+    # overrides an earlier one, including back to a non-torch backend.
+    for i, arg in enumerate(argv):
+        if arg == "--dsa-topk-backend" and i + 1 < len(argv):
+            wants_torch = argv[i + 1] == "torch"
+        elif arg.startswith("--dsa-topk-backend="):
+            wants_torch = arg.split("=", 1)[1] == "torch"
+    if wants_torch:
+        os.environ["SGLANG_DSA_FUSE_TOPK"] = "0"
+
+
 def _kunlun_pre_shim() -> None:
     """Force triton's active driver to advertise ``backend == "cuda"``."""
+
+    _default_dsa_fuse_topk_from_argv()
     import os
     import sys
 

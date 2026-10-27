@@ -20,3 +20,8 @@
 from sglang_kunlun.eb5_adapt.hooks.models import deepseek_v4  # noqa: F401
 from . import deepseek_v4_nextn  # noqa: F401
 
+try:  # only the open-source tree serves EB5 from sglang.srt.models.ernie55
+    from sglang_kunlun.eb5_adapt.hooks.models import ernie55  # noqa: F401
+except ImportError:  # pragma: no cover - the internal fork has no ernie55
+    pass
+

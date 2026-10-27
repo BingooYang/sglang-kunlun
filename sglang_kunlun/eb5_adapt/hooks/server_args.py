@@ -89,3 +89,34 @@ def _set_default_dsa_kv_cache_dtype_kunlun(original_fn, self, major, quantizatio
         self.kv_cache_dtype = "float16"
         return
     return original_fn(self, major, quantization)
+
+
+@plugin_hook(
+    "sglang.srt.server_args.ServerArgs.__post_init__",
+    type=HookType.AFTER,
+)
+def _disable_dsa_fused_topk_for_torch_backend(result, self, *args, **kwargs):
+    """``--dsa-topk-backend torch`` cannot serve the fused indexer top-k.
+
+    ``SGLANG_DSA_FUSE_TOPK`` defaults to True, and the DSA backend then raises
+    "Unsupported self.dsa_topk_backend = DSATopKBackend.TORCH for
+    SGLANG_DSA_FUSE_TOPK". On Kunlun the torch top-k is the only usable backend
+    (the sgl-kernel one has no XPU implementation), so turn the fusion off
+    unless the operator set the variable explicitly.
+    """
+    import os
+
+    backend = getattr(self, "dsa_topk_backend", None)
+    # May already be a DSATopKBackend enum at this point.
+    value = getattr(backend, "value", backend)
+    if value != "torch":
+        return
+    if "SGLANG_DSA_FUSE_TOPK" in os.environ:
+        return
+    os.environ["SGLANG_DSA_FUSE_TOPK"] = "0"
+    try:
+        from sglang.srt.environ import envs
+
+        envs.SGLANG_DSA_FUSE_TOPK.set(False)
+    except Exception:  # noqa: BLE001 - the env var alone is enough
+        pass

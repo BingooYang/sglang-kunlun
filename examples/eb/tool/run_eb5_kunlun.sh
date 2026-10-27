@@ -78,7 +78,16 @@ mkdir -p "$BINGOO/logs"
 
 # `code/sglang`（fork）与 `code/sglang-kunlun`（插件）都是 editable 安装，
 # 不再需要手工拼 PYTHONPATH。
-unset PYTHONPATH
+#
+# `SGLANG_FORK_PYTHONPATH=<dir>`：用另一份 sglang fork 顶掉 editable 安装的那份
+# （例如 `code/wenbin/sglang-ERNIE-5.5-Flash/python`）。只影响 sys.path 优先级，
+# 不改 venv，退出即恢复。不设则沿用 editable 安装。
+if [ -n "${SGLANG_FORK_PYTHONPATH:-}" ]; then
+  export PYTHONPATH="$SGLANG_FORK_PYTHONPATH"
+  echo "[run_eb5_kunlun] sglang fork 覆盖为 $SGLANG_FORK_PYTHONPATH"
+else
+  unset PYTHONPATH
+fi
 
 # ---- 平台 + 插件（SGLANG_PLUGINS 是白名单，设了就只加载列出的） ----
 # **`kunlun` 必须列进来**：白名单对 `sglang.srt.platforms` 与 `sglang.srt.plugins`
@@ -87,7 +96,10 @@ unset PYTHONPATH
 # `sgl_kernel` 不被 stub，随后 `sglang.srt.layers.quantization` 一挂就是
 # `<kunlun-alias-stub>` 连锁失败。
 export SGLANG_PLUGINS=kunlun,kunlun_hooks,eb5_internal_runtime_patch,eb5_kunlun_patch
-export SGLANG_EXTERNAL_MODEL_PACKAGE=sglang.srt.internal.models.eb5
+# 外部模型包指向 fork 的 internal 叠加实现。换成没有 `srt/internal/` 的 fork
+# （如 sglang-ERNIE-5.5-Flash，EB5 做进了主干 `models/ernie55.py`）时要置空，
+# 否则 import 直接失败。置空写法：SGLANG_EXTERNAL_MODEL_PACKAGE=""
+export SGLANG_EXTERNAL_MODEL_PACKAGE=${SGLANG_EXTERNAL_MODEL_PACKAGE-sglang.srt.internal.models.eb5}
 # EB5 的融合算子拆解（torch / KLX 原生）随 sglang_kunlun 包一起安装，由
 # eb5_kunlun_patch 从 `sglang_kunlun.eb5_adapt` 导入，不再需要指定目录。
 # 仅当要用工作区里的平铺副本临时覆盖时才设置：
@@ -174,8 +186,8 @@ nohup sglang-kunlun-launch \
   --nccl-port 9999 \
   --moe-a2a-backend deepep \
   --deepep-mode low_latency \
-  --tool-call-parser ernie_lite \
-  --reasoning-parser ernie_lite \
+  --tool-call-parser ${TOOL_PARSER:-ernie_lite} \
+  --reasoning-parser ${REASON_PARSER:-ernie_lite} \
   --tokenizer-worker-num 4 \
   --enable-metrics \
   $EXTRA_ARGS \

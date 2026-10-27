@@ -29,10 +29,20 @@ import kunlun_ops
 import os
 import torch
 
-from sglang.srt.internal.train_infer_consistent_ops.inspect_util import (
-    get_current_layer,
-    inspect_tensor,
-)
+try:
+    # fork-only debug helper; absent in the open-source tree (no sglang.srt.internal)
+    from sglang.srt.internal.train_infer_consistent_ops.inspect_util import (
+        get_current_layer,
+        inspect_tensor,
+    )
+except ImportError:  # pragma: no cover - depends on which sglang tree is installed
+
+    def get_current_layer():
+        return -1
+
+    def inspect_tensor(tag, layer_id, tensor, *args, **kwargs):
+        # The real probe is a pass-through; callers assign its return value.
+        return tensor
 import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops.*)
 
 from sglang_kunlun.eb5_adapt.kernels.quant_ops import (
@@ -1589,6 +1599,36 @@ def _compress_norm_rope_store_kunlun(
 
     if kv_out.shape[0] == 0:
         return
+
+    # A fixed-capacity prefill plan can mark every row invalid (no 128-token
+    # window closed yet). There is nothing to write then, and handing the native
+    # ``set_k_and_s_v4`` a row set that masks out to empty wedges the device
+    # (CPU then spins at 100% in the next sync).
+    if valid_rows is not None and not bool(valid_rows.any()):
+        return
+
+    # ``EB5_COMP_STORE_DUMP=1``: first few stores' addressing. A `loc` out of
+    # the pool's range makes the native ``set_k_and_s_v4`` hang (CPU spins in
+    # the next device sync at 100%), so compare these numbers against a
+    # known-good tree when a store wedges.
+    if os.environ.get("EB5_COMP_STORE_DUMP", "0") == "1":
+        _n = globals().setdefault("_EB5_COMP_STORE_N", [0])
+        if _n[0] < 8:
+            _n[0] += 1
+            _cap = kvcache.shape[0] * page_size
+            _v = (
+                "None"
+                if valid_rows is None
+                else f"{int(valid_rows.sum())}/{valid_rows.numel()}"
+            )
+            print(
+                f"[comp-store] call={_n[0]} is_decode={plan.is_decode} "
+                f"rows={tuple(kv_out.shape)} kvcache={tuple(kvcache.shape)} "
+                f"dtype={kvcache.dtype} page_size={page_size} capacity={_cap} "
+                f"loc.numel={out_locs.numel()} loc.min={int(out_locs.min())} "
+                f"loc.max={int(out_locs.max())} valid={_v}",
+                flush=True,
+            )
 
     # 同上：``pack`` 算完从未使用，存的是 ``kv_out``。已删除这次无效量化。
     _store_compress_kv_int8(

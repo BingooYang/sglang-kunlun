@@ -219,6 +219,7 @@ def mhc_pre(
     norm_eps=None,
     mhc_align_fleet: bool = False,
     mhc_align_accum_order: bool = False,
+    eps_outside_sqrt: bool = False,
 ):
     """``mhc.mhc_pre`` replacement (same return shapes and kernels).
 
@@ -259,7 +260,10 @@ def mhc_pre(
 
     x_flat = residual_flat.reshape(num_tokens, hc_mult * hidden_size).float()
     trace("pre:flatten")
-    if mhc_align_fleet:
+    # ``eps_outside_sqrt`` is upstream's name for this same alternative: it only
+    # changes the mapping's rms, unlike ``mhc_align_fleet`` which also switches
+    # the Sinkhorn softmax to exp2. ERNIE 5.5 Flash always passes it True.
+    if mhc_align_fleet or eps_outside_sqrt:
         rms = 1.0 / (
             torch.sqrt(x_flat.square().mean(-1, keepdim=True)) + rms_eps
         )

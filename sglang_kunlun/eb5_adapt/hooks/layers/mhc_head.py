@@ -39,7 +39,9 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
     "sglang.kernels.ops.layernorm.mhc_head.fused_hc_head",
     type=HookType.REPLACE,
 )
-def _fused_hc_head_kunlun(x, hc_fn, hc_scale, hc_base, norm_eps, hc_eps):
+def _fused_hc_head_kunlun(
+    x, hc_fn, hc_scale, hc_base, norm_eps, hc_eps, eps_outside_sqrt=False
+):
     """Kunlun-native fused HC Head via ``kunlun_ops.fused_dpsk_v4_hc_head_nofc``.
 
     Step 1: GEMM (linear) — done separately (nofc = no FC in the kunlun op)
@@ -48,6 +50,13 @@ def _fused_hc_head_kunlun(x, hc_fn, hc_scale, hc_base, norm_eps, hc_eps):
     shape, dtype = x.size(), x.dtype
     if shape[0] == 0:
         return torch.empty((0, shape[-1]), dtype=dtype, device=x.device)
+
+    if eps_outside_sqrt:
+        # ERNIE 5.5 Flash normalizes by ``1 / (sqrt(mean_sq) + eps)``; the
+        # kunlun op hardcodes ``rsqrt(mean_sq + eps)``, so take the torch path.
+        return _fused_hc_head_torch(
+            x, hc_fn, hc_scale, hc_base, norm_eps, hc_eps, eps_outside_sqrt=True
+        )
 
     hc_mult = shape[1]
     hidden_size = shape[2]
@@ -76,3 +85,23 @@ def _fused_hc_head_kunlun(x, hc_fn, hc_scale, hc_base, norm_eps, hc_eps):
         hc_mult,       # int
     )
     return out.to(dtype)
+
+
+def _fused_hc_head_torch(
+    x, hc_fn, hc_scale, hc_base, norm_eps, hc_eps, eps_outside_sqrt=False
+):
+    """Reference path (``mhc_head`` module docstring) with the eps placement flag.
+
+    Used when the fused kunlun op cannot express the requested arithmetic.
+    """
+    shape, dtype = x.size(), x.dtype
+    x_flat = x.flatten(1).float()
+    mean_sq = x_flat.square().mean(-1, keepdim=True)
+    if eps_outside_sqrt:
+        rsqrt = 1.0 / (torch.sqrt(mean_sq) + norm_eps)
+    else:
+        rsqrt = torch.rsqrt(mean_sq + norm_eps)
+    mixes = F.linear(x_flat, hc_fn.float()) * rsqrt
+    pre = torch.sigmoid(mixes * hc_scale.to(x.device) + hc_base.to(x.device)) + hc_eps
+    y = torch.sum(pre.unsqueeze(-1) * x_flat.view(shape), dim=1)
+    return y.to(dtype)

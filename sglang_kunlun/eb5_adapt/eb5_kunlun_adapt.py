@@ -813,6 +813,72 @@ def apply() -> list[str]:
         _mhc_torch.hc_split_sinkhorn_flat = _sinkhorn_flat_fused
         patched.append("hc_split_sinkhorn_flat[fused]")
 
+    # ①-d 多流残差合并（ERNI-7 D2 第 4 项）：`mhc_pre` 在 sinkhorn 之后要算
+    #    `y[t,h] = Σ_i pre[t,i] * residual[t,i,h]`。散装实现 `mhc_torch.hc_combine:190`
+    #    把整个 `[n, hc, hidden]` 升 fp32、广播乘、再 sum、再 cast 回去，四发 kernel。
+    #    `kunlun_ops.mhc_pre_weighted_sum`（`_fusion.py:1112`）就是这一式的融合算子，
+    #    docstring 写明「用于 DeepSeek-V4 的多流残差合并」，即 DSV4 侧在用。
+    #    纯加权和，不含 softmax / rsqrt / eps，所以没有 ①-c 那种对齐陷阱。
+    #
+    #    **只接加权和，不传 `scale`**：该 kernel 传 `scale` 会顺带做 RMSNorm，而
+    #    `srt/models/ernie55.py:705-707` 在 `_INEXACT_FUSION` 为假时把 RMSNorm 单独做，
+    #    注释明说融进去会改 norm 自身的算术 —— 那是另一个变量，不在本轮。
+    #
+    #    数值：散装版是 fp32 累加后 cast 回 bf16，融合版按 `residual.dtype` 走。
+    #    T0（`tools/t0_weighted_sum.py`，按真实幅度扫 |res| ∈ {1,4,16,64}）：
+    #    bf16 下 max_rel 最差 2.8e-3（n=64），decode 的 n=6 一档是 0 ~ 5.0e-5，
+    #    都在一个 bf16 ULP（2^-8 ≈ 3.9e-3）以内，与 ①-b 过闸门时的量级相同。
+    #    该 kernel **不支持 fp32 residual**（会 `RuntimeError: unsupported residual
+    #    dtype`），EB5 的 residual 是 bf16，满足；dtype 不符时下面会回退。
+    #
+    #    ⚠️ **实测没有可归因收益，所以默认关。** 接线确认 8/8 rank 打印
+    #    `hc_combine FUSED active ... m=6 hc=4 h=4096`、`FUSED failed` 0 次，
+    #    但 T1 1.6876 -> 1.6907 tok/s（+0.18%），三次重复区间大幅重叠
+    #    （参照 1.6733~1.7006 vs 融合 1.6837~1.7034），服务端 1.67~1.70 -> 1.68~1.71。
+    #    物理上限也就这么大：decode 的 batch 是 6 token，这一步省掉的是 3 发 kernel
+    #    launch × 86 次/步（43 层 × 2 个 mHC 边界）≈ 1.3~2.6 ms，而一步约 590 ms，
+    #    即 0.2~0.4%。**结论：方向对但边界太小，不值得翻默认、也不单独提 PR。**
+    #    留开关供 prefill 场景或 batch 变大后复测（n 大时它才可能有量）。
+    if _os.environ.get("EB5_MHC_COMBINE_FUSED", "0") == "1":
+        from sglang_kunlun.eb5_adapt.kernels import mhc_torch as _mhc_torch_c
+
+        _comb_ref = _mhc_torch_c.hc_combine
+        _wc_seen = []
+
+        def _hc_combine_fused(x_flat, pre, hc, out_dtype):
+            # 直调融合算子，不经 `mhc_torch` 的任何 try/except —— 那会静默回退，
+            # 没法证明 kernel 真的跑了。
+            try:
+                import kunlun_ops
+
+                m = x_flat.shape[0]
+                h = x_flat.shape[1] // int(hc)
+                if m == 0:
+                    raise ValueError("empty batch")
+                res = x_flat.reshape(m, int(hc), h)
+                out = torch.empty((m, h), dtype=res.dtype, device=x_flat.device)
+                kunlun_ops.mhc_pre_weighted_sum(
+                    res.contiguous(), pre.contiguous(), out, None, 1e-6
+                )
+                if not _wc_seen:
+                    _wc_seen.append(1)
+                    print(
+                        f"[ERNI-7] hc_combine FUSED active: mhc_pre_weighted_sum "
+                        f"m={m} hc={int(hc)} h={h} dtype={res.dtype}",
+                        flush=True,
+                    )
+                return out.to(out_dtype)
+            except Exception as exc:  # noqa: BLE001
+                if not _wc_seen:
+                    _wc_seen.append(1)
+                    print(
+                        f"[ERNI-7] hc_combine FUSED failed -> torch: {exc!r}", flush=True
+                    )
+                return _comb_ref(x_flat, pre, hc, out_dtype)
+
+        _mhc_torch_c.hc_combine = _hc_combine_fused
+        patched.append("hc_combine[fused]")
+
     # ② kernel 级：昆仑没有 tilelang / deep_gemm，这些融合 kernel 由 torch 散算子
     #    逐个替代（**不能**只在 ① 的调用层绕开 —— 直调 kernel 的代码同样要能跑）。
     _patch(mhc_mod, "mhc_post_tilelang", mhc_post_tilelang)

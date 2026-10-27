@@ -1,10 +1,16 @@
 #!/bin/bash
-# EB5 在线 INT8 量化跑法（昆仑 P800）。包一层 `run_eb5_kunlun.sh`，只负责
-# 打开 INT8 的开关并给出 8L 的减层子模型；其余（env / preflight / 端口）沿用原脚本。
+# EB5 INT8 跑法（昆仑 P800）。包一层 `run_eb5_kunlun.sh`，只负责打开 INT8 的
+# 开关并给出 8L 的减层子模型；其余（env / preflight / 端口）沿用原脚本。
+#
+# 两种来源：
+#   * 在线（默认）：BF16 checkpoint，加载时做 per-output-channel 量化；
+#   * 离线：`EB5_INT8_OFFLINE=1`，checkpoint 自带 int8 routed experts +
+#     `w{1,2,3}.weight_scale`（config.json 里 `quant_method=w8a8_int8`）。
 #
 # 用法：
 #   bash run_eb5_int8.sh [MODEL_PATH] [PORT]
 #   LAYERS=8 EB5_GPUS=4,5,6,7 bash run_eb5_int8.sh
+#   EB5_INT8_OFFLINE=1 bash run_eb5_int8.sh /path/to/eblite-int8-moe 30199
 #
 # 量化方案（见 sglang/srt/internal/layers/quantization/blockwise_int8_patch.py）：
 #   * 权重：加载后 per-output-channel 对称 INT8（absmax 标度），MoE 专家 CPU 暂存逐 expert 量化
@@ -28,7 +34,16 @@ LAYERS=${LAYERS:-8}
 EB5_GPUS=${EB5_GPUS:-4,5,6,7}
 
 # ---- INT8 开关 ----
-export EB5_INT8_ONLINE=1          # 总开关：把 --quantization blockwise_int8 映射到本实现
+EB5_INT8_OFFLINE=${EB5_INT8_OFFLINE:-0}
+if [ "$EB5_INT8_OFFLINE" = "1" ]; then
+  # checkpoint 已带 int8 权重：不要再做在线量化，直接按 config 的
+  # quantization_config（w8a8_int8）加载。
+  export EB5_INT8_ONLINE=0
+  EB5_QUANT=${EB5_QUANT:-w8a8_int8}
+else
+  export EB5_INT8_ONLINE=1          # 总开关：把 --quantization blockwise_int8 映射到本实现
+  EB5_QUANT=${EB5_QUANT:-blockwise_int8}
+fi
 export EB5_INT8_MOE_ONLY=${EB5_INT8_MOE_ONLY:-0}      # 1 = 只量化 routed experts
 export EB5_INT8_MOE_CPU_STAGING=${EB5_INT8_MOE_CPU_STAGING:-1}
 
@@ -46,7 +61,7 @@ PY
   export MODEL_OVERRIDE_ARGS="{\"num_hidden_layers\":$LAYERS,\"compress_ratios\":$RATIOS}"
 fi
 
-export EXTRA_ARGS="--deepep-mode normal --quantization blockwise_int8 ${EXTRA_ARGS:-}"
+export EXTRA_ARGS="--deepep-mode normal --quantization ${EB5_QUANT} ${EXTRA_ARGS:-}"
 
-echo "[run_eb5_int8] layers=$LAYERS gpus=$EB5_GPUS port=$PORT override=$MODEL_OVERRIDE_ARGS"
+echo "[run_eb5_int8] layers=$LAYERS gpus=$EB5_GPUS port=$PORT override=$MODEL_OVERRIDE_ARGS quant=$EB5_QUANT offline=$EB5_INT8_OFFLINE"
 exec bash "$HERE/run_eb5_kunlun.sh" "$MODEL_PATH" "$PORT"

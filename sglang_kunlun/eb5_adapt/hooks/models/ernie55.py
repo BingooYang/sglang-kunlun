@@ -104,39 +104,67 @@ _ERNIE55_CKPT_MODEL_TYPE = "ernie5_5_moe"
 _LEGACY_ARCHS = ("ErnieForCausalLM", "ErnieMlaHcaForCausalLM")
 
 
-def _retarget_eb5_checkpoint(hf_config) -> bool:
-    """Point a legacy EB5 checkpoint at ``Ernie5_5_MoeForCausalLM``.
+def _retarget_eb5_checkpoint(hf_config):
+    """Rebuild a legacy EB5 config as a genuine ``Ernie5_5_MoeConfig``.
 
-    ``hf_checkpoint-48800`` and friends declare ``architectures=
-    ["ErnieForCausalLM"]`` / ``model_type="ernie"``, which the internal fork
-    resolves through its own runtime patch. The open-source tree registers the
-    model as ``Ernie5_5_MoeForCausalLM`` / ``ernie5_5_moe`` and rejects anything
-    else ("serves ERNIE 5.5 Flash checkpoints only, got a ErnieConfig"), so
-    rewrite the two fields here instead of shipping a patched copy of the
-    checkpoint. Every other field in those configs is already what
-    ``Ernie5_5_MoeConfig`` expects.
+    ``hf_checkpoint-48800`` / ``eblite-int8-moe`` and friends declare
+    ``architectures=["ErnieForCausalLM"]`` / ``model_type="ernie"``, which the
+    internal fork resolves through its own runtime patch. The open-source tree
+    registers the model as ``Ernie5_5_MoeForCausalLM`` / ``ernie5_5_moe``, and
+    the model class type-checks its config, so renaming the two fields on the
+    existing object is not enough -- it stays an ``ErnieConfig`` and the model
+    raises "serves ERNIE 5.5 Flash checkpoints only, got a ErnieConfig".
+    Construct the real class from the same field dict instead, so no patched
+    copy of the checkpoint is needed.
+
+    Returns the replacement config, or ``None`` when nothing had to change.
     """
+    from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig
+
     archs = list(getattr(hf_config, "architectures", None) or [])
     if not archs or archs[0] not in _LEGACY_ARCHS:
-        return False
-    hf_config.architectures = [_ERNIE55_CKPT_ARCH]
-    if getattr(hf_config, "model_type", None) != _ERNIE55_CKPT_MODEL_TYPE:
-        hf_config.model_type = _ERNIE55_CKPT_MODEL_TYPE
+        return None
+    if isinstance(hf_config, Ernie5_5_MoeConfig):
+        return None
+    fields = hf_config.to_dict()
+    fields["architectures"] = [_ERNIE55_CKPT_ARCH]
+    fields["model_type"] = _ERNIE55_CKPT_MODEL_TYPE
+    # ``__init__`` derives both ratio lists from its ``compress_ratios``
+    # argument, where -2 marks an MLA layer. ``compress_ratios`` on an already
+    # built config may be the normalised copy (-2 -> 0), which would erase
+    # every MLA layer, so prefer the verbatim list when it is present.
+    ratios = fields.get("checkpoint_compress_ratios") or fields.get("compress_ratios")
+    if ratios:
+        fields["compress_ratios"] = ratios
+    rebuilt = Ernie5_5_MoeConfig(**fields)
     logger.warning(
-        "sglang-kunlun: retargeted EB5 checkpoint %s -> %s (model_type=%s)",
+        "sglang-kunlun: retargeted EB5 checkpoint %s -> %s (model_type=%s, "
+        "config %s -> Ernie5_5_MoeConfig)",
         archs[0],
         _ERNIE55_CKPT_ARCH,
         _ERNIE55_CKPT_MODEL_TYPE,
+        type(hf_config).__name__,
     )
-    return True
+    return rebuilt
 
 
 @plugin_hook(
-    target="sglang.srt.configs.model_config.ModelConfig.__init__",
-    type=HookType.AFTER,
+    target="sglang.srt.configs.model_config.get_config",
+    type=HookType.AROUND,
 ) if _ernie55_present() else (lambda fn: fn)
-def model_config_init_kunlun(result, self, *args, **kwargs):
-    """Rewrite the EB5 arch/model_type as soon as the config is built."""
-    hf_config = getattr(self, "hf_config", None)
-    if hf_config is not None:
-        _retarget_eb5_checkpoint(hf_config)
+def get_config_kunlun(original_fn, *args, **kwargs):
+    """Retarget the EB5 checkpoint before ``ModelConfig`` reads the config.
+
+    ``ModelConfig.__init__`` derives the attention backend, the hybrid-SWA
+    flags and the DSV4 pool layout from ``architectures``, so an AFTER hook on
+    ``__init__`` is too late: those branches would already have been skipped.
+    ``get_config`` applies ``--json-model-override-args`` last and returns, so
+    this is the first point where the config is complete.
+    """
+    config = original_fn(*args, **kwargs)
+    try:
+        rebuilt = _retarget_eb5_checkpoint(config)
+    except Exception:  # noqa: BLE001 - a non-EB5 config must still start up
+        logger.exception("sglang-kunlun: EB5 config retarget failed; leaving as is")
+        return config
+    return config if rebuilt is None else rebuilt

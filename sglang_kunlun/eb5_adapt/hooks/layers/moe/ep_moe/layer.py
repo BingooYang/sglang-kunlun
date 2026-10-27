@@ -1257,7 +1257,8 @@ class DeepEPMoE(FusedMoE):
         import kunlun_ops
         hidden_states, hidden_states_scale,  _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
-        assert self.moe_runner_config.activation == "silu"
+        activation = self.moe_runner_config.activation
+        assert activation in ("silu", "situ"), activation
         hidden_states_fp8 = (hidden_states, hidden_states_scale)
         if self.w13_weight.dtype != torch.int8:
             return self.forward_deepgemm_masked_bfp16(
@@ -1292,7 +1293,9 @@ class DeepEPMoE(FusedMoE):
                 gateup_output.shape[2] // 2,
             ),
             device=gateup_output.device,
-            dtype=self.fp8_dtype,
+            # 走到这里 w13 一定是 int8；EB5 的 InternalBlockwiseInt8Config 不会命中
+            # __init__ 里的 fp8_dtype 分支，不能用 self.fp8_dtype。
+            dtype=torch.int8,
         )
         scale_block_size = 128
         scale_block_size = gateup_output.shape[2] // 2  # per_col quant
@@ -1306,10 +1309,35 @@ class DeepEPMoE(FusedMoE):
             device=gateup_output.device,
             dtype=torch.float32,
         )
-        kunlun_ops.silu_and_per_token_group_quant_I8(gateup_output,
-                                          down_input,
-                                          down_input_scale,
-                                          masked_m)
+        if activation == "situ":
+            # KLX 原生 SiTU（gate/up 两支）→ per-token absmax 量化（quant2d）。
+            # ``gateup_output`` 是 torch.empty，masked_m 之外的行是未初始化内存，
+            # 直接送量化内核会触发 KL_XID_KERNEL_EXCEPTION（2026-10-23 实测）。
+            # 先把无效行清零：整行量化，且 masked GEMM 本来就不读这些行。
+            beta = self.moe_runner_config.gemm1_alpha
+            linear_beta = self.moe_runner_config.gemm1_clamp_limit
+            act = torch.ops.xspeedgate_ops.situ_and_mul(
+                gateup_output.view(-1, gateup_output.shape[2]),
+                1.0 if beta is None else float(beta),
+                -1.0 if linear_beta is None else float(linear_beta),
+            ).view(down_input.shape)
+            expert_rows = torch.arange(
+                down_input.shape[1], device=down_input.device
+            )
+            valid = expert_rows[None, :] < masked_m.to(torch.int64)[:, None]
+            act.masked_fill_(~valid.unsqueeze(-1), 0.0)
+            kunlun_ops.quant2d(
+                act.view(-1, down_input.shape[2]),
+                down_input.view(-1, down_input.shape[2]),
+                down_input_scale.view(-1),
+                force_sdnn=False,
+            )
+            del act
+        else:
+            kunlun_ops.silu_and_per_token_group_quant_I8(gateup_output,
+                                              down_input,
+                                              down_input_scale,
+                                              masked_m)
         del gateup_output
 
         # GroupGemm-1

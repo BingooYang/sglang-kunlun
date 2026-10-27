@@ -735,6 +735,20 @@ def apply() -> list[str]:
 
         print("[eb5-kunlun-adapt] int8 adapt failed:", _e, file=_sys.stderr)
 
+    # --- 离线 INT8 checkpoint 的 scale 路由（另见本包的 eb5_offline_int8_adapt.py） ---
+    # checkpoint 自带 per-channel INT8 routed experts 时，loader 需要认识
+    # ``w{1,2,3}.weight_scale``（而不是 block-FP8 的 ``weight_scale_inv``）。
+    try:
+        eb5_offline_int8_adapt = _import_sibling("eb5_offline_int8_adapt")
+
+        patched.extend(eb5_offline_int8_adapt.apply())
+    except ImportError:
+        pass
+    except Exception as _e:
+        import sys as _sys
+
+        print("[eb5-kunlun-adapt] offline int8 adapt failed:", _e, file=_sys.stderr)
+
     # --- DSA transform_index 的 torch 拆解（另见本包的 eb5_transform_index_adapt.py） ---
     try:
         eb5_transform_index_adapt = _import_sibling("eb5_transform_index_adapt")

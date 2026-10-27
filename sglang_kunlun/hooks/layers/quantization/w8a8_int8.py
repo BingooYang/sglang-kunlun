@@ -257,6 +257,25 @@ def moe_apply_kunlun(
 # ---------------------------------------------------------------------------
 
 
+def _checkpoint_quantizes_experts_only(quant_description: Any) -> bool:
+    """True for EB5-style checkpoints that only carry INT8 routed experts.
+
+    ``quantized_modules`` is the list of module regexes the exporter actually
+    quantized. EB5's offline checkpoint lists only
+    ``.*\\.block_sparse_moe\\.experts\\.\\d+\\.w[123]``, while every dense
+    projection is still BF16. The upstream ``W8A8Int8Config`` ignores that field
+    and would build INT8 dense layers whose weights do not exist in the
+    checkpoint, so gate on it here.
+    """
+
+    if not isinstance(quant_description, dict):
+        return False
+    modules = quant_description.get("quantized_modules") or []
+    if isinstance(modules, str):
+        modules = [modules]
+    return any("experts" in str(pattern) for pattern in modules)
+
+
 @plugin_hook(
     "sglang.srt.layers.quantization.w8a8_int8.W8A8Int8Config.get_quant_method",
     type=HookType.REPLACE,
@@ -285,7 +304,16 @@ def w8a8_int8_config_get_quant_method_kunlun(
         W8A8Int8MoEMethod,
     )
 
+    # EB5 offline checkpoints quantize the routed experts only; the dense
+    # projections keep their BF16 weights (there is no ``weight_scale`` for
+    # them in the checkpoint). Quantizing them here would fail at load time.
+    experts_only = _checkpoint_quantizes_experts_only(
+        getattr(self, "quant_description", None)
+    )
+
     if isinstance(layer, LinearBase):
+        if experts_only:
+            return UnquantizedLinearMethod()
         if should_ignore_layer(
             prefix,
             ignore=self.ignore,

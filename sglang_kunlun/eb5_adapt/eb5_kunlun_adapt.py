@@ -669,10 +669,17 @@ def apply() -> list[str]:
     #    `mhc_post` 是纯代数（加权和 + 残差重组），不含 softmax/rsqrt，
     #    所以 `mhc_align_fleet` 的两处对齐差异（eps 位置、exp2 vs exp）与它无关。
     #    形状门槛（mhc_torch.py:316-324）EB5 全满足：hc_mult=4、x 2-D、residual 3-D。
-    #    用 `EB5_MHC_POST_FUSED` 门控，默认关；置 1 打开，回退 = 不设该变量。
+    #
+    #    已在**新口径**（公版 sglang + ERNIE 5.5 Flash + 离线 INT8 eblite-int8-moe）
+    #    实测通过，故 **默认开启**；`EB5_MHC_POST_FUSED=0` 可退回散算子。
+    #      - 接线确认：8/8 rank 打印 `mhc_post FUSED active ... b=6 n=4 d=4096`，
+    #        `FUSED failed` 0 次。
+    #      - T1：客户端 1.6515 -> 1.6857 tok/s（+2.07%），服务端 `gen throughput`
+    #        1.64~1.66 -> 1.67~1.70，两个指标同向、三次重复区间不重叠。
+    #      - T2：`aime26_first2` **2/2**（277/277 553 tok、62/62 7800 tok）。
     import os as _os
 
-    if _os.environ.get("EB5_MHC_POST_FUSED", "0") == "1":
+    if _os.environ.get("EB5_MHC_POST_FUSED", "1") == "1":
 
         _seen = []
 

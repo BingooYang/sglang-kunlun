@@ -656,11 +656,156 @@ def apply() -> list[str]:
     #    `from ...mhc import mhc_pre as _mhc_pre` / `mhc_post as _mhc_post`，
     #    `patch_everywhere` 会按对象身份把这类旧绑定一并改掉。
     _patch(mhc_mod, "mhc_pre", mhc_pre_torch_ref)
-    _patch(mhc_mod, "mhc_post", mhc_post_torch_ref)
     # ``mhc_combine`` was dropped from the registration set together with the
     # other mHC kernels; DSV4's boundary path still calls it, and the Triton
     # version then dies in graph capture (``_CudaTarget.arch``).
     _patch(mhc_mod, "mhc_combine", mhc_combine_torch_ref)
+    # ①-b `mhc_post` 例外（ERNI-7 D2）：DSV4 侧这一步是**一发融合算子**
+    #    `kunlun_ops.hc_post_kunlun_impl`（见 sglang05124 的
+    #    `hooks/models/deepseek_v4.py:32-64`；trace 实测
+    #    `xpuops3::hc_post_kunlun_impl<bfloat16,float>` 0.586 ms/step x86），
+    #    EB5 这里因为 `ernie5.py` 调用时不传 `use_fused`、取 `mhc_torch.py` 的默认
+    #    False，退化成 `unsqueeze/mul/sum/add/type_as` 散算子。
+    #    `mhc_post` 是纯代数（加权和 + 残差重组），不含 softmax/rsqrt，
+    #    所以 `mhc_align_fleet` 的两处对齐差异（eps 位置、exp2 vs exp）与它无关。
+    #    形状门槛（mhc_torch.py:316-324）EB5 全满足：hc_mult=4、x 2-D、residual 3-D。
+    #    用 `EB5_MHC_POST_FUSED` 门控，默认关；置 1 打开，回退 = 不设该变量。
+    import os as _os
+
+    if _os.environ.get("EB5_MHC_POST_FUSED", "0") == "1":
+
+        _seen = []
+
+        def _mhc_post_fused(x, residual, post_layer_mix, comb_res_mix, **kwargs):
+            # 直调融合算子（与 DSV4 的 hook `hooks/models/deepseek_v4.py:32-64` 同形），
+            # 不走 `mhc_torch.mhc_post` 的 `use_fused` 门——那条路的
+            # `except Exception: pass` 会静默回退，没法证明 kernel 真的跑了。
+            try:
+                import kunlun_ops
+
+                post = (
+                    post_layer_mix.squeeze(-1)
+                    if post_layer_mix.dim() == residual.dim()
+                    else post_layer_mix
+                )
+                if x.shape[0] == 0:
+                    return torch.empty_like(residual)
+                b, n, d = residual.shape
+                out = torch.empty((b, n, d), dtype=x.dtype, device=x.device)
+                kunlun_ops.hc_post_kunlun_impl(
+                    post.contiguous(),
+                    x.contiguous(),
+                    comb_res_mix.contiguous(),
+                    residual.contiguous(),
+                    out,
+                    b,
+                    n,
+                    d,
+                )
+                if not _seen:
+                    _seen.append(1)
+                    print(
+                        f"[ERNI-7] mhc_post FUSED active: hc_post_kunlun_impl "
+                        f"b={b} n={n} d={d} dtype={x.dtype}",
+                        flush=True,
+                    )
+                return out
+            except Exception as exc:  # noqa: BLE001
+                if not _seen:
+                    _seen.append(1)
+                    print(f"[ERNI-7] mhc_post FUSED failed -> torch: {exc!r}", flush=True)
+                return mhc_post_torch_ref(x, residual, post_layer_mix, comb_res_mix)
+
+        _patch(mhc_mod, "mhc_post", _mhc_post_fused)
+        patched.append("mhc_post[use_fused=True]")
+    else:
+        _patch(mhc_mod, "mhc_post", mhc_post_torch_ref)
+
+    # ①-c split-Sinkhorn（ERNI-7 D2 第 2 项）：`mhc_pre` 里最贵的一段。
+    #    `mhc_torch.mhc_pre:271` 直调 `hc_split_sinkhorn_flat`，绕过了 `:130` 的
+    #    派发器，所以 `use_fused` 根本到不了这里；派发器那条路的门
+    #    （`mhc_torch.py:145`）又要求 `not mhc_align_fleet`，而 EB5 的
+    #    `mhc_align_fleet` 恒为 True（`"ernie" in model_type`）。
+    #
+    #    那个门对 sinkhorn **看起来**是过严的：`mhc_align_fleet` 只改两处，
+    #      - `1/(sqrt(mean)+eps)` vs `rsqrt(mean+eps)` —— 在 `mhc_pre` 的 RMS 里，
+    #        发生在 GEMM 之前，**不属于** `hc_split_sinkhorn_flat`；
+    #      - `exp2((x-max)*log2e)` vs `exp(x-max)` —— 在 sinkhorn 里，数学恒等。
+    #
+    #    ⚠️ 但实测结论相反：**这个门是对的，不要打开本开关。**
+    #    - T1 性能确实大涨：服务端 `gen throughput` 1.79 -> 2.55~2.64 tok/s（+44%）。
+    #    - T2 精度闸门**挂了**：`aime26_first2` **0/2**（pred=5 exp=277、pred=1 exp=62，
+    #      两题都跑满 8192 token 没收敛）。按 ERNI-7 的硬闸门已回退。
+    #    - 原因（tools/t0_sinkhorn_diag.py 实测）：融合 kernel 与参考实现的误差
+    #      **随输入幅度增长** —— comb 的 max_rel 在 |mixes|~1 时 1.085e-6、
+    #      ~4 时 2.444e-6、~16 时 **2.065e-4**。最初的 T0 用 `randn`（幅度~1）
+    #      只看到 1e-6，是**样本幅度不足**；真实网络里 GEMM 后的 mixes 幅度大得多，
+    #      误差经 43 层 x 2 个 block x 8192 步放大后足以带偏推理链。
+    #    => 这一项应归 **需新开发融合算子**（要一个与 fleet 对齐、在大幅度输入下
+    #       仍精确的 split-Sinkhorn kernel）。它的价值已实测：**+44% decode**。
+    #
+    #    开关保留但**默认关**，仅作为复现失败与后续开发的入口。
+    #    接法：替换 `mhc_torch` 模块里的 `hc_split_sinkhorn_flat` 全局名。
+    #    `mhc_pre` 在调用时按模块全局解析该名字，所以这样能接到；派发器 `:173`
+    #    的兜底分支同样受益。
+    if _os.environ.get("EB5_MHC_SINKHORN_FUSED", "0") == "1":
+        from sglang_kunlun.eb5_adapt.kernels import mhc_torch as _mhc_torch
+
+        _flat_ref = _mhc_torch.hc_split_sinkhorn_flat
+        _sk_seen = []
+
+        def _sinkhorn_flat_fused(
+            mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps,
+            *, mhc_align_fleet=False, post_mult_value=2.0,
+        ):
+            # 直调融合算子，不走派发器的 `use_fused` 门；那条路的
+            # `except Exception: pass` 会静默回退，没法证明 kernel 真的跑了。
+            try:
+                import kunlun_ops
+
+                hc = int(hc_mult)
+                if float(post_mult_value) != 2.0:
+                    raise ValueError(f"post_mult_value={post_mult_value} != 2.0")
+                m = mixes.reshape(-1, (2 + hc) * hc).contiguous()
+                n = m.shape[0]
+                if n == 0:
+                    raise ValueError("empty batch")
+                pre = torch.empty((n, hc), dtype=torch.float32, device=mixes.device)
+                post = torch.empty((n, hc), dtype=torch.float32, device=mixes.device)
+                comb = torch.empty((n, hc * hc), dtype=torch.float32, device=mixes.device)
+                kunlun_ops.mhc_split_sinkhorn(
+                    m,
+                    hc_scale.float().contiguous(),
+                    hc_base.float().contiguous(),
+                    pre,
+                    post,
+                    comb,
+                    hc,
+                    int(sinkhorn_iters),
+                    float(eps),
+                )
+                if not _sk_seen:
+                    _sk_seen.append(1)
+                    print(
+                        f"[ERNI-7] sinkhorn FUSED active: mhc_split_sinkhorn "
+                        f"n={n} hc={hc} iters={int(sinkhorn_iters)} "
+                        f"align_fleet={bool(mhc_align_fleet)}",
+                        flush=True,
+                    )
+                return pre, post, comb.reshape(n, hc, hc)
+            except Exception as exc:  # noqa: BLE001
+                if not _sk_seen:
+                    _sk_seen.append(1)
+                    print(f"[ERNI-7] sinkhorn FUSED failed -> torch: {exc!r}", flush=True)
+                return _flat_ref(
+                    mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps,
+                    mhc_align_fleet=mhc_align_fleet,
+                    post_mult_value=post_mult_value,
+                )
+
+        _mhc_torch.hc_split_sinkhorn_flat = _sinkhorn_flat_fused
+        patched.append("hc_split_sinkhorn_flat[fused]")
+
     # ② kernel 级：昆仑没有 tilelang / deep_gemm，这些融合 kernel 由 torch 散算子
     #    逐个替代（**不能**只在 ① 的调用层绕开 —— 直调 kernel 的代码同样要能跑）。
     _patch(mhc_mod, "mhc_post_tilelang", mhc_post_tilelang)

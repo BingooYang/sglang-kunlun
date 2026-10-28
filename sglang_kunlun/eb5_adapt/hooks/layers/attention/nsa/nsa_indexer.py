@@ -88,6 +88,14 @@ def _topk_all_visible(metadata, topk: int, device) -> torch.Tensor:
     return out
 
 
+def _indexer_zerocopy_k() -> bool:
+    """是否把 paged indexer 的 K 以零拷贝 strided 视图喂给 I8_paged_mqa_logits。
+
+    置 ``EB5_DSA_INDEXER_ZEROCOPY_K=0`` 退回原来的"整池物化一份 int8"写法，便于二分。
+    """
+    return os.environ.get("EB5_DSA_INDEXER_ZEROCOPY_K", "1") == "1"
+
+
 def _indexer_kv_pool():
     """indexer 侧真正要写的 KV pool（EB5 是 full latent 子池）。
 
@@ -643,17 +651,33 @@ def _get_topk_paged(
     q_offset = sum(_extend_lens_cpu(metadata))
 
     head_dim = _indexer_kv_pool().index_head_dim
-    k_fp8 = (
-        kv_cache_fp8[:, : page_size * head_dim]
-        .view(kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim)
-        .to(torch.int8)
-    )
+    # indexer 的 k 缓存按 fp8 存，但 buffer 的 dtype 是 uint8(Byte)；vendor 算子
+    # 只收 Char(int8)。2026-10-20 22:24 实测：
+    # ``RuntimeError: dtype of kv_cache (Byte) must be one of [Char]``。
+    # ``view`` 同 itemsize，零拷贝。
+    kv_int8 = kv_cache_fp8.view(torch.int8)
+    if _indexer_zerocopy_k():
+        # 池的每一行是 ``page_size*head_dim`` 字节的 K 加 ``page_size*4`` 字节的
+        # fp32 scale，所以 ``[:, :page_size*head_dim]`` 在 dim0 上是 strided 的。
+        # 原实现用 ``.to(torch.int8)``（+ ``.contiguous()``）把**整个 KV 池**物化一份，
+        # 在 profiler 里就是最大的那个 GPU kernel
+        # ``cluster_cast_kl3<unsigned char, signed char>``（~31.3 ms/step）。
+        # 而 ``kunlun_ops.I8_paged_mqa_logits`` 本来就支持 dim0 strided 的 k_cache
+        # （C++ wrapper 取 ``key_cache.stride(0)`` 当 ``k_block_stride``），只要内层
+        # (1,2,3) 维连续即可 —— 这里 view 出来的 stride 是
+        # ``(row_bytes, head_dim, head_dim, 1)``，正好满足。于是整份拷贝可以直接去掉。
+        k_fp8 = kv_int8[:, : page_size * head_dim].view(
+            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim
+        )
+    else:
+        k_fp8 = (
+            kv_cache_fp8[:, : page_size * head_dim]
+            .view(kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim)
+            .to(torch.int8)
+            .contiguous()
+        )
     k_scale = torch.ops.xspeedgate_ops.gather_paged_scale(
-        # indexer 的 k 缓存按 fp8 存，但 buffer 的 dtype 是 uint8(Byte)；vendor 算子
-        # 只收 Char(int8)。2026-10-20 22:24 实测：
-        # ``RuntimeError: dtype of kv_cache (Byte) must be one of [Char]``。
-        # ``view`` 同 itemsize，零拷贝。
-        kv_cache=kv_cache_fp8.view(torch.int8),
+        kv_cache=kv_int8,
         block_tables=block_tables,
         page_size=page_size,
         head_dim=head_dim,
@@ -663,7 +687,7 @@ def _get_topk_paged(
         q_is_int8=(q_fp8.dtype == torch.int8),
     )
 
-    fused_kv_cache = [k_fp8.contiguous(), k_scale.contiguous()]
+    fused_kv_cache = [k_fp8, k_scale.contiguous()]
     logits = torch.empty(
         (q_offset, q_fp8.shape[1], max_seq_len),
         dtype=torch.float32,

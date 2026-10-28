@@ -41,6 +41,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+from sglang_kunlun.eb5_adapt import dsa_topk_handoff as _handoff
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
@@ -61,6 +62,8 @@ def _topk_all_visible(metadata, topk: int, device) -> torch.Tensor:
     可见 KV 长度，``page_table_1`` 在常规 prefill 下是 per-request，需要按
     extend 长度展开行。
     """
+    # 这条路径不经过融合算子，清掉交接标志（见 ``eb5_adapt/dsa_topk_handoff.py``）。
+    _handoff.set_produced_slots(False)
     page_table_1 = metadata.get_page_table_1()
     visible = metadata.get_seqlens_expanded().to(torch.int64)
     rows = page_table_1
@@ -94,6 +97,93 @@ def _indexer_zerocopy_k() -> bool:
     置 ``EB5_DSA_INDEXER_ZEROCOPY_K=0`` 退回原来的"整池物化一份 int8"写法，便于二分。
     """
     return os.environ.get("EB5_DSA_INDEXER_ZEROCOPY_K", "1") == "1"
+
+
+_QLOD_CACHE: dict = {}
+_FUSED_FALLBACK_SEEN: set = set()
+
+
+def _qlod_pair(extend_lens, device):
+    """由**已在 host 上**的每"请求"query 长度拼出 ``[0, l0, l0+l1, ...]`` int32 对。
+
+    不要用 ``cu_seqlens_q.to("cpu")``（D2H 同步）也不要每次 ``.to(device)``
+    （每层一次 H2D，6 层就把省下来的时间吃回去）：decode 的形状高度重复，
+    直接按 tuple 把 (cpu, xpu) 两份一起缓存，steady state 零传输。
+    """
+    key = (tuple(int(x) for x in extend_lens), str(device))
+    pair = _QLOD_CACHE.get(key)
+    if pair is None:
+        acc = [0]
+        for v in key[0]:
+            acc.append(acc[-1] + v)
+        cpu = torch.tensor(acc, dtype=torch.int32)
+        pair = (cpu, cpu.to(device))
+        _QLOD_CACHE[key] = pair
+    return pair
+
+
+def _fused_fallback(reason: str):
+    """融合路径让位给上游实现时，按原因**只打一次**日志，方便事后确认走没走上。"""
+    if reason not in _FUSED_FALLBACK_SEEN:
+        _FUSED_FALLBACK_SEEN.add(reason)
+        logger.info("eb5 fused topk-transform 回退: %s", reason)
+    return None
+
+
+def _fused_topk_transform(
+    self, metadata, logits: torch.Tensor, q_offset: int, page_size: int
+):
+    """``kunlun_ops.fast_topk_transform_fused``：一刀出物理 slot。
+
+    取代"``_topk_unfused(torch.topk)`` 出局部位置 + ``transform_index_page_table_*``
+    的 torch gather 出 slot"这两步共 ~15 个 kernel。``block_size=page_size`` 让算子直接
+    吃 indexer 的紧凑页表（``attn_metadata.real_page_table``），page_size=1 的宽表
+    在这条路径上整个不需要。
+
+    形状/元数据对不上就返回 ``None``，由调用方退回上游 ``metadata.topk_transform``。
+    """
+    import kunlun_ops
+
+    if q_offset <= 0 or logits.shape[0] != q_offset:
+        return _fused_fallback(f"rows {logits.shape[0]} != q_offset {q_offset}")
+    # 昆仑算子只支持 topk=2048（EB5 的 config.index_topk 正好是 2048）。
+    if self.index_topk != 2048:
+        return _fused_fallback(f"index_topk={self.index_topk} != 2048")
+
+    lengths = metadata.get_seqlens_expanded()
+    if lengths is None or lengths.shape[0] < q_offset:
+        return _fused_fallback("seqlens_expanded 行数不足")
+    lengths = lengths[:q_offset]
+    if lengths.dtype != torch.int32:
+        lengths = lengths.to(torch.int32)
+
+    block_tables = metadata.get_page_table_64()
+    if block_tables is None or block_tables.shape[1] * page_size != logits.shape[1]:
+        return _fused_fallback("page_table_64 宽度与 logits 不匹配")
+
+    rows = block_tables.shape[0]
+    if rows == q_offset:
+        # 紧凑页表已按 query token 展开（``I8_paged_mqa_logits`` 也是按这个口径
+        # 喂的：``context_lens`` 用的是 expanded seqlens），每行自成一个 request，
+        # lod 就是 ``arange``。decode / MTP verify / draft extend 都走这条。
+        extend_lens = (1,) * q_offset
+    else:
+        extend_lens = tuple(int(x) for x in _extend_lens_cpu(metadata))
+        if len(extend_lens) != rows or sum(extend_lens) != q_offset:
+            return _fused_fallback(
+                f"lod 对不上 rows={rows} q_offset={q_offset} n={len(extend_lens)}"
+            )
+    qlod_cpu, qlod_xpu = _qlod_pair(extend_lens, logits.device)
+
+    return kunlun_ops.fast_topk_transform_fused(
+        score=logits,
+        lengths=lengths,
+        src_page_table=block_tables,
+        context_qlen_lod_cpu=qlod_cpu,
+        context_qlen_lod_xpu=qlod_xpu,
+        topk=self.index_topk,
+        block_size=page_size,
+    )
 
 
 def _indexer_kv_pool():
@@ -707,9 +797,19 @@ def _get_topk_paged(
     )
 
     logits = logits.reshape(-1, max_seq_len)
-    # ``fast_topk_transform_fused`` 由 ``sgl_kernel_kunlun/top_k.py`` 的 torch 版
-    # 实现在 stub 层兜住（pipeline10 已端到端验证，见 doc §11.13），调用点保持上游写法。
-    topk_result = metadata.topk_transform(logits, self.index_topk)
+    # 融合 top-k + page-table transform：``kunlun_ops.fast_topk_transform_fused``
+    # 直接产出物理 slot，省掉上游"torch 分解 top-k 出局部位置 + 下游 gather 宽表"
+    # 两步（单层实测 402.0 us -> 26.9 us，逐行 slot 集合与原路径完全一致）。
+    # 交接标志见 ``eb5_adapt/dsa_topk_handoff.py``：置位后
+    # ``transform_index_page_table_decode`` 变成直通，不再二次 gather。
+    topk_result = None
+    if _handoff.fused_transform_enabled():
+        topk_result = _fused_topk_transform(
+            self, metadata, logits, q_offset, page_size
+        )
+    _handoff.set_produced_slots(topk_result is not None)
+    if topk_result is None:
+        topk_result = metadata.topk_transform(logits, self.index_topk)
     if q_offset < q_fp8.shape[0]:
         pad_len = q_fp8.shape[0] - q_offset
         padding = torch.full(
@@ -737,6 +837,9 @@ def _get_topk_ragged(
 ) -> torch.Tensor:
     """_get_topk_ragged Kunlun replacement."""
     import kunlun_ops
+
+    # 这条路径不经过融合算子，清掉交接标志（见 ``eb5_adapt/dsa_topk_handoff.py``）。
+    _handoff.set_produced_slots(False)
 
     if TYPE_CHECKING:
         assert isinstance(_indexer_kv_pool(), NSATokenToKVPool)

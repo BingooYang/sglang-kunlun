@@ -1768,6 +1768,12 @@ def _install_native_sparse_decode():
     return install()
 
 
+def _install_ernie55_backend():
+    from sglang_kunlun.eb5_adapt.hooks.layers.attention.ernie55_backend import install
+
+    return install()
+
+
 def apply() -> list:
     """把 torch 拆解 patch 到 fork 的调用点上。返回已 patch 的符号列表。"""
     patched = []
@@ -1789,6 +1795,7 @@ def apply() -> list:
         _install_expert_location_pad,
         _install_native_sparse_prefill,
         _install_native_sparse_decode,
+        _install_ernie55_backend,
     ):
         try:
             patched.extend(hook())

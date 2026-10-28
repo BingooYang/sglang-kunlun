@@ -44,6 +44,12 @@ def _import_sibling(name: str):
     return importlib.import_module(name)
 
 
+# ``eb5_adapt/dsa_topk_handoff.py``：decode 侧 indexer 与本模块之间的标志位。
+# 置位表示 ``_get_topk_paged`` 走的是 ``kunlun_ops.fast_topk_transform_fused``，
+# 产物**已经是物理 slot**，这里必须直通，不能再 gather 一次。
+_handoff = _import_sibling("dsa_topk_handoff")
+
+
 def prepare_trtllm_nope_sparse_metadata(page_table: torch.Tensor) -> torch.Tensor:
     """逐查询统计有效 top-k 长度；空行（整行 -1）把第 0 列改成 dummy token 0。
 
@@ -69,7 +75,20 @@ def transform_index_page_table_decode_fast(
     result: Optional[torch.Tensor] = None,
     page_size: int = 1,
 ) -> torch.Tensor:
-    """decode：行对齐 gather，负下标/越界写 -1。"""
+    """decode：行对齐 gather，负下标/越界写 -1。
+
+    ``dsa_topk_handoff.produced_slots()`` 为真时 ``topk_indices`` 已是物理 slot
+    （融合算子一刀出的），直通返回；否则按原语义 gather。
+    """
+
+    if _handoff.produced_slots():
+        out = topk_indices if topk_indices.dtype == torch.int32 else topk_indices.to(
+            torch.int32
+        )
+        if result is not None and result is not out:
+            result.copy_(out)
+            return result
+        return out
 
     assert page_size == 1
     assert page_table.shape[0] == topk_indices.shape[0]
@@ -102,7 +121,12 @@ def transform_index_page_table_prefill_fast(
     page_table_is_expanded: bool = False,
     cu_seqlens_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """prefill：token 行 → 请求行由 ``cu_seqlens_q`` 定位，负值/越界/padding 写 -1。"""
+    """prefill：token 行 → 请求行由 ``cu_seqlens_q`` 定位，负值/越界/padding 写 -1。
+
+    ``dsa_topk_handoff.produced_slots()`` 为真时 ``topk_indices`` 已是物理 slot
+    （MTP 的 TARGET_VERIFY 走 ``_get_topk_paged`` 出 slot，但在上游 ``forward_extend``
+    里落到的是**这个** prefill transform），只需按输出形状对齐，不再 gather。
+    """
 
     from sglang.kernels.ops.attention.dsa.transform_index import (
         _allocate_prefill_result,
@@ -111,6 +135,27 @@ def transform_index_page_table_prefill_fast(
     assert page_size == 1
     assert topk_indices.shape[1] > 0
     real_num_tokens = sum(extend_lens_cpu)
+
+    if _handoff.produced_slots():
+        src = (
+            topk_indices
+            if topk_indices.dtype == torch.int32
+            else topk_indices.to(torch.int32)
+        )
+        n = min(real_num_tokens, src.shape[0])
+        if output_num_tokens is None and n == src.shape[0]:
+            return src
+        result = _allocate_prefill_result(
+            topk_indices, real_num_tokens, output_num_tokens
+        )
+        if result.shape[0] == n and result.shape == src.shape:
+            result.copy_(src)
+            return result
+        result.fill_(-1)
+        if n > 0:
+            result[:n].copy_(src[:n])
+        return result
+
     result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     if real_num_tokens == 0:
         return result

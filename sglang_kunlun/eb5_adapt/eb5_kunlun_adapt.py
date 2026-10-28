@@ -728,34 +728,90 @@ def apply() -> list[str]:
     else:
         _patch(mhc_mod, "mhc_post", mhc_post_torch_ref)
 
-    # ①-c split-Sinkhorn（ERNI-7 D2 第 2 项）：`mhc_pre` 里最贵的一段。
-    #    `mhc_torch.mhc_pre:271` 直调 `hc_split_sinkhorn_flat`，绕过了 `:130` 的
-    #    派发器，所以 `use_fused` 根本到不了这里；派发器那条路的门
-    #    （`mhc_torch.py:145`）又要求 `not mhc_align_fleet`，而 EB5 的
-    #    `mhc_align_fleet` 恒为 True（`"ernie" in model_type`）。
+    # ①-c0 诊断开关（ERNI-7 第 5 轮）：量出 `mixes` 的**真实幅度**。
+    #    第 2 轮判 sinkhorn 融合算子"误差随幅度增长"时，幅度是我猜的（扫到 16）；
+    #    第 5 轮的离线 T0 显示 kernel 与 fp32 参考在 |mixes|<=4 时只差 1e-6、
+    #    在 64 时差 1.2e-4，而参考自身在 64 时 20 次迭代**远未收敛**
+    #    （ref(20) vs ref(80) 差 2e-2）。所以这一项成立与否完全取决于真实幅度，
+    #    不能再猜。`EB5_MHC_DUMP_MIXES=1` 时打印前若干次调用的幅度统计，
+    #    并把第一次调用的输入存成 .pt 供离线复算。**默认关，零开销。**
+    if _os.environ.get("EB5_MHC_DUMP_MIXES", "0") == "1":
+        from sglang_kunlun.eb5_adapt.kernels import mhc_torch as _mhc_dbg
+
+        _dump_ref = _mhc_dbg.hc_split_sinkhorn_flat
+        _dump_n = int(_os.environ.get("EB5_MHC_DUMP_N", "8"))
+        _dump_dir = _os.environ.get("EB5_MHC_DUMP_DIR", "/tmp")
+        _dump_cnt = []
+
+        def _sinkhorn_flat_dump(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters,
+                                eps, **kw):
+            i = len(_dump_cnt)
+            if i < _dump_n:
+                _dump_cnt.append(1)
+                f = mixes.reshape(-1, mixes.shape[-1]).float()
+                hc = int(hc_mult)
+                cb = f[:, 2 * hc:] * hc_scale.float()[2] + hc_base.float()[2 * hc:]
+                print(
+                    f"[ERNI-7][dump{i}] pid={_os.getpid()} shape={tuple(mixes.shape)} "
+                    f"dtype={mixes.dtype} |mixes|max={f.abs().max().item():.4g} "
+                    f"std={f.std().item():.4g} comb_raw|max={cb.abs().max().item():.4g} "
+                    f"comb_rowspread={(cb.reshape(-1, hc, hc).amax(2) - cb.reshape(-1, hc, hc).amin(2)).max().item():.4g} "
+                    f"scale={hc_scale.float().tolist()} iters={int(sinkhorn_iters)} eps={eps}",
+                    flush=True,
+                )
+                if i == 0:
+                    import torch as _t
+
+                    _t.save(
+                        {
+                            "mixes": mixes.detach().cpu(),
+                            "hc_scale": hc_scale.detach().cpu(),
+                            "hc_base": hc_base.detach().cpu(),
+                            "hc_mult": int(hc_mult),
+                            "sinkhorn_iters": int(sinkhorn_iters),
+                            "eps": float(eps),
+                            "kw": {k: v for k, v in kw.items() if not hasattr(v, "shape")},
+                        },
+                        f"{_dump_dir}/erni7_mixes_{_os.getpid()}.pt",
+                    )
+            return _dump_ref(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters,
+                             eps, **kw)
+
+        _mhc_dbg.hc_split_sinkhorn_flat = _sinkhorn_flat_dump
+        patched.append("hc_split_sinkhorn_flat[dump]")
+
+    # ①-c split-Sinkhorn（ERNI-7 D2 第 2 项）：`mhc_pre` 里最贵的一段 ——
+    #    softmax + 20 次 Sinkhorn 迭代被摊成约 41 发 kernel，每发只处理 [n,4,4]
+    #    （decode 时 n=6，96 个元素），**纯 launch 开销**。
+    #    `mhc_torch.mhc_pre:275` 直调 `hc_split_sinkhorn_flat`，绕过 `:130` 的派发器，
+    #    所以 `use_fused` 到不了这里；接法是替换 `mhc_torch` 模块里
+    #    `hc_split_sinkhorn_flat` 这个**全局名**（`mhc_pre` 按模块全局解析），
+    #    派发器 `:173` 的兜底分支同样受益。
     #
-    #    那个门对 sinkhorn **看起来**是过严的：`mhc_align_fleet` 只改两处，
-    #      - `1/(sqrt(mean)+eps)` vs `rsqrt(mean+eps)` —— 在 `mhc_pre` 的 RMS 里，
-    #        发生在 GEMM 之前，**不属于** `hc_split_sinkhorn_flat`；
-    #      - `exp2((x-max)*log2e)` vs `exp(x-max)` —— 在 sinkhorn 里，数学恒等。
+    #    ✅ **第 5 轮实测：+38.6% decode，精度闸门 2/2，默认开。**
+    #    - T1 1.6876 -> **2.3382 tok/s**（3 次 2.3151/2.3631/2.3364，区间毫不相交）；
+    #      服务端 `gen throughput` 1.67~1.70 -> **2.32~2.37**，两个独立指标一致。
+    #    - T2 `aime26_first2` **2/2**（277 用 892 token / 390.4s，62 用 1003 token
+    #      / 437.6s）。
     #
-    #    ⚠️ 但实测结论相反：**这个门是对的，不要打开本开关。**
-    #    - T1 性能确实大涨：服务端 `gen throughput` 1.79 -> 2.55~2.64 tok/s（+44%）。
-    #    - T2 精度闸门**挂了**：`aime26_first2` **0/2**（pred=5 exp=277、pred=1 exp=62，
-    #      两题都跑满 8192 token 没收敛）。按 ERNI-7 的硬闸门已回退。
-    #    - 原因（tools/t0_sinkhorn_diag.py 实测）：融合 kernel 与参考实现的误差
-    #      **随输入幅度增长** —— comb 的 max_rel 在 |mixes|~1 时 1.085e-6、
-    #      ~4 时 2.444e-6、~16 时 **2.065e-4**。最初的 T0 用 `randn`（幅度~1）
-    #      只看到 1e-6，是**样本幅度不足**；真实网络里 GEMM 后的 mixes 幅度大得多，
-    #      误差经 43 层 x 2 个 block x 8192 步放大后足以带偏推理链。
-    #    => 这一项应归 **需新开发融合算子**（要一个与 fleet 对齐、在大幅度输入下
-    #       仍精确的 split-Sinkhorn kernel）。它的价值已实测：**+44% decode**。
+    #    ⚠️ 必须保留下面 `mhc_align_fleet` 这道门 —— 第 2 轮 0/2 就是踩在它上面：
+    #    - `mhc_align_fleet=True` 时参考实现的行 softmax 是
+    #      `exp2((c-max)*log2e)`，而融合 kernel 做的是 `exp(c-max)`；两者数学恒等、
+    #      只差舍入。但 **Sinkhorn 被刻意停在远离不动点的地方**
+    #      （实测 `|ref(20) - ref(80)| = 5.8e-2`，tools/t0_sinkhorn_real.py），
+    #      所以它是一条定长 20 步递推，输入扰动**不会**被收缩掉，会一路带下去。
+    #      第 2 轮日志里那行正是 `align_fleet=True`，第 5 轮是 `align_fleet=False`。
+    #    - 新口径的 `srt/models/ernie55.py` 根本不传 `mhc_align_fleet`（默认 False），
+    #      即派发器 `:145` 那道门的前置条件本来就成立，接这颗 kernel 是合法的。
     #
-    #    开关保留但**默认关**，仅作为复现失败与后续开发的入口。
-    #    接法：替换 `mhc_torch` 模块里的 `hc_split_sinkhorn_flat` 全局名。
-    #    `mhc_pre` 在调用时按模块全局解析该名字，所以这样能接到；派发器 `:173`
-    #    的兜底分支同样受益。
-    if _os.environ.get("EB5_MHC_SINKHORN_FUSED", "0") == "1":
+    #    第 2 轮写的根因（"误差随输入幅度增长"）**是错的**，第 5 轮已证伪：
+    #    用 `EB5_MHC_DUMP_MIXES=1` 抓了真实输入（fp32 [6,24]，|mixes| 250~375，
+    #    但 `hc_scale[2]` 只有 0.05~0.09，softmax 实际看到的行内跨度只有 25~35），
+    #    回放后融合 kernel 对 fp64 参考的 comb max_rel 是 **1.26e-6**，`pre`/`post`
+    #    完全一致；n 从 1 扫到 8192 都在 1.2~1.4e-6，无 NaN/Inf
+    #    （tools/t0_sinkhorn_real.py、tools/t0_sinkhorn_nsweep.py）。
+    #    当初那个 2.065e-4 是拿 `randn*16` 扫出来的，那种幅度真实网络里不出现。
+    if _os.environ.get("EB5_MHC_SINKHORN_FUSED", "1") == "1":
         from sglang_kunlun.eb5_adapt.kernels import mhc_torch as _mhc_torch
 
         _flat_ref = _mhc_torch.hc_split_sinkhorn_flat
@@ -771,6 +827,11 @@ def apply() -> list[str]:
                 import kunlun_ops
 
                 hc = int(hc_mult)
+                if mhc_align_fleet:
+                    # 参考实现会切到 `exp2((c-max)*log2e)`，kernel 只有 `exp`；
+                    # 20 步 Sinkhorn 远离不动点，这点舍入差不会被收缩掉（第 2 轮
+                    # 0/2 的真因）。派发器 `mhc_torch.py:145` 的门同款。
+                    raise ValueError("mhc_align_fleet=True: kernel uses exp, ref uses exp2")
                 if float(post_mult_value) != 2.0:
                     raise ValueError(f"post_mult_value={post_mult_value} != 2.0")
                 m = mixes.reshape(-1, (2 + hc) * hc).contiguous()

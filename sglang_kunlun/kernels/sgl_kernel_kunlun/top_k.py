@@ -69,7 +69,7 @@ def moe_fused_gate(
         x=input_tensor,
         topk_index=topk_ids,
         norm_score=topk_weights,
-        block_static=block_statistic,
+        block_statistic=block_statistic,
         bias=bias.float(),
         scale=(routed_scaling_factor if apply_routed_scaling_factor_on_output else 1.0),
         n_group=num_expert_group,

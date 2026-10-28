@@ -3134,6 +3134,49 @@ def get_and_clear_swa_pages_kunlun(
     return swa_pages, peers_mapped, page_valid
 
 
+@register_triton_op("sglang.kernels.ops.attention.pad", "seqlens_expand_kernel")
+def seqlens_expand_kernel_kunlun(
+    extend_seq_lens_ptr,
+    seq_lens_ptr,
+    offsets_ptr,
+    output_ptr,
+    N,
+    BLOCK=None,
+):
+    """Torch replacement for ``seqlens_expand_kernel``.
+
+    ``dsa_backend.init_forward_metadata`` expands per-request kv lengths into
+    per-query-token ones whenever a batch carries more than one token per
+    request, i.e. on every speculative verify / draft-extend step.  The upstream
+    implementation is Triton (``kernels/ops/attention/pad.py:381``), which is
+    stubbed to a plain function on Kunlun, so the indexed launch raises
+    ``'function' object is not subscriptable`` on the first MTP step.
+
+    Request ``i`` writes, at ``offsets[i]``, the ``qo_len_i`` values
+    ``kv_len_i - qo_len_i + 1 + j``.  The clamp at 0 is upstream's: DP-padded
+    and idle-companion rows can have ``kv_len < qo_len``, and consumers that
+    read the length as uint32 turn a negative one into ~4e9 and an illegal
+    access.  Entries past ``sum(extend_seq_lens)`` are left as the caller
+    allocated them, exactly like the Triton version.
+    """
+    n = int(N)
+    if n <= 0:
+        return
+    lengths = extend_seq_lens_ptr[:n].to(torch.int64)
+    total = int(lengths.sum().item())
+    if total == 0:
+        return
+    starts = offsets_ptr[:n].to(torch.int64)
+    base = seq_lens_ptr[:n].to(torch.int64) - lengths + 1
+    within = torch.arange(total, device=output_ptr.device) - torch.repeat_interleave(
+        starts, lengths
+    )
+    values = (torch.repeat_interleave(base, lengths) + within).clamp_min_(0)
+    # ``offsets`` is an exclusive prefix sum of ``lengths``, so the written rows
+    # are exactly ``[0, total)`` and this one copy covers every request.
+    output_ptr[:total] = values.to(output_ptr.dtype)
+
+
 
 
 @register_jit_op(

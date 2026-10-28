@@ -8,6 +8,7 @@
 #   bash run_eb5.sh --gpus 0,1,2,3
 #   bash run_eb5.sh --model <权重绝对路径> --port 30201
 #   bash run_eb5.sh --sglang <sglang 的 python 目录> --kunlun <sglang-kunlun 仓库>
+#   bash run_eb5.sh -- --speculative-algorithm EAGLE  # `--` 之后原样传给 launch
 #
 # 四条路径都有默认值（见下面的 ENV_DIR / MODEL / SGLANG_DIR / KUNLUN_DIR），
 # 全部写成绝对路径，不依赖脚本位置和当前目录。
@@ -34,6 +35,9 @@ GPUS=0,1,2,3,4,5,6,7
 CONTEXT=8192
 MEM=0.75
 PORT=30200
+# `--` 之后的参数原样追加到 sglang-kunlun-launch，用来做单变量实验
+# （例如 -- --speculative-algorithm EAGLE ...），不用改这个脚本。
+EXTRA=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -45,7 +49,8 @@ while [ $# -gt 0 ]; do
     --context) CONTEXT=$2; shift 2;;
     --mem)     MEM=$2; shift 2;;
     --port)    PORT=$2; shift 2;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0;;
+    --)        shift; EXTRA+=("$@"); break;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0;;
     *) echo "未知参数：$1（-h 看用法）"; exit 1;;
   esac
 done
@@ -135,4 +140,5 @@ exec sglang-kunlun-launch \
   --dsa-topk-backend torch \
   --tool-call-parser ernie5 --reasoning-parser ernie5 \
   --tokenizer-worker-num 4 \
-  --enable-metrics
+  --enable-metrics \
+  "${EXTRA[@]}"

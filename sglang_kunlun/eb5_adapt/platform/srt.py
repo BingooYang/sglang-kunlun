@@ -127,6 +127,31 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
         """Return the default Kunlun attention backend name."""
         return "kunlun"
 
+    # ------------------------------------------------------------------
+    # Speculative decoding
+    # ------------------------------------------------------------------
+
+    #: 本平台已验证的投机解码算法。``SRTPlatform.supports_speculative_algorithm``
+    #: 对 out-of-tree 平台默认返回 False，``speculative_hook._check_oot_speculative_
+    #: algorithm`` 据此在 ``resolve_once()`` 阶段直接报
+    #: "EAGLE speculative decoding is not supported by KunlunSRTPlatform"，
+    #: 所以不声明就根本起不来。只列实测跑通的，别顺手放开 EAGLE3 / STANDALONE /
+    #: NGRAM / DFLASH —— 后几个还要 ``get_default_speculative_draft_attention_
+    #: backend()`` 之类的实现。
+    _SUPPORTED_SPECULATIVE_ALGORITHMS = frozenset({"EAGLE", "NEXTN"})
+
+    def supports_speculative_algorithm(self, algorithm: str) -> bool:
+        """Whether Kunlun serves ``algorithm``.
+
+        EB5 的 MTP 走 EAGLE（``NEXTN`` 由 ``handle_speculative_decoding`` 解析成
+        EAGLE），draft 链固定 ``num_steps=1 / topk=1 / draft_tokens=2``，由
+        ``srt/arg_groups/model_overrides/ernie55.py`` 校验。draft worker 用框架
+        自带的（``get_speculative_worker_cls`` 返回 None），draft 的两个注意力
+        后端由上面的 ``get_draft_*_attention_backend_cls`` 给出，cache-locs 的
+        Triton 核在 ``kernels/kernel_ops.py`` 已有 Kunlun 替身。
+        """
+        return str(algorithm or "").upper() in self._SUPPORTED_SPECULATIVE_ALGORITHMS
+
     def get_draft_prefill_attention_backend_cls(self) -> type | None:
         """Return the Kunlun draft prefill attention backend class."""
         from sglang_kunlun.eb5_adapt.hooks.layers.attention.kunlun_backend import KunlunAttentionBackend

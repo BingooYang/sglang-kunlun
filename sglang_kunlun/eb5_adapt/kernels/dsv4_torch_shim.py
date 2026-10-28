@@ -1604,7 +1604,19 @@ def _compress_norm_rope_store_kunlun(
     # window closed yet). There is nothing to write then, and handing the native
     # ``set_k_and_s_v4`` a row set that masks out to empty wedges the device
     # (CPU then spins at 100% in the next sync).
-    if valid_rows is not None and not bool(valid_rows.any()):
+    #
+    # ``bool(...)`` is a D2H sync, which inside CUDA Graph capture hangs the
+    # device (``error code= 299, wait for noc idle timeout``) — and a
+    # data-dependent early return could not be baked into a graph anyway. Under
+    # capture we therefore always fall through; ``_store_bf16_rows`` routes the
+    # capture case to its static padded-scatter branch (``sel_loc = None``,
+    # line ~1088), which tolerates an all-invalid mask and never touches the
+    # native ``set_k_and_s_v4``.
+    if (
+        valid_rows is not None
+        and not torch.cuda.is_current_stream_capturing()
+        and not bool(valid_rows.any())
+    ):
         return
 
     # ``EB5_COMP_STORE_DUMP=1``: first few stores' addressing. A `loc` out of

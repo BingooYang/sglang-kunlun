@@ -114,6 +114,23 @@ export PYTHONPATH="$SGLANG_DIR:$KUNLUN_DIR"
 # checkpoint 自带 int8 routed experts + w{1,2,3}.weight_scale，不要再做在线量化。
 export EB5_INT8_ONLINE=0
 
+# ---------------------------------------------------------------- 开图 / DeepEP
+# decode CUDA Graph 默认关（历史口径）。`EB5_CUDA_GRAPH=1` 打开，用来做开图 A/B
+# 只翻一个变量。
+#
+# 注意两者是**耦合**的：上游 `arg_groups/moe_hook.py:381-396` 在
+# `deepep_mode == normal` 时**无条件把 decode 和 prefill 的图都置成 DISABLED**
+# （日志里那句 `Cuda graph is disabled because deepep_mode=\`normal\``）。
+# 所以想开图必须同时把 DeepEP 模式换成 `auto`（prefill 走 normal、decode 走
+# low_latency，见 `layers/moe/utils.py:278-285`）或 `low_latency`。
+GRAPH_ARGS=(--disable-cuda-graph)
+if [ "${EB5_CUDA_GRAPH:-0}" = "1" ]; then
+  GRAPH_ARGS=()
+  [ -n "${EB5_CUDA_GRAPH_MAX_BS:-}" ] &&
+    GRAPH_ARGS=(--cuda-graph-max-bs-decode "$EB5_CUDA_GRAPH_MAX_BS")
+fi
+DEEPEP_MODE="${EB5_DEEPEP_MODE:-normal}"
+
 # ---------------------------------------------------------------- 起服务
 # 入口必须用 sglang-kunlun-launch，不能用 python -m sglang.launch_server：
 # 标准入口加载 general 插件时平台还没解析，sgl_kernel 没被 stub，一 import
@@ -129,14 +146,14 @@ exec sglang-kunlun-launch \
   --kv-cache-dtype bfloat16 \
   --mem-fraction-static "$MEM" \
   --max-running-requests 8 \
-  --disable-cuda-graph \
+  "${GRAPH_ARGS[@]}" \
   --swa-full-tokens-ratio 0.1 \
   --tp-size "$NGPU" --dp-size "$NGPU" --ep-size "$NGPU" \
   --enable-dp-attention \
   --disable-custom-all-reduce \
   --page-size 256 \
   --nccl-port 9999 \
-  --moe-a2a-backend deepep --deepep-mode normal \
+  --moe-a2a-backend deepep --deepep-mode "$DEEPEP_MODE" \
   --dsa-topk-backend torch \
   --tool-call-parser ernie5 --reasoning-parser ernie5 \
   --tokenizer-worker-num 4 \

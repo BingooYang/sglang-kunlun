@@ -1038,6 +1038,16 @@ def apply() -> list[str]:
 
         print("[eb5-kunlun-adapt] transform_index adapt failed:", _e, file=_sys.stderr)
 
+    # --- logits softcap 的 torch 拆解（只在 CUDA Graph 口径下会被调到） ---
+    try:
+        eb5_softcap_adapt = _import_sibling("eb5_softcap_adapt")
+
+        patched.extend(eb5_softcap_adapt.apply())
+    except Exception as _e:
+        import sys as _sys
+
+        print("[eb5-kunlun-adapt] softcap adapt failed:", _e, file=_sys.stderr)
+
     # --- xy fork 专属适配（ERNIE 5.5 算子 + DP 空转守卫，另见 eb5_xy_adapt.py） ---
     # 上游仓库没有这个文件，缺失时静默跳过，保证本模块可以随上游同步。
     try:
